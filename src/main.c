@@ -1,7 +1,7 @@
 #define _GNU_SOURCE  /* SO_REUSEPORT under strict -std=c11 */
 
 /*
- * PulseKV -- build step 4: thread pool over epoll, thread-per-core.
+ * PulseKV -- build step 5: thread-per-core epoll over a sharded hash table.
  *
  * Each of N_THREADS workers owns a complete stack of its own: its own listening
  * socket on the shared port via SO_REUSEPORT, its own epoll instance, and its
@@ -11,11 +11,10 @@
  * queue. The design doc picks this over a shared epoll fd with EPOLLEXCLUSIVE
  * because it scales more predictably under the 25K req/sec target.
  *
- * The one thing every worker does share is the store: a single pk_table_t
- * behind a single mutex. That is deliberate for this step. Sixteen threads
- * serialising on one lock is the contention baseline that step 5's per-bucket
- * sharding gets measured against, so it wants to exist and be correct before
- * it gets optimised away.
+ * The one thing every worker shares is the logical store: one pk_table_t with
+ * 1,024 bucket chains striped across 256 mutex shards. A request locks only the
+ * shard selected by its key hash, so unrelated keys can execute concurrently
+ * without changing the worker-owned event-loop model established in step 4.
  *
  * Shutdown is a real mechanism rather than signal timing. A signal handler can
  * set a flag, but a thread parked in epoll_wait(-1) will not look at it, so the
@@ -832,7 +831,9 @@ int main(void)
 
     if (!failed && !stopping())
         printf("pulsekv listening on 0.0.0.0:%d (%d threads, thread-per-core via "
-               "SO_REUSEPORT, %s)\n", PULSEKV_PORT, N_THREADS, TRIGGER_NAME);
+               "SO_REUSEPORT, %s, %u lock shards / %u buckets)\n",
+               PULSEKV_PORT, N_THREADS, TRIGGER_NAME,
+               PK_TABLE_SHARDS, PK_TABLE_BUCKETS);
 
     for (int i = 0; i < created; i++) {
         void *worker_result = NULL;

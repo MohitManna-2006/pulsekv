@@ -29,20 +29,38 @@ uint64_t pk_table_hash(const uint8_t *key, uint32_t klen)
     return h;
 }
 
-static size_t bucket_of(const uint8_t *key, uint32_t klen)
+typedef struct {
+    size_t shard;
+    size_t bucket;
+} pk_route_t;
+
+/*
+ * The low ten hash bits still address 1,024 physical buckets. The low eight
+ * choose one of 256 lock shards; the remaining two choose one of the four
+ * chains inside it. In other words, shard s owns global buckets
+ * s, s+256, s+512 and s+768.
+ */
+static pk_route_t route_of(const uint8_t *key, uint32_t klen)
 {
-    return (size_t)(pk_table_hash(key, klen) & (uint64_t)(PK_TABLE_BUCKETS - 1u));
+    size_t global_bucket =
+        (size_t)(pk_table_hash(key, klen) & (uint64_t)(PK_TABLE_BUCKETS - 1u));
+    pk_route_t route = {
+        .shard  = global_bucket & (PK_TABLE_SHARDS - 1u),
+        .bucket = global_bucket / PK_TABLE_SHARDS,
+    };
+    return route;
 }
 
 /*
- * Caller holds t->lock. prev_out receives the address of the link that points
- * at the node found, so a delete can unlink it without walking the chain twice
- * and without special-casing the head.
+ * Caller holds shard->lock. prev_out receives the address of the link that
+ * points at the node found, so a delete can unlink it without walking the chain
+ * twice and without special-casing the head.
  */
-static pk_node_t *find(pk_table_t *t, size_t b, const uint8_t *key, uint32_t klen,
+static pk_node_t *find(pk_table_shard_t *shard, size_t bucket,
+                       const uint8_t *key, uint32_t klen,
                        pk_node_t ***prev_out)
 {
-    pk_node_t **prev = &t->buckets[b];
+    pk_node_t **prev = &shard->buckets[bucket];
 
     for (pk_node_t *n = *prev; n != NULL; prev = &n->next, n = n->next) {
         if (n->klen == klen && memcmp(n->key, key, klen) == 0) {
@@ -56,25 +74,40 @@ static pk_node_t *find(pk_table_t *t, size_t b, const uint8_t *key, uint32_t kle
 
 int pk_table_init(pk_table_t *t)
 {
-    memset(t->buckets, 0, sizeof(t->buckets));
-    t->count = 0;
-    return pthread_mutex_init(&t->lock, NULL);
+    memset(t, 0, sizeof(*t));
+    atomic_init(&t->count, 0);
+
+    for (size_t s = 0; s < PK_TABLE_SHARDS; s++) {
+        int rc = pthread_mutex_init(&t->shards[s].lock, NULL);
+        if (rc != 0) {
+            while (s > 0) {
+                s--;
+                pthread_mutex_destroy(&t->shards[s].lock);
+            }
+            return rc;
+        }
+    }
+    return 0;
 }
 
 void pk_table_destroy(pk_table_t *t)
 {
-    for (size_t b = 0; b < PK_TABLE_BUCKETS; b++) {
-        pk_node_t *n = t->buckets[b];
-        while (n != NULL) {
-            pk_node_t *next = n->next;
-            free(n->val);
-            free(n);
-            n = next;
+    for (size_t s = 0; s < PK_TABLE_SHARDS; s++) {
+        pk_table_shard_t *shard = &t->shards[s];
+
+        for (size_t b = 0; b < PK_TABLE_BUCKETS_PER_SHARD; b++) {
+            pk_node_t *n = shard->buckets[b];
+            while (n != NULL) {
+                pk_node_t *next = n->next;
+                free(n->val);
+                free(n);
+                n = next;
+            }
+            shard->buckets[b] = NULL;
         }
-        t->buckets[b] = NULL;
+        pthread_mutex_destroy(&shard->lock);
     }
-    t->count = 0;
-    pthread_mutex_destroy(&t->lock);
+    atomic_store_explicit(&t->count, 0, memory_order_relaxed);
 }
 
 pk_table_result_t pk_table_set(pk_table_t *t, const uint8_t *key, uint32_t klen,
@@ -98,22 +131,23 @@ pk_table_result_t pk_table_set(pk_table_t *t, const uint8_t *key, uint32_t klen,
         memcpy(copy, val, vlen);
     }
 
-    size_t b = bucket_of(key, klen);
-    pthread_mutex_lock(&t->lock);
+    pk_route_t route = route_of(key, klen);
+    pk_table_shard_t *shard = &t->shards[route.shard];
+    pthread_mutex_lock(&shard->lock);
 
-    pk_node_t *n = find(t, b, key, klen, NULL);
+    pk_node_t *n = find(shard, route.bucket, key, klen, NULL);
     if (n != NULL) {
         uint8_t *old = n->val;  /* freed after the swap, never before */
         n->val  = copy;
         n->vlen = vlen;
-        pthread_mutex_unlock(&t->lock);
+        pthread_mutex_unlock(&shard->lock);
         free(old);
         return PK_TABLE_OK;
     }
 
     pk_node_t *fresh = malloc(sizeof(*fresh) + klen);
     if (fresh == NULL) {
-        pthread_mutex_unlock(&t->lock);
+        pthread_mutex_unlock(&shard->lock);
         free(copy);
         return PK_TABLE_NOMEM;
     }
@@ -123,11 +157,11 @@ pk_table_result_t pk_table_set(pk_table_t *t, const uint8_t *key, uint32_t klen,
     fresh->val  = copy;
     fresh->vlen = vlen;
 
-    fresh->next   = t->buckets[b];  /* prepend: newest first, O(1) */
-    t->buckets[b] = fresh;
-    t->count++;
+    fresh->next                  = shard->buckets[route.bucket];
+    shard->buckets[route.bucket] = fresh;
+    atomic_fetch_add_explicit(&t->count, 1, memory_order_relaxed);
 
-    pthread_mutex_unlock(&t->lock);
+    pthread_mutex_unlock(&shard->lock);
     return PK_TABLE_OK;
 }
 
@@ -139,16 +173,17 @@ pk_table_result_t pk_table_get(pk_table_t *t, const uint8_t *key, uint32_t klen,
     if (key == NULL || klen == 0)
         return PK_TABLE_INVALID;
 
-    size_t b = bucket_of(key, klen);
-    pthread_mutex_lock(&t->lock);
+    pk_route_t route = route_of(key, klen);
+    pk_table_shard_t *shard = &t->shards[route.shard];
+    pthread_mutex_lock(&shard->lock);
 
-    pk_node_t *n = find(t, b, key, klen, NULL);
+    pk_node_t *n = find(shard, route.bucket, key, klen, NULL);
     if (n == NULL) {
-        pthread_mutex_unlock(&t->lock);
+        pthread_mutex_unlock(&shard->lock);
         return PK_TABLE_NOT_FOUND;
     }
     if (n->vlen > out_cap) {
-        pthread_mutex_unlock(&t->lock);
+        pthread_mutex_unlock(&shard->lock);
         return PK_TABLE_TOO_BIG;
     }
 
@@ -159,7 +194,7 @@ pk_table_result_t pk_table_get(pk_table_t *t, const uint8_t *key, uint32_t klen,
     if (out_vlen != NULL)
         *out_vlen = n->vlen;
 
-    pthread_mutex_unlock(&t->lock);
+    pthread_mutex_unlock(&shard->lock);
     return PK_TABLE_OK;
 }
 
@@ -168,20 +203,21 @@ pk_table_result_t pk_table_del(pk_table_t *t, const uint8_t *key, uint32_t klen)
     if (key == NULL || klen == 0)
         return PK_TABLE_INVALID;
 
-    size_t b = bucket_of(key, klen);
-    pthread_mutex_lock(&t->lock);
+    pk_route_t route = route_of(key, klen);
+    pk_table_shard_t *shard = &t->shards[route.shard];
+    pthread_mutex_lock(&shard->lock);
 
     pk_node_t **prev = NULL;
-    pk_node_t  *n    = find(t, b, key, klen, &prev);
+    pk_node_t  *n    = find(shard, route.bucket, key, klen, &prev);
     if (n == NULL) {
-        pthread_mutex_unlock(&t->lock);
+        pthread_mutex_unlock(&shard->lock);
         return PK_TABLE_NOT_FOUND;
     }
 
     *prev = n->next;  /* head or mid-chain, same operation */
-    t->count--;
+    atomic_fetch_sub_explicit(&t->count, 1, memory_order_relaxed);
 
-    pthread_mutex_unlock(&t->lock);
+    pthread_mutex_unlock(&shard->lock);
 
     /* Unlinked already, so nothing can reach it and the frees need no lock. */
     free(n->val);
@@ -191,8 +227,5 @@ pk_table_result_t pk_table_del(pk_table_t *t, const uint8_t *key, uint32_t klen)
 
 size_t pk_table_count(pk_table_t *t)
 {
-    pthread_mutex_lock(&t->lock);
-    size_t c = t->count;
-    pthread_mutex_unlock(&t->lock);
-    return c;
+    return atomic_load_explicit(&t->count, memory_order_relaxed);
 }

@@ -2,7 +2,7 @@
 
 Concurrent, sharded, epoll-based key-value store in C — single-node, Linux-native, zero external dependencies.
 
-> **Status: Step 4 of 8 complete** — thread-per-core server with shared in-memory store over epoll. Sharding, WAL, and crash recovery are designed but not yet implemented.
+> **Status: Step 5 of 8 complete** — thread-per-core epoll server with 1,024 hash buckets striped across 256 lock shards. WAL and crash recovery are designed but not yet implemented.
 
 ---
 
@@ -11,16 +11,19 @@ Concurrent, sharded, epoll-based key-value store in C — single-node, Linux-nat
 PulseKV is a TCP key-value store built from scratch to hit **25K+ req/sec, 500 concurrent clients, <5ms p99** on a single Linux box. Every layer — wire framing, hash table, event loop, threading — is hand-rolled in C11 on `epoll` + `pthreads`.
 
 ```
-Client(s) --TCP--> epoll event loop --dispatch--> worker thread pool (16 x thread-per-core)
-                                                          |
-                                          shard router: hash(key) % N  (planned)
-                                                          |
-                                    -------------------------------------
-                                    |                                   |
-                          sharded hash table                      WAL writer (planned)
-                          (per-bucket mutex)                   (append-only log)
-                                                                        |
-                                                                  disk: pulsekv.log
+Client(s) --TCP--> 16 SO_REUSEPORT listeners (one epoll loop per worker)
+                                      |
+                         parse frame + dispatch
+                                      |
+                  FNV-1a route: shard = hash & 255
+                    bucket-in-shard = (hash >> 8) & 3
+                                      |
+                    -------------------------------------
+                    |                                   |
+          sharded hash table                      WAL writer (planned)
+       (256 locks / 1,024 buckets)             (append-only log)
+                                                        |
+                                                  disk: pulsekv.log
 ```
 
 ---
@@ -32,13 +35,13 @@ Client(s) --TCP--> epoll event loop --dispatch--> worker thread pool (16 x threa
 | 1 | Blocking TCP skeleton + wire protocol | Done |
 | 2 | Single-threaded epoll (level-triggered → edge-triggered) | Done |
 | 3 | In-memory hash table, single global mutex | Done |
-| 4 | Thread pool over epoll (16 threads, thread-per-core) | **Done — current** |
-| 5 | Shard the hash table (per-bucket mutex) | Planned |
+| 4 | Thread pool over epoll (16 threads, thread-per-core) | Done |
+| 5 | Sharded table (256 striped mutexes over 1,024 buckets) | **Done — current** |
 | 6 | Append-only WAL with checksummed records | Planned |
 | 7 | Crash recovery with batched replay | Planned |
 | 8 | Load test & benchmark (500 clients, p50/p99/p999) | Planned |
 
-Full design for steps 5–8 is in [`docs/system-design.md`](docs/system-design.md).
+Full design for steps 6–8 is in [`docs/system-design.md`](docs/system-design.md).
 
 ---
 
@@ -66,11 +69,12 @@ response: [1B status][4B val_len][val]
 
 ### Storage Engine — `include/hashtable.h` / `src/hashtable.c`
 
-Separate-chaining hash table, 1024 buckets (power of two, masked not modulo'd).
+Separate-chaining hash table with 1,024 physical buckets striped across 256 lock shards.
 
-- **Hash:** FNV-1a over raw key bytes (`pk_table_hash` — public so the future shard router can reuse it).
-- **Concurrency:** single `pthread_mutex_t` guarding the whole table. Correctness baseline for step 4; step 5 shards this into per-bucket locks.
-- **Ownership:** `pk_table_set` **copies** key and value in. `pk_table_get` **copies out** into a caller buffer (never hands out an interior pointer — another thread's `DEL` could free the node the instant the lock drops). No singleton — step 5 creates an array of tables and routes on the hash.
+- **Hash:** FNV-1a over raw key bytes. `global_bucket = hash & 1023`, `shard = global_bucket & 255`, and `bucket_in_shard = global_bucket / 256`.
+- **Concurrency:** each shard owns one `pthread_mutex_t` and four bucket chains. Every request takes exactly one of 256 locks, so unrelated shards proceed concurrently while bucket capacity and lock granularity remain independently tunable.
+- **Count:** one relaxed atomic entry counter provides exact statistics without taking every shard lock or serializing key/value access.
+- **Ownership:** `pk_table_set` **copies** key and value in. `pk_table_get` **copies out** into a caller buffer (never hands out an interior pointer — another thread's `DEL` could free the node the instant the lock drops).
 - **Node layout:** `key[]` flex array rides inside the node allocation; `val` is a separate allocation so overwrites of different sizes don't require reallocating the node.
 - **API:**
 
@@ -85,7 +89,7 @@ Separate-chaining hash table, 1024 buckets (power of two, masked not modulo'd).
   ```
 - **Limitation:** fixed bucket array, no growth/rehash. Past ~1K live keys chains lengthen toward O(n) — intentionally deferred.
 
-### Concurrency Model — `src/main.c` (867 lines)
+### Concurrency Model — `src/main.c`
 
 **Thread-per-core via `SO_REUSEPORT`** — 16 workers, each owns:
 
@@ -93,7 +97,7 @@ Separate-chaining hash table, 1024 buckets (power of two, masked not modulo'd).
 - its own `epoll` instance
 - its own intrusive linked list of `conn_t`
 
-Nothing about the event loop is shared. No cross-thread epoll contention, no thundering herd. The one shared object is the `pk_table_t` behind a single mutex.
+Nothing about the event loop is shared. No cross-thread epoll contention, no thundering herd. The one shared logical store is a `pk_table_t`; requests contend only when their keys map to the same one of its 256 lock shards.
 
 **Per-connection state (`conn_t`):**
 
@@ -180,7 +184,7 @@ The CLI speaks the binary protocol directly (`struct.pack("!BI", opcode, len)` +
 
 | Test | What it covers |
 |------|----------------|
-| `test_hashtable` | Hash table in isolation: set/get/del, overwrites, collision chains, `TOO_BIG`, `INVALID`, `NOT_FOUND` |
+| `test_hashtable` | Sharded table in isolation: two-level routing, same-shard/different-chain keys, collision chains, ownership/error cases, and a 32-thread direct SET/GET/DEL stress test |
 | `test_client` | Single-connection framing round-trip (step 1 — proves encode/decode + TCP transport) |
 | `test_multi_client` | 5 concurrent clients: truncated-frame stall, pipelined lifecycle (SET→GET→cross-read→overwrite→DEL), in-order pipelining, stalled-connection resume, 80-frame burst reassembly |
 | `test_thread_stress` | Multi-threaded load against the 16-worker server |
@@ -200,8 +204,8 @@ valgrind ./build/test_hashtable
 ```
 pulsekv/
 ├── src/
-│   ├── main.c          # thread-per-core epoll server (step 4)
-│   ├── hashtable.c     # separate-chaining store + FNV-1a
+│   ├── main.c          # thread-per-core epoll server + shared sharded store (step 5)
+│   ├── hashtable.c     # 1,024 buckets / 256 lock shards + FNV-1a
 │   └── protocol.c      # binary frame encode/decode
 ├── include/
 │   ├── hashtable.h
@@ -231,6 +235,7 @@ pulsekv/
 | Worker threads | `16` | `N_THREADS` in `src/main.c` |
 | Listen backlog | `512` | `LISTEN_BACKLOG` |
 | Buckets | `1024` | `PK_TABLE_BUCKETS` in `include/hashtable.h` |
+| Lock shards | `256` | `PK_TABLE_SHARDS` in `include/hashtable.h` |
 | Max key / val | `1 KiB / 64 KiB` | `PK_MAX_KEY_LEN / PK_MAX_VAL_LEN` in `include/protocol.h` |
 | Trigger mode | edge-triggered | `PULSEKV_LEVEL_TRIGGERED` compile flag |
 | Quiet log | off | `PULSEKV_QUIET` env var |
@@ -239,7 +244,7 @@ pulsekv/
 
 ## Roadmap
 
-- **Step 5 — Sharded table:** array of `N_SHARDS` buckets each with its own mutex; `shard = hash(key) % N_SHARDS`; removes the single-lock bottleneck.
+- **Step 5 — Sharded table (complete):** 1,024 bucket chains striped across 256 mutex shards; one atomic entry counter; removes unrelated-key contention without multiplying the table into 256 oversized copies.
 - **Step 6 — WAL:** `[len][opcode][key][val][CRC32]` append-only log, group-commit fsync (batch N or T ms) to sustain 25K req/sec. Durability point is *before* the in-memory mutation; disk-full must not apply the write.
 - **Step 7 — Recovery:** sequential batched reads, checksum each record, discard truncated tail (crash-mid-write), rebuild shards. Benchmark vs. naive record-by-record replay for the 60%+ restart-time cut.
 - **Step 8 — Load test:** 500 concurrent clients, report p50/p99/p999.
@@ -251,7 +256,7 @@ pulsekv/
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
 | Threading | Thread-per-core + `SO_REUSEPORT` over shared epoll + `EPOLLEXCLUSIVE` | Predictable scaling, no cross-thread epoll contention; matches the 25K req/sec target |
-| Store lock | Single global mutex (now) → per-bucket sharding (next) | Correctness baseline first, then measure contention reduction |
+| Store lock | 256 striped mutex shards over 1,024 buckets | Removes unrelated-key contention while keeping bucket capacity and lock granularity independently tunable |
 | Durability | Group-commit over per-write fsync | Throughput target requires batching; same trade-off as Kafka/Postgres |
 | Protocol | Binary fixed-layout, views not copies | No allocation on parse; table copies only after validation |
 

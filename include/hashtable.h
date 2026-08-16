@@ -3,10 +3,15 @@
 
 #include <pthread.h>
 #include <stddef.h>
+#include <stdatomic.h>
 #include <stdint.h>
 
 /*
- * PulseKV in-memory store: separate chaining, one lock for the whole table.
+ * PulseKV in-memory store: 1,024 separate-chaining buckets striped across 256
+ * independently locked shards. A request takes exactly one shard mutex, so
+ * keys in different shards proceed concurrently while four bucket chains share
+ * each lock. Keeping bucket count separate from lock count lets capacity and
+ * contention be tuned independently.
  *
  * Ownership is the thing to get right here. The table copies every key and
  * value it is given, because the caller's pointers are decode views into a
@@ -15,23 +20,33 @@
  * borrowed by pointer: the node it came from can be freed by the next DEL the
  * instant the lock is released.
  *
- * Nothing here is a singleton. Step 5 shards the store by making an array of
- * these and routing on the hash, with no change to the operations themselves.
- *
  * TODO(later): the bucket array is a fixed size. Much past PK_TABLE_BUCKETS
  * live keys the chains lengthen and lookups drift towards O(n); the design's
  * 1M-key target would want growth-and-rehash under the lock. Deliberately out
  * of scope for this correctness baseline.
  */
 
-#define PK_TABLE_BUCKETS 1024u  /* power of two: the index is a mask, not a modulo */
+#define PK_TABLE_BUCKETS          1024u
+#define PK_TABLE_SHARDS            256u
+#define PK_TABLE_BUCKETS_PER_SHARD (PK_TABLE_BUCKETS / PK_TABLE_SHARDS)
+
+_Static_assert((PK_TABLE_BUCKETS & (PK_TABLE_BUCKETS - 1u)) == 0,
+               "bucket count must be a power of two");
+_Static_assert((PK_TABLE_SHARDS & (PK_TABLE_SHARDS - 1u)) == 0,
+               "shard count must be a power of two");
+_Static_assert(PK_TABLE_BUCKETS % PK_TABLE_SHARDS == 0,
+               "buckets must divide evenly across shards");
 
 typedef struct pk_node pk_node_t;  /* chain node; layout is private to the .c */
 
 typedef struct {
-    pk_node_t      *buckets[PK_TABLE_BUCKETS];
+    pk_node_t      *buckets[PK_TABLE_BUCKETS_PER_SHARD];
     pthread_mutex_t lock;
-    size_t          count;
+} pk_table_shard_t;
+
+typedef struct {
+    pk_table_shard_t shards[PK_TABLE_SHARDS];
+    atomic_size_t    count;
 } pk_table_t;
 
 typedef enum {
@@ -42,7 +57,8 @@ typedef enum {
     PK_TABLE_INVALID   = -3   /* empty key, or a length/pointer pair that disagree */
 } pk_table_result_t;
 
-/* Returns 0, or an errno from pthread_mutex_init. */
+/* Returns 0, or an errno from pthread_mutex_init. A partial initialization is
+ * rolled back before an error is returned. */
 int  pk_table_init(pk_table_t *t);
 
 /* Frees every node. The caller must ensure nothing else is using the table. */
@@ -59,10 +75,11 @@ pk_table_result_t pk_table_get(pk_table_t *t, const uint8_t *key, uint32_t klen,
 
 pk_table_result_t pk_table_del(pk_table_t *t, const uint8_t *key, uint32_t klen);
 
+/* Exact atomic snapshot without taking any shard lock. */
 size_t pk_table_count(pk_table_t *t);
 
-/* FNV-1a over the raw key bytes. Public because step 5's shard router needs the
- * same hash, and because tests construct deliberate bucket collisions with it. */
+/* FNV-1a over the raw key bytes. Public so tests and future benchmarks can
+ * construct deliberate shard and bucket collisions. */
 uint64_t pk_table_hash(const uint8_t *key, uint32_t klen);
 
 #endif /* PULSEKV_HASHTABLE_H */

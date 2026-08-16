@@ -1,13 +1,13 @@
 /*
  * Unit test for the store, with no network in the picture.
  *
- * The interesting cases are the ones that separate a hash table that works from
- * one that only appears to: two keys chained in the same bucket, an overwrite
- * that has to free what it replaces, an unlink from the middle of a chain, and
- * -- the likeliest real bug here -- whether the table actually copies what it
- * is given. The server hands it pointers into a connection's read buffer, which
- * is overwritten by the very next frame, so anything held by reference would
- * come back as garbage a moment later.
+ * The interesting cases are the ones that separate a sharded hash table that
+ * works from one that only appears to: two keys sharing a lock but not a chain,
+ * two keys chained in the same bucket, concurrent shared-key churn, an
+ * overwrite that has to free what it replaces, and whether the table actually
+ * copies what it is given. The server hands it pointers into a connection's
+ * read buffer, which is overwritten by the next frame, so anything held by
+ * reference would come back as garbage a moment later.
  *
  * Run under valgrind: several of these assertions are about lifetime, and a
  * leak checker is the only thing that sees the difference.
@@ -15,11 +15,16 @@
 
 #include "hashtable.h"
 
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
 
 #define VALBUF 256
+#define DIRECT_THREADS     32
+#define DIRECT_KEYS         4
+#define DIRECT_SHARED_KEYS  8
+#define DIRECT_ITERATIONS 1000
 
 static int g_checks = 0;
 static int g_failed = 0;
@@ -69,6 +74,16 @@ static size_t bucket_of(const char *key)
     return (size_t)(pk_table_hash(B(key), L(key)) & (PK_TABLE_BUCKETS - 1u));
 }
 
+static size_t shard_of(const char *key)
+{
+    return bucket_of(key) & (PK_TABLE_SHARDS - 1u);
+}
+
+static size_t bucket_in_shard_of(const char *key)
+{
+    return bucket_of(key) / PK_TABLE_SHARDS;
+}
+
 /*
  * Search for a second key landing in the same bucket as the first, rather than
  * hardcoding a pair that would quietly stop colliding if PK_TABLE_BUCKETS or
@@ -88,6 +103,230 @@ static bool find_collision(const char *anchor, char *out, size_t out_cap, size_t
     return false;
 }
 
+static bool find_same_shard_other_bucket(const char *anchor, char *out,
+                                         size_t out_cap)
+{
+    size_t shard  = shard_of(anchor);
+    size_t bucket = bucket_in_shard_of(anchor);
+
+    for (int i = 0; i < 1000000; i++) {
+        snprintf(out, out_cap, "stripe-%d", i);
+        if (shard_of(out) == shard && bucket_in_shard_of(out) != bucket)
+            return true;
+    }
+    return false;
+}
+
+typedef struct {
+    pthread_mutex_t lock;
+    pthread_cond_t  cond;
+    bool            go;
+    bool            abort;
+} direct_gate_t;
+
+typedef struct {
+    pk_table_t   *table;
+    direct_gate_t *gate;
+    int           id;
+    int           failures;
+    char          first_failure[160];
+} direct_client_t;
+
+static void direct_fail(direct_client_t *c, const char *what, const char *key)
+{
+    c->failures++;
+    if (c->first_failure[0] == '\0')
+        snprintf(c->first_failure, sizeof(c->first_failure), "%s: %s", what, key);
+}
+
+static bool direct_shared_value_is_whole(const uint8_t *value, uint32_t len)
+{
+    if (len < 32 || len > 63 || value[0] < 'A' || value[0] > 'Z')
+        return false;
+    for (uint32_t i = 1; i < len; i++)
+        if (value[i] != value[0])
+            return false;
+    return true;
+}
+
+static void *direct_client_main(void *arg)
+{
+    direct_client_t *c = arg;
+
+    pthread_mutex_lock(&c->gate->lock);
+    while (!c->gate->go)
+        pthread_cond_wait(&c->gate->cond, &c->gate->lock);
+    bool run = !c->gate->abort;
+    pthread_mutex_unlock(&c->gate->lock);
+    if (!run)
+        return NULL;
+
+    for (int iter = 0; iter < DIRECT_ITERATIONS; iter++) {
+        char key[48], value[64];
+        int key_index = iter % DIRECT_KEYS;
+
+        snprintf(key, sizeof(key), "direct-%02d-%d", c->id, key_index);
+        snprintf(value, sizeof(value), "thread-%02d-key-%d-iter-%04d",
+                 c->id, key_index, iter);
+
+        if (pk_table_set(c->table, B(key), L(key), B(value), L(value)) != PK_TABLE_OK) {
+            direct_fail(c, "SET unique failed", key);
+            return NULL;
+        }
+
+        uint8_t  got[VALBUF];
+        uint32_t got_len = 0;
+        if (pk_table_get(c->table, B(key), L(key), got, sizeof(got), &got_len)
+                != PK_TABLE_OK
+            || got_len != L(value) || memcmp(got, value, got_len) != 0) {
+            direct_fail(c, "GET unique lost/corrupted value", key);
+            return NULL;
+        }
+
+        char shared_key[48];
+        uint8_t shared_value[63];
+        uint32_t shared_len = (uint32_t)(32 + (iter % 32));
+        snprintf(shared_key, sizeof(shared_key), "direct-shared-%d",
+                 iter % DIRECT_SHARED_KEYS);
+        memset(shared_value, 'A' + (c->id % 26), shared_len);
+
+        if (pk_table_set(c->table, B(shared_key), L(shared_key),
+                         shared_value, shared_len) != PK_TABLE_OK) {
+            direct_fail(c, "SET shared failed", shared_key);
+            return NULL;
+        }
+        got_len = 0;
+        if (pk_table_get(c->table, B(shared_key), L(shared_key),
+                         got, sizeof(got), &got_len) != PK_TABLE_OK
+            || !direct_shared_value_is_whole(got, got_len)) {
+            direct_fail(c, "GET shared returned torn value", shared_key);
+            return NULL;
+        }
+
+        if (iter % 97 == 0) {
+            if (pk_table_del(c->table, B(key), L(key)) != PK_TABLE_OK
+                || !get_misses(c->table, key)
+                || pk_table_set(c->table, B(key), L(key), B(value), L(value))
+                       != PK_TABLE_OK) {
+                direct_fail(c, "DEL/re-SET unique failed", key);
+                return NULL;
+            }
+        }
+    }
+
+    /* Give the verification pass a deterministic quiescent final state. */
+    for (int j = 0; j < DIRECT_KEYS; j++) {
+        char key[48], value[64];
+        snprintf(key, sizeof(key), "direct-%02d-%d", c->id, j);
+        if (j == 0) {
+            if (pk_table_del(c->table, B(key), L(key)) != PK_TABLE_OK) {
+                direct_fail(c, "final DEL failed", key);
+                return NULL;
+            }
+            continue;
+        }
+        snprintf(value, sizeof(value), "final-thread-%02d-key-%d", c->id, j);
+        if (pk_table_set(c->table, B(key), L(key), B(value), L(value)) != PK_TABLE_OK) {
+            direct_fail(c, "final SET failed", key);
+            return NULL;
+        }
+    }
+    return NULL;
+}
+
+static bool run_direct_concurrency_test(void)
+{
+    pk_table_t table;
+    if (pk_table_init(&table) != 0)
+        return false;
+
+    direct_gate_t gate;
+    memset(&gate, 0, sizeof(gate));
+    if (pthread_mutex_init(&gate.lock, NULL) != 0) {
+        pk_table_destroy(&table);
+        return false;
+    }
+    if (pthread_cond_init(&gate.cond, NULL) != 0) {
+        pthread_mutex_destroy(&gate.lock);
+        pk_table_destroy(&table);
+        return false;
+    }
+
+    pthread_t threads[DIRECT_THREADS];
+    direct_client_t clients[DIRECT_THREADS];
+    memset(clients, 0, sizeof(clients));
+
+    int created = 0;
+    bool launch_failed = false;
+    for (int i = 0; i < DIRECT_THREADS; i++) {
+        clients[i].table = &table;
+        clients[i].gate  = &gate;
+        clients[i].id    = i;
+        int rc = pthread_create(&threads[i], NULL, direct_client_main, &clients[i]);
+        if (rc != 0) {
+            launch_failed = true;
+            break;
+        }
+        created++;
+    }
+
+    pthread_mutex_lock(&gate.lock);
+    gate.abort = launch_failed;
+    gate.go    = true;
+    pthread_cond_broadcast(&gate.cond);
+    pthread_mutex_unlock(&gate.lock);
+
+    for (int i = 0; i < created; i++)
+        pthread_join(threads[i], NULL);
+
+    bool clean = !launch_failed;
+    for (int i = 0; i < created; i++) {
+        if (clients[i].failures != 0) {
+            printf("  thread %d: %s\n", i, clients[i].first_failure);
+            clean = false;
+        }
+    }
+
+    int checked = 0;
+    if (clean) {
+        for (int i = 0; i < DIRECT_THREADS; i++) {
+            for (int j = 0; j < DIRECT_KEYS; j++) {
+                char key[48], value[64];
+                snprintf(key, sizeof(key), "direct-%02d-%d", i, j);
+                if (j == 0) {
+                    clean = clean && get_misses(&table, key);
+                } else {
+                    snprintf(value, sizeof(value), "final-thread-%02d-key-%d", i, j);
+                    clean = clean && get_is(&table, key, value);
+                }
+                checked++;
+            }
+        }
+
+        for (int j = 0; j < DIRECT_SHARED_KEYS; j++) {
+            char key[48];
+            uint8_t value[VALBUF];
+            uint32_t len = 0;
+            snprintf(key, sizeof(key), "direct-shared-%d", j);
+            clean = clean
+                && pk_table_get(&table, B(key), L(key), value, sizeof(value), &len)
+                       == PK_TABLE_OK
+                && direct_shared_value_is_whole(value, len);
+        }
+
+        size_t expected = DIRECT_THREADS * (DIRECT_KEYS - 1) + DIRECT_SHARED_KEYS;
+        clean = clean && pk_table_count(&table) == expected;
+    }
+
+    printf("  %d threads x %d iterations; %d unique-key states checked\n",
+           DIRECT_THREADS, DIRECT_ITERATIONS, checked);
+
+    pthread_cond_destroy(&gate.cond);
+    pthread_mutex_destroy(&gate.lock);
+    pk_table_destroy(&table);
+    return clean;
+}
+
 int main(void)
 {
     pk_table_t t;
@@ -102,6 +341,33 @@ int main(void)
     ok(get_misses(&t, "never-set"), "GET on a key never set reports not-found");
     ok(pk_table_del(&t, B("never-set"), L("never-set")) == PK_TABLE_NOT_FOUND,
        "DEL on a key never set reports not-found");
+
+    printf("\n=== two-level shard routing ===\n");
+    ok(PK_TABLE_BUCKETS == 1024u, "the table retains 1,024 physical buckets");
+    ok(PK_TABLE_SHARDS == 256u, "256 mutex shards set lock granularity");
+    ok(PK_TABLE_BUCKETS_PER_SHARD == 4u, "each lock shard owns four bucket chains");
+    {
+        const char *anchor = "shard-anchor";
+        char peer[32];
+        bool found = find_same_shard_other_bucket(anchor, peer, sizeof(peer));
+
+        ok(found, "construct two keys sharing a mutex but not a chain");
+        if (found) {
+            ok(shard_of(anchor) == shard_of(peer), "both keys route to one lock shard");
+            ok(bucket_in_shard_of(anchor) != bucket_in_shard_of(peer),
+               "the keys occupy different chains inside that shard");
+            ok(pk_table_set(&t, B(anchor), L(anchor), B("anchor"), 6) == PK_TABLE_OK,
+               "SET the first striped key");
+            ok(pk_table_set(&t, B(peer), L(peer), B("peer"), 4) == PK_TABLE_OK,
+               "SET the second striped key");
+            ok(get_is(&t, anchor, "anchor") && get_is(&t, peer, "peer"),
+               "both chains remain independently addressable");
+            ok(pk_table_del(&t, B(anchor), L(anchor)) == PK_TABLE_OK
+                   && pk_table_del(&t, B(peer), L(peer)) == PK_TABLE_OK
+                   && pk_table_count(&t) == 0,
+               "striped test keys cleanly unlink from their own chains");
+        }
+    }
 
     printf("\n=== basic set/get ===\n");
     ok(pk_table_set(&t, B("alpha"), L("alpha"), B("one"), 3) == PK_TABLE_OK, "SET alpha");
@@ -225,6 +491,10 @@ int main(void)
     printf("\n=== teardown ===\n");
     printf("  destroying a table holding %zu keys\n", pk_table_count(&t));
     pk_table_destroy(&t);
+
+    printf("\n=== direct concurrent shard stress ===\n");
+    ok(run_direct_concurrency_test(),
+       "concurrent shard SET/GET/DEL preserves all final state");
 
     printf("\nRESULT: %s (%d checks, %d failed)\n",
            g_failed == 0 ? "PASS" : "FAIL", g_checks, g_failed);
