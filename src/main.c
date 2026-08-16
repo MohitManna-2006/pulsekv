@@ -3,8 +3,12 @@
  *
  * One thread, one epoll instance, every socket non-blocking. Connections make
  * progress independently: a client that stalls mid-frame parks its partial
- * bytes in its own read buffer and everyone else keeps being served. Storage is
- * still stubbed -- SET/DEL answer OK, GET answers NOT_FOUND -- until step 3.
+ * bytes in its own read buffer and everyone else keeps being served.
+ *
+ * Step 3 replaced the stub handlers with a real store: one hash table behind
+ * one mutex, shared by every connection. Still a single thread, so the lock is
+ * uncontended for now -- it is here as the correctness baseline that step 4's
+ * thread pool will actually lean on.
  *
  * Step 2 lands in two stages, selected at compile time:
  *
@@ -19,6 +23,7 @@
  *       EAGAIN ourselves.
  */
 
+#include "hashtable.h"
 #include "protocol.h"
 
 #include <arpa/inet.h>
@@ -46,7 +51,7 @@
 #  define TRIGGER_NAME  "edge-triggered"
 #endif
 
-typedef struct {
+typedef struct conn {
     int  fd;
     char desc[INET_ADDRSTRLEN + 8];
 
@@ -62,7 +67,22 @@ typedef struct {
 
     bool want_write;    /* EPOLLOUT currently in this fd's interest set */
     bool read_stalled;  /* stopped reading because rbuf had no room */
+
+    /* Intrusive list of every live connection, so shutdown can free them.
+     * Otherwise the only pointer to a conn_t lives in kernel epoll state, where
+     * a leak checker cannot see it. */
+    struct conn   *all_next;
+    struct conn  **all_prev;
 } conn_t;
+
+/* One table, one lock, shared by every connection. Sharded in step 5. */
+static pk_table_t g_table;
+
+static conn_t *g_conns = NULL;
+
+/* Set from a signal handler; the event loop notices and unwinds cleanly so the
+ * store and every connection get freed under a leak checker. */
+static volatile sig_atomic_t g_stop = 0;
 
 static int set_nonblocking(int fd)
 {
@@ -79,29 +99,57 @@ static int set_nonblocking(int fd)
 }
 
 /*
- * Step 3 replaces this with a real hash table lookup. Until then every SET and
- * DEL claims success and every GET misses.
+ * Run one request against the store. A GET hit is copied into val_out, which
+ * belongs to the caller -- the table never lends out a pointer into a node,
+ * since a later DEL would free it underneath us.
  */
-static pk_status_t dispatch(const pk_request_t *req)
+static pk_status_t dispatch(const pk_request_t *req, uint8_t *val_out,
+                            size_t val_cap, uint32_t *val_len_out)
 {
+    *val_len_out = 0;
+
     switch (req->opcode) {
     case PK_OP_GET:
-        return PK_STATUS_NOT_FOUND;
+        switch (pk_table_get(&g_table, req->key, req->key_len,
+                             val_out, val_cap, val_len_out)) {
+        case PK_TABLE_OK:        return PK_STATUS_OK;
+        case PK_TABLE_NOT_FOUND: return PK_STATUS_NOT_FOUND;
+        default:                 return PK_STATUS_ERROR;
+        }
+
     case PK_OP_SET:
+        return pk_table_set(&g_table, req->key, req->key_len,
+                            req->val, req->val_len) == PK_TABLE_OK
+                   ? PK_STATUS_OK : PK_STATUS_ERROR;
+
     case PK_OP_DEL:
-        return PK_STATUS_OK;
+        /*
+         * The wire protocol defines DEL as answering OK whenever the frame
+         * parsed, so a delete of an absent key is not reported differently.
+         * pk_table_del does distinguish the two if that is ever wanted.
+         */
+        switch (pk_table_del(&g_table, req->key, req->key_len)) {
+        case PK_TABLE_OK:
+        case PK_TABLE_NOT_FOUND: return PK_STATUS_OK;
+        default:                 return PK_STATUS_ERROR;
+        }
+
     default:
         return PK_STATUS_ERROR;
     }
 }
 
-static void log_request(const conn_t *c, const pk_request_t *req, pk_status_t status)
+static void log_request(const conn_t *c, const pk_request_t *req,
+                        pk_status_t status, uint32_t val_len)
 {
     printf("[%s] %s key=\"%.*s\"", c->desc, pk_opcode_name(req->opcode),
            (int)req->key_len, (const char *)req->key);
     if (req->opcode == PK_OP_SET)
-        printf(" val=\"%.*s\"", (int)req->val_len, (const char *)req->val);
-    printf(" -> %s\n", pk_status_name(status));
+        printf(" val=%uB", req->val_len);
+    printf(" -> %s", pk_status_name(status));
+    if (req->opcode == PK_OP_GET && status == PK_STATUS_OK)
+        printf(" val=%uB", val_len);
+    printf("\n");
 }
 
 /* ---------------------------------------------------------------- write side */
@@ -122,14 +170,21 @@ static void wbuf_compact(conn_t *c)
 }
 
 /* Returns false when there is no room, which the caller reads as backpressure. */
-static bool queue_status(conn_t *c, pk_status_t status)
+static bool queue_response(conn_t *c, pk_status_t status,
+                           const uint8_t *val, uint32_t val_len)
 {
-    if (wbuf_room(c) < PK_RESP_HEADER_LEN)
+    size_t need = PK_RESP_HEADER_LEN + val_len;
+
+    if (wbuf_room(c) < need)
         wbuf_compact(c);
-    if (wbuf_room(c) < PK_RESP_HEADER_LEN)
+    if (wbuf_room(c) < need)
         return false;
 
-    pk_response_t resp = { .status = (uint8_t)status, .val_len = 0, .val = NULL };
+    pk_response_t resp = {
+        .status  = (uint8_t)status,
+        .val_len = val_len,
+        .val     = val_len > 0 ? val : NULL,
+    };
     int n = pk_response_encode(&resp, c->wbuf + c->wfill, wbuf_room(c));
     if (n < 0) {
         fprintf(stderr, "[%s] failed to encode response (status=%d)\n", c->desc, status);
@@ -174,19 +229,41 @@ static bool conn_process(conn_t *c)
 
         if (r == PK_DECODE_ERROR) {
             fprintf(stderr, "[%s] malformed frame, closing\n", c->desc);
-            queue_status(c, PK_STATUS_ERROR);
+            queue_response(c, PK_STATUS_ERROR, NULL, 0);
             return false;
         }
 
-        pk_status_t status = dispatch(&req);
+        /*
+         * A frame whose reply will not fit stays in rbuf and is decoded again
+         * on a later pass, so anything that mutates must not have run yet.
+         * SET and DEL always reply with a bare header, so the room for it can
+         * be checked before executing. GET is read-only and safe to repeat,
+         * which is what lets its variable-length reply be sized afterwards.
+         * (Today both mutations are idempotent so a repeat is invisible; once
+         * step 6 appends a WAL record per write, it would not be.)
+         */
+        if (req.opcode != PK_OP_GET) {
+            if (wbuf_room(c) < PK_RESP_HEADER_LEN)
+                wbuf_compact(c);
+            if (wbuf_room(c) < PK_RESP_HEADER_LEN)
+                return true;  /* backpressure, nothing executed */
+        }
+
+        /* Staging for a GET hit. The value has to land somewhere the table can
+         * copy into while it holds its lock, before the protocol encoder frames
+         * it into wbuf. */
+        uint8_t  val[PK_MAX_VAL_LEN];
+        uint32_t val_len = 0;
+
+        pk_status_t status = dispatch(&req, val, sizeof(val), &val_len);
 
         /* Queue the reply before consuming the request: if the write buffer is
          * full we leave the frame in rbuf and pick it up again once the socket
          * drains, rather than answering a request we've already thrown away. */
-        if (!queue_status(c, status))
+        if (!queue_response(c, status, val, val_len))
             return true;
 
-        log_request(c, &req, status);
+        log_request(c, &req, status, val_len);
 
         c->rhave -= consumed;
         memmove(c->rbuf, c->rbuf + consumed, c->rhave);
@@ -281,12 +358,35 @@ static bool conn_update_interest(int epfd, conn_t *c)
     return true;
 }
 
+static void conns_insert(conn_t *c)
+{
+    c->all_next = g_conns;
+    c->all_prev = &g_conns;
+    if (g_conns != NULL)
+        g_conns->all_prev = &c->all_next;
+    g_conns = c;
+}
+
+static void conns_remove(conn_t *c)
+{
+    *c->all_prev = c->all_next;
+    if (c->all_next != NULL)
+        c->all_next->all_prev = c->all_prev;
+}
+
 static void conn_close(int epfd, conn_t *c)
 {
     conn_flush(c);  /* best effort: the last reply may still be buffered */
     epoll_ctl(epfd, EPOLL_CTL_DEL, c->fd, NULL);
     close(c->fd);
+    conns_remove(c);
     free(c);
+}
+
+static void on_signal(int sig)
+{
+    (void)sig;
+    g_stop = 1;
 }
 
 /* Drain the accept queue: one readable event can cover several pending peers. */
@@ -336,6 +436,7 @@ static void accept_ready(int epfd, int lfd)
             continue;
         }
 
+        conns_insert(c);
         printf("[%s] connected\n", c->desc);
     }
 }
@@ -387,18 +488,33 @@ int main(void)
     /* A client that vanishes mid-write must not take the server down with it. */
     signal(SIGPIPE, SIG_IGN);
 
+    /* Unwind on the usual stop signals rather than dying where we stand, so the
+     * store and every open connection are released and a leak checker sees a
+     * clean exit instead of a process shot mid-flight. */
+    signal(SIGINT, on_signal);
+    signal(SIGTERM, on_signal);
+
     /* Line buffering keeps the interleaved per-connection log readable when
      * stdout is a pipe rather than a terminal. */
     setvbuf(stdout, NULL, _IOLBF, 0);
 
-    int lfd = listen_socket(PULSEKV_PORT);
-    if (lfd < 0)
+    int rc = pk_table_init(&g_table);
+    if (rc != 0) {
+        fprintf(stderr, "pk_table_init: %s\n", strerror(rc));
         return EXIT_FAILURE;
+    }
+
+    int lfd = listen_socket(PULSEKV_PORT);
+    if (lfd < 0) {
+        pk_table_destroy(&g_table);
+        return EXIT_FAILURE;
+    }
 
     int epfd = epoll_create1(0);
     if (epfd < 0) {
         perror("epoll_create1");
         close(lfd);
+        pk_table_destroy(&g_table);
         return EXIT_FAILURE;
     }
 
@@ -410,6 +526,7 @@ int main(void)
         perror("epoll_ctl(ADD listener)");
         close(epfd);
         close(lfd);
+        pk_table_destroy(&g_table);
         return EXIT_FAILURE;
     }
 
@@ -417,11 +534,11 @@ int main(void)
            PULSEKV_PORT, TRIGGER_NAME);
 
     struct epoll_event events[MAX_EVENTS];
-    for (;;) {
+    while (!g_stop) {
         int n = epoll_wait(epfd, events, MAX_EVENTS, -1);
         if (n < 0) {
             if (errno == EINTR)
-                continue;
+                continue;  /* a stop signal lands here too; the while re-checks */
             perror("epoll_wait");
             break;
         }
@@ -456,7 +573,11 @@ int main(void)
         }
     }
 
+    printf("shutting down: %zu keys resident\n", pk_table_count(&g_table));
+    while (g_conns != NULL)
+        conn_close(epfd, g_conns);
     close(epfd);
     close(lfd);
-    return EXIT_FAILURE;
+    pk_table_destroy(&g_table);
+    return EXIT_SUCCESS;
 }

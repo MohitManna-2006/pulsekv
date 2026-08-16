@@ -144,6 +144,6 @@ int main(void)
         printf("round-trip FAILED\n");
         return EXIT_FAILURE;
     }
-    printf("round-trip OK (framing verified; storage lands in step 3)\n");
+    printf("round-trip OK (framing verified; the GET should now return \"bar\")\n");
     return EXIT_SUCCESS;
 }
