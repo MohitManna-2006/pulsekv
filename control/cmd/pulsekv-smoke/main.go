@@ -10,9 +10,12 @@
 //	--mode=wait   poll every process's HealthCheck until all report ok, or fail
 //	              loudly naming exactly which ones did not come up. Used by
 //	              deploy/run-local-cluster.sh.
-//	--mode=smoke  assert the live contract and Phase 2 routing: exact HRW
+//	--mode=smoke  assert the live contract and Phase 3 routing: exact HRW
 //	              metadata, SDK round-trips, direct physical placement, and
 //	              every data-plane RPC. Used by deploy/smoke-test.sh.
+//	--mode=topology-wait
+//	              wait for an exact live membership set and coherent shard map.
+//	              Used by the Phase 3 node lifecycle and chaos scripts.
 package main
 
 import (
@@ -39,6 +42,7 @@ import (
 	nodev1 "pulsekv/control/gen/node/v1"
 	"pulsekv/control/internal/config"
 	"pulsekv/control/internal/router"
+	clustertopology "pulsekv/control/internal/topology"
 	pulsekvclient "pulsekv/control/pkg/client"
 )
 
@@ -61,13 +65,19 @@ func main() {
 		configPath = flag.String("config", "deploy/cluster.config.yaml",
 			"path to the static cluster config")
 		mode = flag.String("mode", "smoke",
-			"`wait` (poll until healthy) or `smoke` (assert the live contract and routing)")
+			"`wait`, `topology-wait`, or `smoke` (assert the live contract and routing)")
 		timeout = flag.Duration("timeout", 15*time.Second,
-			"overall budget for --mode=wait")
+			"overall budget for a wait mode")
 		rpcTimeout = flag.Duration("rpc-timeout", 2*time.Second,
 			"per-RPC deadline")
 		pollInterval = flag.Duration("poll-interval", 250*time.Millisecond,
 			"delay between polls in --mode=wait")
+		expectLive = flag.String("expect-live", "",
+			"comma-separated exact live node IDs for --mode=topology-wait (default: all configured nodes)")
+		expectAbsent = flag.String("expect-absent", "",
+			"comma-separated node IDs that must be absent in --mode=topology-wait")
+		minGeneration = flag.Uint64("min-generation", 0,
+			"minimum topology generation for --mode=topology-wait")
 	)
 	flag.Parse()
 
@@ -82,8 +92,21 @@ func main() {
 		os.Exit(runWait(cfg, *timeout, *rpcTimeout, *pollInterval))
 	case "smoke":
 		os.Exit(runSmoke(cfg, *rpcTimeout))
+	case "topology-wait":
+		live, err := expectedNodeIDs(cfg, *expectLive)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "pulsekv-smoke: %v\n", err)
+			os.Exit(2)
+		}
+		absent, err := parseNodeIDs(*expectAbsent)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "pulsekv-smoke: --expect-absent: %v\n", err)
+			os.Exit(2)
+		}
+		os.Exit(runTopologyWait(cfg, live, absent, *minGeneration,
+			*timeout, *rpcTimeout, *pollInterval))
 	default:
-		fmt.Fprintf(os.Stderr, "pulsekv-smoke: unknown --mode %q (want wait or smoke)\n", *mode)
+		fmt.Fprintf(os.Stderr, "pulsekv-smoke: unknown --mode %q (want wait, smoke, or topology-wait)\n", *mode)
 		os.Exit(2)
 	}
 }
@@ -111,13 +134,13 @@ func runWait(cfg *config.Config, budget, rpcTimeout, interval time.Duration) int
 	ps := processes(cfg)
 	deadline := time.Now().Add(budget)
 
-	fmt.Printf("waiting up to %s for %d process(es) to report healthy...\n", budget, len(ps))
+	fmt.Printf("waiting up to %s for %d service(s) to report healthy...\n", budget, len(ps))
 
 	var lastErrs map[string]error
 	for attempt := 1; ; attempt++ {
 		lastErrs = probeAll(ps, rpcTimeout)
 		if len(lastErrs) == 0 {
-			fmt.Printf("all %d process(es) healthy after %d poll(s)\n", len(ps), attempt)
+			fmt.Printf("all %d service(s) healthy after %d poll(s)\n", len(ps), attempt)
 			return 0
 		}
 		if time.Now().After(deadline) {
@@ -136,6 +159,126 @@ func runWait(cfg *config.Config, budget, rpcTimeout, interval time.Duration) int
 		}
 	}
 	return 1
+}
+
+// ---------------------------------------------------------------------------
+// topology-wait mode
+// ---------------------------------------------------------------------------
+
+func runTopologyWait(cfg *config.Config, expected, absent []string, minGeneration uint64,
+	budget, rpcTimeout, interval time.Duration) int {
+
+	deadline := time.Now().Add(budget)
+	var lastErr error
+	for attempt := 1; ; attempt++ {
+		lastErr = probeTopology(cfg.ControlPlane.Address(), cfg.ShardCount,
+			expected, absent, minGeneration, rpcTimeout)
+		if lastErr == nil {
+			fmt.Printf("topology converged after %d poll(s): generation >= %d, live=[%s]\n",
+				attempt, minGeneration, strings.Join(expected, ","))
+			return 0
+		}
+		if time.Now().After(deadline) {
+			fmt.Fprintf(os.Stderr, "FAILED: topology did not converge within %s: %v\n", budget, lastErr)
+			return 1
+		}
+		time.Sleep(interval)
+	}
+}
+
+func probeTopology(controlPlane string, shardCount uint32, expected, absent []string, minGeneration uint64,
+	rpcTimeout time.Duration) error {
+
+	conn, err := dial(controlPlane)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
+	defer cancel()
+	snapshot, err := clustertopology.Fetch(ctx, metadatav1.NewClusterMetadataServiceClient(conn))
+	if err != nil {
+		return err
+	}
+	if snapshot.Generation < minGeneration {
+		return fmt.Errorf("generation=%d, want at least %d", snapshot.Generation, minGeneration)
+	}
+	if snapshot.ShardCount != shardCount {
+		return fmt.Errorf("shard count=%d, want configured %d", snapshot.ShardCount, shardCount)
+	}
+
+	want := make(map[string]bool, len(expected))
+	for _, id := range expected {
+		want[id] = true
+	}
+	if len(snapshot.Nodes) != len(want) {
+		return fmt.Errorf("live nodes=%v, want exactly %v", sortedNodeIDs(snapshot.Nodes), expected)
+	}
+	for id := range snapshot.Nodes {
+		if !want[id] {
+			return fmt.Errorf("unexpected live node %q (live=%v, want=%v)",
+				id, sortedNodeIDs(snapshot.Nodes), expected)
+		}
+	}
+	for _, id := range expected {
+		if _, ok := snapshot.Nodes[id]; !ok {
+			return fmt.Errorf("expected node %q is absent (live=%v)", id, sortedNodeIDs(snapshot.Nodes))
+		}
+	}
+	for _, id := range absent {
+		if _, ok := snapshot.Nodes[id]; ok {
+			return fmt.Errorf("node %q is still present (live=%v)", id, sortedNodeIDs(snapshot.Nodes))
+		}
+	}
+
+	wantMap := router.AssignShards(expected, shardCount)
+	if differences := shardMapDifferences(snapshot.ShardMap, wantMap, 5); len(differences) > 0 {
+		return fmt.Errorf("generation %d is not the exact HRW map for live nodes: %s",
+			snapshot.Generation, strings.Join(differences, "; "))
+	}
+	return nil
+}
+
+func sortedNodeIDs(nodes map[string]string) []string {
+	ids := make([]string, 0, len(nodes))
+	for id := range nodes {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+func expectedNodeIDs(cfg *config.Config, text string) ([]string, error) {
+	if strings.TrimSpace(text) == "" {
+		return cfg.NodeIDs(), nil
+	}
+	ids, err := parseNodeIDs(text)
+	if err != nil {
+		return nil, fmt.Errorf("--expect-live: %w", err)
+	}
+	return ids, nil
+}
+
+func parseNodeIDs(text string) ([]string, error) {
+	if strings.TrimSpace(text) == "" {
+		return nil, nil
+	}
+	seen := make(map[string]bool)
+	var ids []string
+	for _, raw := range strings.Split(text, ",") {
+		id := strings.TrimSpace(raw)
+		if id == "" {
+			return nil, errors.New("contains an empty node ID")
+		}
+		if seen[id] {
+			return nil, fmt.Errorf("duplicate node ID %q", id)
+		}
+		seen[id] = true
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids, nil
 }
 
 // probeAll health-checks every process once, returning only the failures.
@@ -237,6 +380,8 @@ func runSmoke(cfg *config.Config, rpcTimeout time.Duration) int {
 
 func checkControlPlane(r *reporter, cfg *config.Config, conn *grpc.ClientConn, rpcTimeout time.Duration) {
 	md := metadatav1.NewClusterMetadataServiceClient(conn)
+	var nodeGeneration uint64
+	var nodeFingerprint []byte
 
 	// --- HealthCheck must be real, not a stub.
 	func() {
@@ -268,6 +413,8 @@ func checkControlPlane(r *reporter, cfg *config.Config, conn *grpc.ClientConn, r
 			r.fail("controlplane/GetNodeList", err)
 			return
 		}
+		nodeGeneration = resp.GetTopologyGeneration()
+		nodeFingerprint = bytes.Clone(resp.GetTopologyFingerprint())
 
 		want := make(map[string]string, len(cfg.Nodes)) // node ID -> address
 		for _, n := range cfg.Nodes {
@@ -275,6 +422,13 @@ func checkControlPlane(r *reporter, cfg *config.Config, conn *grpc.ClientConn, r
 		}
 
 		var problems []string
+		if nodeGeneration == 0 {
+			problems = append(problems, "topology_generation=0; Phase 3 requires a published generation")
+		}
+		if len(nodeFingerprint) != clustertopology.FingerprintSize {
+			problems = append(problems, fmt.Sprintf("topology_fingerprint has %d bytes, want %d",
+				len(nodeFingerprint), clustertopology.FingerprintSize))
+		}
 		var dead []string
 		seen := make(map[string]bool, len(resp.GetNodes()))
 
@@ -314,7 +468,8 @@ func checkControlPlane(r *reporter, cfg *config.Config, conn *grpc.ClientConn, r
 			return
 		}
 		r.pass("controlplane/GetNodeList",
-			fmt.Sprintf("%d node(s), all alive, addresses match config", len(resp.GetNodes())))
+			fmt.Sprintf("generation=%d; %d node(s), all alive, addresses match config",
+				nodeGeneration, len(resp.GetNodes())))
 	}()
 
 	// --- GetShardMap must cover every shard with a configured owner and match
@@ -337,6 +492,18 @@ func checkControlPlane(r *reporter, cfg *config.Config, conn *grpc.ClientConn, r
 		got := resp.GetShardToNodeId()
 		want := router.AssignShards(cfg.NodeIDs(), cfg.ShardCount)
 		var problems []string
+		if resp.GetTopologyGeneration() != nodeGeneration {
+			problems = append(problems, fmt.Sprintf(
+				"topology generation=%d, preceding node-list generation=%d",
+				resp.GetTopologyGeneration(), nodeGeneration))
+		}
+		if !bytes.Equal(resp.GetTopologyFingerprint(), nodeFingerprint) {
+			problems = append(problems, "topology fingerprint differs from preceding node list")
+		}
+		if resp.GetShardCount() != cfg.ShardCount {
+			problems = append(problems, fmt.Sprintf("reported shard_count=%d, want %d",
+				resp.GetShardCount(), cfg.ShardCount))
+		}
 		if uint32(len(got)) != cfg.ShardCount {
 			problems = append(problems, fmt.Sprintf("%d entries, want shard_count=%d",
 				len(got), cfg.ShardCount))
@@ -370,8 +537,8 @@ func checkControlPlane(r *reporter, cfg *config.Config, conn *grpc.ClientConn, r
 			return
 		}
 		r.pass("controlplane/GetShardMap",
-			fmt.Sprintf("%d shard(s) over %d node(s), exact router.AssignShards match",
-				len(got), len(owners)))
+			fmt.Sprintf("generation=%d; %d shard(s) over %d node(s), exact router.AssignShards match",
+				resp.GetTopologyGeneration(), len(got), len(owners)))
 	}()
 
 	// --- AdapterService is generated and dial-able but has no server in
@@ -412,8 +579,8 @@ func checkRouting(r *reporter, cfg *config.Config, conn *grpc.ClientConn, rpcTim
 		return
 	}
 	r.pass("routing/live metadata", fmt.Sprintf(
-		"fetched %d node(s) and %d shard(s); exact router.AssignShards match",
-		len(topology.nodes), len(topology.shardMap)))
+		"generation=%d; fetched %d node(s) and %d shard(s); exact router.AssignShards match",
+		topology.generation, len(topology.nodes), len(topology.shardMap)))
 
 	routed, err := pulsekvclient.New(
 		cfg.ControlPlane.Address(),
@@ -527,56 +694,25 @@ func checkRouting(r *reporter, cfg *config.Config, conn *grpc.ClientConn, rpcTim
 }
 
 type liveRoutingTopology struct {
-	nodes    map[string]string
-	shardMap map[uint32]string
+	generation uint64
+	nodes      map[string]string
+	shardMap   map[uint32]string
 }
 
 func fetchLiveRoutingTopology(md metadatav1.ClusterMetadataServiceClient,
 	rpcTimeout time.Duration) (liveRoutingTopology, error) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
-	nodesResp, err := md.GetNodeList(ctx, &metadatav1.GetNodeListRequest{})
-	cancel()
+	defer cancel()
+	snapshot, err := clustertopology.Fetch(ctx, md)
 	if err != nil {
-		return liveRoutingTopology{}, fmt.Errorf("GetNodeList: %w", err)
+		return liveRoutingTopology{}, err
 	}
-
-	ctx, cancel = context.WithTimeout(context.Background(), rpcTimeout)
-	shardsResp, err := md.GetShardMap(ctx, &metadatav1.GetShardMapRequest{})
-	cancel()
-	if err != nil {
-		return liveRoutingTopology{}, fmt.Errorf("GetShardMap: %w", err)
-	}
-
-	nodes := make(map[string]string, len(nodesResp.GetNodes()))
-	for _, node := range nodesResp.GetNodes() {
-		if node == nil || node.GetNodeId() == "" || node.GetAddress() == "" {
-			return liveRoutingTopology{}, errors.New("GetNodeList returned a node with an empty ID or address")
-		}
-		if _, duplicate := nodes[node.GetNodeId()]; duplicate {
-			return liveRoutingTopology{}, fmt.Errorf("GetNodeList returned duplicate node %q", node.GetNodeId())
-		}
-		if !node.GetAlive() {
-			return liveRoutingTopology{}, fmt.Errorf("GetNodeList reports node %q not alive", node.GetNodeId())
-		}
-		nodes[node.GetNodeId()] = node.GetAddress()
-	}
-	if len(nodes) == 0 {
-		return liveRoutingTopology{}, errors.New("GetNodeList returned no nodes")
-	}
-
-	shardMap := make(map[uint32]string, len(shardsResp.GetShardToNodeId()))
-	for shard, owner := range shardsResp.GetShardToNodeId() {
-		if _, known := nodes[owner]; !known {
-			return liveRoutingTopology{}, fmt.Errorf(
-				"GetShardMap shard %d has unknown owner %q", shard, owner)
-		}
-		shardMap[shard] = owner
-	}
-	if len(shardMap) == 0 {
-		return liveRoutingTopology{}, errors.New("GetShardMap returned no shards")
-	}
-	return liveRoutingTopology{nodes: nodes, shardMap: shardMap}, nil
+	return liveRoutingTopology{
+		generation: snapshot.Generation,
+		nodes:      snapshot.Nodes,
+		shardMap:   snapshot.ShardMap,
+	}, nil
 }
 
 func routingSampleKeys(prefix string, count int, shardCount uint32,

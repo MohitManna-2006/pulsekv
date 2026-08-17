@@ -2,16 +2,15 @@
 #
 # Stop everything deploy/run-local-cluster.sh started.
 #
-#   deploy/stop-local-cluster.sh [--grace SECONDS] [--keep-logs]
+#   deploy/stop-local-cluster.sh [--grace SECONDS] [--keep-logs|--clean-logs]
 #
-# Sends SIGTERM to every PID in deploy/run/cluster.pids, waits up to --grace
-# seconds (default 10) for a clean exit, then SIGKILLs whatever is left. Both
-# servers handle SIGTERM properly -- the Go control plane calls GracefulStop
-# and the C++ shim shuts the gRPC server down through a self-pipe -- so the
-# SIGKILL path should never fire in practice.
+# Stops processes in dependency order: chaos watcher, membership sidecars
+# (which announce Leave), data nodes, and finally the control-plane gossip
+# observer. Each group receives SIGTERM concurrently, gets up to --grace
+# seconds to exit, then has a SIGKILL fallback.
 #
-# Finishes with an orphan sweep: any pulsekv-controlplane or pulsekv-node
-# process still alive that is NOT in the pid file gets found and killed too,
+# Finishes with an orphan sweep: any managed PulseKV process still alive that
+# is NOT in the pid file gets found and killed too,
 # and reported. A stop script that leaves a process holding port 7100 makes the
 # next boot fail for reasons that look nothing like the actual cause.
 #
@@ -27,14 +26,19 @@ KEEP_LOGS=1
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --grace)    GRACE="$2"; shift 2 ;;
+        --grace)    [ $# -ge 2 ] || pk_die "--grace requires seconds"; GRACE="$2"; shift 2 ;;
         --grace=*)  GRACE="${1#*=}"; shift ;;
         --keep-logs) KEEP_LOGS=1; shift ;;
         --clean-logs) KEEP_LOGS=0; shift ;;
-        -h|--help)  sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help)  sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *)          pk_die "unknown argument: $1 (try --help)" ;;
     esac
 done
+
+case "$GRACE" in
+    ''|*[!0-9]*) pk_die "--grace must be a non-negative integer, got: $GRACE" ;;
+esac
+GRACE=$((10#$GRACE))
 
 # Escape a literal string for use as a pgrep -f extended regex.
 pk_regex_escape() {
@@ -44,7 +48,9 @@ pk_regex_escape() {
 find_orphans() {
     {
         pgrep -f -- "$(pk_regex_escape "$PULSEKV_CONTROLPLANE_BIN")" || true
+        pgrep -f -- "$(pk_regex_escape "$PULSEKV_MEMBER_BIN")" || true
         pgrep -f -- "$(pk_regex_escape "$PULSEKV_NODE_BIN")" || true
+        pgrep -f -- "$(pk_regex_escape "$PULSEKV_CHAOS_BIN")" || true
     } | sort -u
 }
 
@@ -63,66 +69,120 @@ if [ "${#PIDS[@]}" -eq 0 ] && [ -z "$known_orphans" ]; then
     pk_step "Nothing to stop"
     [ -f "$PULSEKV_PID_FILE" ] && rm -f "$PULSEKV_PID_FILE"
     pk_info "no recorded PIDs and no stray pulsekv processes"
+    if [ "$KEEP_LOGS" -eq 0 ]; then
+        rm -rf "$PULSEKV_LOG_DIR"
+        pk_info "removed $(pk_relpath "$PULSEKV_LOG_DIR")"
+    fi
     exit 0
 fi
 
 # ---------------------------------------------------------------------------
-# Graceful stop of the recorded processes.
+# Ordered graceful stop of recorded processes.
 # ---------------------------------------------------------------------------
 pk_step "Stopping the cluster"
 
-terminated=(); already_gone=()
-for i in "${!PIDS[@]}"; do
-    if pk_pid_alive "${PIDS[$i]}"; then
-        kill -TERM "${PIDS[$i]}" 2>/dev/null || true
-        terminated+=("$i")
-    else
-        already_gone+=("$i")
-    fi
-done
-
-# Poll rather than sleep for the full grace period: a healthy cluster stops in
-# well under a second and there is no reason to make the common case slow.
-deadline=$(( $(date +%s) + GRACE ))
-while [ "${#terminated[@]}" -gt 0 ]; do
-    still_running=()
-    for i in ${terminated[@]+"${terminated[@]}"}; do
-        pk_pid_alive "${PIDS[$i]}" && still_running+=("$i")
-    done
-    terminated=(${still_running[@]+"${still_running[@]}"})
-    [ "${#terminated[@]}" -eq 0 ] && break
-    [ "$(date +%s)" -ge "$deadline" ] && break
-    sleep 0.2
-done
-
-killed_hard=()
-for i in ${terminated[@]+"${terminated[@]}"}; do
-    pk_warn "${LABELS[$i]} (pid ${PIDS[$i]}) ignored SIGTERM after ${GRACE}s, sending SIGKILL"
-    kill -KILL "${PIDS[$i]}" 2>/dev/null || true
-    killed_hard+=("$i")
-done
-[ "${#killed_hard[@]}" -gt 0 ] && sleep 0.3
-
-# ---------------------------------------------------------------------------
-# Report.
-# ---------------------------------------------------------------------------
+declare -A STOP_STATE=()
 failed=0
+
+select_group() {
+    local group="$1" i label
+    GROUP_INDICES=()
+    for i in "${!LABELS[@]}"; do
+        label="${LABELS[$i]}"
+        case "$group:$label" in
+            chaos:chaos) GROUP_INDICES+=("$i") ;;
+            member:member:*) GROUP_INDICES+=("$i") ;;
+            data:data:*|data:node-*) GROUP_INDICES+=("$i") ;;
+            control:controlplane) GROUP_INDICES+=("$i") ;;
+            other:*)
+                case "$label" in
+                    chaos|member:*|data:*|node-*|controlplane) ;;
+                    *) GROUP_INDICES+=("$i") ;;
+                esac
+                ;;
+        esac
+    done
+}
+
+stop_group() {
+    local group="$1" i label pid deadline
+    local active=() still=()
+    select_group "$group"
+    [ "${#GROUP_INDICES[@]}" -gt 0 ] || return 0
+
+    for i in "${GROUP_INDICES[@]}"; do
+        label="${LABELS[$i]}"; pid="${PIDS[$i]}"
+        if ! pk_pid_alive "$pid"; then
+            STOP_STATE[$i]="was already gone"
+            pk_pid_remove_if "$label" "$pid"
+            continue
+        fi
+        if ! pk_pid_matches_label "$label" "$pid"; then
+            STOP_STATE[$i]="stale PID record (not signalled)"
+            pk_err "$label records pid $pid, but that PID belongs to another command"
+            failed=1
+            continue
+        fi
+        if kill -TERM "$pid" 2>/dev/null; then
+            active+=("$i")
+        elif ! pk_pid_alive "$pid"; then
+            STOP_STATE[$i]="stopped during SIGTERM"
+            pk_pid_remove_if "$label" "$pid"
+        else
+            STOP_STATE[$i]="SIGTERM failed"
+            failed=1
+        fi
+    done
+
+    deadline=$((SECONDS + GRACE))
+    while [ "${#active[@]}" -gt 0 ]; do
+        still=()
+        for i in "${active[@]}"; do
+            pk_pid_alive "${PIDS[$i]}" && still+=("$i")
+        done
+        active=("${still[@]}")
+        [ "${#active[@]}" -eq 0 ] && break
+        [ "$SECONDS" -ge "$deadline" ] && break
+        sleep 0.1
+    done
+
+    for i in "${active[@]}"; do
+        pk_warn "${LABELS[$i]} (pid ${PIDS[$i]}) ignored SIGTERM after ${GRACE}s, sending SIGKILL"
+        kill -KILL "${PIDS[$i]}" 2>/dev/null || true
+        STOP_STATE[$i]="killed (SIGKILL)"
+    done
+    [ "${#active[@]}" -eq 0 ] || sleep 0.2
+
+    for i in "${GROUP_INDICES[@]}"; do
+        label="${LABELS[$i]}"; pid="${PIDS[$i]}"
+        [ -n "${STOP_STATE[$i]:-}" ] || STOP_STATE[$i]="stopped"
+        if pk_pid_alive "$pid"; then
+            STOP_STATE[$i]="still running"
+            failed=1
+        else
+            pk_pid_remove_if "$label" "$pid"
+        fi
+    done
+}
+
+# Keep the observer alive while sidecars announce Leave. Data services remain
+# available until they are no longer advertised.
+stop_group chaos
+stop_group member
+stop_group data
+stop_group other
+stop_group control
+
 for i in "${!PIDS[@]}"; do
-    if pk_pid_alive "${PIDS[$i]}"; then
-        pk_err "$(printf '%-14s pid %-7s %-22s still running' \
-            "${LABELS[$i]}" "${PIDS[$i]}" "${ADDRS[$i]}")"
-        failed=1
-        continue
+    state="${STOP_STATE[$i]:-not processed}"
+    if [ "$state" = "still running" ] || [ "$state" = "SIGTERM failed" ] || \
+       [ "$state" = "stale PID record (not signalled)" ]; then
+        pk_err "$(printf '%-18s pid %-7s %-22s %s' \
+            "${LABELS[$i]}" "${PIDS[$i]}" "${ADDRS[$i]}" "$state")"
+    else
+        pk_ok "$(printf '%-18s pid %-7s %-22s %s' \
+            "${LABELS[$i]}" "${PIDS[$i]}" "${ADDRS[$i]}" "$state")"
     fi
-    state="stopped"
-    for g in ${already_gone[@]+"${already_gone[@]}"}; do
-        [ "$g" = "$i" ] && state="was already gone"
-    done
-    for k in ${killed_hard[@]+"${killed_hard[@]}"}; do
-        [ "$k" = "$i" ] && state="killed (SIGKILL)"
-    done
-    pk_ok "$(printf '%-14s pid %-7s %-22s %s' \
-        "${LABELS[$i]}" "${PIDS[$i]}" "${ADDRS[$i]}" "$state")"
 done
 
 # ---------------------------------------------------------------------------

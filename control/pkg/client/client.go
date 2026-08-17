@@ -1,10 +1,10 @@
 // Package client provides the public, LLM-agnostic PulseKV cluster SDK.
 //
-// A Client discovers the static cluster topology from ClusterMetadataService,
-// routes each key through the cluster's rendezvous-hash shard map, and reuses
-// gRPC connections to the owning data-plane nodes. Applications should import
-// this package rather than depending on the internal routing or transport
-// packages directly.
+// A Client discovers the live cluster topology from ClusterMetadataService,
+// atomically installs coherent membership snapshots, routes each key through
+// the cluster's rendezvous-hash shard map, and reuses gRPC connections to the
+// owning data-plane nodes. Applications should import this package rather than
+// depending on the internal routing or transport packages directly.
 package client
 
 import (
@@ -12,7 +12,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -23,6 +22,7 @@ import (
 	metadatav1 "pulsekv/control/gen/metadata/v1"
 	nodev1 "pulsekv/control/gen/node/v1"
 	"pulsekv/control/internal/router"
+	clustertopology "pulsekv/control/internal/topology"
 	"pulsekv/control/internal/transport"
 )
 
@@ -34,8 +34,14 @@ const (
 	defaultMaxMessageBytes = 8 * 1024 * 1024
 )
 
-// ErrClosed is returned when an operation is attempted after Close.
-var ErrClosed = errors.New("pulsekv client is closed")
+var (
+	// ErrClosed is returned when an operation is attempted after Close.
+	ErrClosed = errors.New("pulsekv client is closed")
+	// ErrNoLiveNodes means metadata authoritatively published an empty live
+	// membership. It is distinct from a metadata transport failure, for which
+	// the client deliberately retains its last complete topology.
+	ErrNoLiveNodes = errors.New("pulsekv cluster has no live data nodes")
+)
 
 type options struct {
 	refreshInterval time.Duration
@@ -48,8 +54,8 @@ type Option func(*options) error
 
 // WithRefreshInterval changes how often the client polls cluster metadata.
 // A zero interval disables background refresh, which is useful for short-lived
-// tools and tests. Phase 2 topology is static, so refresh is deliberately a
-// simple poll rather than push invalidation.
+// tools and tests. Refresh is deliberately a simple poll rather than push
+// invalidation.
 func WithRefreshInterval(interval time.Duration) Option {
 	return func(o *options) error {
 		if interval < 0 {
@@ -82,11 +88,7 @@ func WithDialOptions(dialOptions ...grpc.DialOption) Option {
 	}
 }
 
-type topology struct {
-	shardCount uint32
-	shardMap   map[uint32]string
-	nodes      map[string]string // node ID -> NodeService address
-}
+type topology = clustertopology.Snapshot
 
 // Client is a concurrency-safe PulseKV cluster client.
 type Client struct {
@@ -99,18 +101,21 @@ type Client struct {
 	refreshCancel   context.CancelFunc
 	refreshDone     chan struct{}
 	closeDone       chan struct{}
+	refreshMu       sync.Mutex
 
-	mu          sync.RWMutex
-	closed      bool
-	closeErr    error
-	topology    topology
-	nodeConns   map[string]*grpc.ClientConn
-	nodeClients map[string]nodev1.NodeServiceClient
+	mu              sync.RWMutex
+	closed          bool
+	closeErr        error
+	topology        topology
+	nodeConns       map[string]*grpc.ClientConn
+	nodeClients     map[string]nodev1.NodeServiceClient
+	nodeConnFactory func(string) (*grpc.ClientConn, error)
 }
 
 // New connects to a PulseKV control plane, fetches and validates the current
 // topology, and starts periodic metadata refresh. The initial metadata fetch is
-// eager: a successful return means the client has a complete routable map.
+// eager: a successful return means the client has a complete authoritative
+// topology, which may explicitly contain no live data nodes.
 func New(controlPlaneAddr string, opts ...Option) (*Client, error) {
 	if strings.TrimSpace(controlPlaneAddr) == "" {
 		return nil, errors.New("control-plane address must not be empty")
@@ -151,6 +156,9 @@ func New(controlPlaneAddr string, opts ...Option) (*Client, error) {
 		closeDone:       make(chan struct{}),
 		nodeConns:       make(map[string]*grpc.ClientConn),
 		nodeClients:     make(map[string]nodev1.NodeServiceClient),
+	}
+	c.nodeConnFactory = func(address string) (*grpc.ClientConn, error) {
+		return grpc.NewClient(address, c.dialOptions...)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), c.refreshTimeout)
@@ -311,67 +319,41 @@ func (c *Client) refreshLoop(ctx context.Context) {
 }
 
 func (c *Client) refresh(ctx context.Context) error {
-	nodesResp, err := c.metadata.GetNodeList(ctx, &metadatav1.GetNodeListRequest{})
-	if err != nil {
-		return fmt.Errorf("get node list: %w", err)
-	}
-	shardsResp, err := c.metadata.GetShardMap(ctx, &metadatav1.GetShardMapRequest{})
-	if err != nil {
-		return fmt.Errorf("get shard map: %w", err)
-	}
+	c.refreshMu.Lock()
+	defer c.refreshMu.Unlock()
 
-	next, err := validateTopology(nodesResp.GetNodes(), shardsResp.GetShardToNodeId())
+	next, err := clustertopology.Fetch(ctx, c.metadata)
 	if err != nil {
 		return err
 	}
+
+	var retired []*grpc.ClientConn
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if c.closed {
+		c.mu.Unlock()
 		return ErrClosed
 	}
 	c.topology = next
+	for address, conn := range c.nodeConns {
+		if next.OwnsAddress(address) {
+			continue
+		}
+		delete(c.nodeConns, address)
+		delete(c.nodeClients, address)
+		retired = append(retired, conn)
+	}
+	c.mu.Unlock()
+
+	// Closing outside mu avoids blocking routing and shutdown on gRPC cleanup.
+	// Removed entries are disjoint from the active connections Close snapshots.
+	for _, conn := range retired {
+		_ = conn.Close()
+	}
 	return nil
 }
 
 func validateTopology(nodes []*metadatav1.NodeInfo, shardMap map[uint32]string) (topology, error) {
-	if len(nodes) == 0 {
-		return topology{}, errors.New("metadata returned no nodes")
-	}
-	byID := make(map[string]string, len(nodes))
-	byAddress := make(map[string]string, len(nodes))
-	for _, node := range nodes {
-		if node == nil || node.GetNodeId() == "" || node.GetAddress() == "" {
-			return topology{}, errors.New("metadata returned a node with an empty ID or address")
-		}
-		if _, exists := byID[node.GetNodeId()]; exists {
-			return topology{}, fmt.Errorf("metadata returned duplicate node ID %q", node.GetNodeId())
-		}
-		if previousID, exists := byAddress[node.GetAddress()]; exists {
-			return topology{}, fmt.Errorf("metadata returned duplicate node address %q for IDs %q and %q",
-				node.GetAddress(), previousID, node.GetNodeId())
-		}
-		byID[node.GetNodeId()] = node.GetAddress()
-		byAddress[node.GetAddress()] = node.GetNodeId()
-	}
-	if len(shardMap) == 0 {
-		return topology{}, errors.New("metadata returned an empty shard map")
-	}
-	if uint64(len(shardMap)) > uint64(^uint32(0)) {
-		return topology{}, errors.New("metadata shard map is too large")
-	}
-	shardCount := uint32(len(shardMap))
-	shards := make(map[uint32]string, len(shardMap))
-	for shard := uint32(0); shard < shardCount; shard++ {
-		owner, ok := shardMap[shard]
-		if !ok {
-			return topology{}, fmt.Errorf("metadata shard map is missing shard %d", shard)
-		}
-		if _, ok := byID[owner]; !ok {
-			return topology{}, fmt.Errorf("metadata shard %d has unknown owner %q", shard, owner)
-		}
-		shards[shard] = owner
-	}
-	return topology{shardCount: shardCount, shardMap: shards, nodes: byID}, nil
+	return clustertopology.Validate(0, nodes, shardMap)
 }
 
 func (c *Client) clientForKey(key []byte) (nodev1.NodeServiceClient, error) {
@@ -380,13 +362,17 @@ func (c *Client) clientForKey(key []byte) (nodev1.NodeServiceClient, error) {
 		c.mu.RUnlock()
 		return nil, ErrClosed
 	}
-	owner, ok := router.OwnerForKey(key, c.topology.shardCount, c.topology.shardMap)
+	if len(c.topology.Nodes) == 0 || len(c.topology.ShardMap) == 0 {
+		c.mu.RUnlock()
+		return nil, ErrNoLiveNodes
+	}
+	owner, ok := router.OwnerForKey(key, c.topology.ShardCount, c.topology.ShardMap)
 	if !ok {
-		shard := router.ShardForKey(key, c.topology.shardCount)
+		shard := router.ShardForKey(key, c.topology.ShardCount)
 		c.mu.RUnlock()
 		return nil, fmt.Errorf("no owner for shard %d", shard)
 	}
-	address, ok := c.topology.nodes[owner]
+	address, ok := c.topology.Nodes[owner]
 	c.mu.RUnlock()
 	if !ok || address == "" {
 		return nil, fmt.Errorf("owner %q has no node address", owner)
@@ -400,13 +386,17 @@ func (c *Client) clientForAddress(address string) (nodev1.NodeServiceClient, err
 		c.mu.RUnlock()
 		return nil, ErrClosed
 	}
+	if !c.topology.OwnsAddress(address) {
+		c.mu.RUnlock()
+		return nil, fmt.Errorf("node address %s no longer owns a shard", address)
+	}
 	if node := c.nodeClients[address]; node != nil {
 		c.mu.RUnlock()
 		return node, nil
 	}
 	c.mu.RUnlock()
 
-	conn, err := grpc.NewClient(address, c.dialOptions...)
+	conn, err := c.nodeConnFactory(address)
 	if err != nil {
 		return nil, fmt.Errorf("create node client for %s: %w", address, err)
 	}
@@ -417,6 +407,10 @@ func (c *Client) clientForAddress(address string) (nodev1.NodeServiceClient, err
 	if c.closed {
 		_ = conn.Close()
 		return nil, ErrClosed
+	}
+	if !c.topology.OwnsAddress(address) {
+		_ = conn.Close()
+		return nil, fmt.Errorf("node address %s stopped owning shards while its connection was created", address)
 	}
 	if existing := c.nodeClients[address]; existing != nil {
 		_ = conn.Close()
@@ -433,14 +427,5 @@ func (c *Client) nodeAddresses() ([]string, error) {
 	if c.closed {
 		return nil, ErrClosed
 	}
-	seen := make(map[string]bool, len(c.topology.nodes))
-	addresses := make([]string, 0, len(c.topology.nodes))
-	for _, address := range c.topology.nodes {
-		if !seen[address] {
-			seen[address] = true
-			addresses = append(addresses, address)
-		}
-	}
-	sort.Strings(addresses)
-	return addresses, nil
+	return c.topology.OwnerAddresses(), nil
 }

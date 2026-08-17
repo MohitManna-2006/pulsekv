@@ -161,6 +161,10 @@ that the cross-language contract and routing logic are both correct before addin
 
 ## 6. Phase 3 — Membership and elasticity (Go)
 
+**Status: complete (2026-08-17).** Implementation details, verification
+evidence, and the exact Phase 4 handoff are recorded in
+`pulsekv-v2-phase3-summary.md`.
+
 **Goal:** replace the static node list with a live, self-healing membership view — nodes can join,
 leave, or fail, and the shard map updates accordingly without a central coordinator or client-
 visible downtime beyond the affected keys.

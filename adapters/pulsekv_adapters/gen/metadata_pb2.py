@@ -24,7 +24,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0emetadata.proto\x12\x13pulsekv.metadata.v1\"\x14\n\x12HealthCheckRequest\"9\n\x13HealthCheckResponse\x12\n\n\x02ok\x18\x01 \x01(\x08\x12\x16\n\x0euptime_seconds\x18\x02 \x01(\x03\";\n\x08NodeInfo\x12\x0f\n\x07node_id\x18\x01 \x01(\t\x12\x0f\n\x07\x61\x64\x64ress\x18\x02 \x01(\t\x12\r\n\x05\x61live\x18\x03 \x01(\x08\"\x14\n\x12GetNodeListRequest\"C\n\x13GetNodeListResponse\x12,\n\x05nodes\x18\x01 \x03(\x0b\x32\x1d.pulsekv.metadata.v1.NodeInfo\"\x14\n\x12GetShardMapRequest\"\xa2\x01\n\x13GetShardMapResponse\x12U\n\x10shard_to_node_id\x18\x01 \x03(\x0b\x32;.pulsekv.metadata.v1.GetShardMapResponse.ShardToNodeIdEntry\x1a\x34\n\x12ShardToNodeIdEntry\x12\x0b\n\x03key\x18\x01 \x01(\r\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\x32\xbe\x02\n\x16\x43lusterMetadataService\x12`\n\x0bHealthCheck\x12\'.pulsekv.metadata.v1.HealthCheckRequest\x1a(.pulsekv.metadata.v1.HealthCheckResponse\x12`\n\x0bGetNodeList\x12\'.pulsekv.metadata.v1.GetNodeListRequest\x1a(.pulsekv.metadata.v1.GetNodeListResponse\x12`\n\x0bGetShardMap\x12\'.pulsekv.metadata.v1.GetShardMapRequest\x1a(.pulsekv.metadata.v1.GetShardMapResponseB,Z*pulsekv/control/gen/metadata/v1;metadatav1b\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0emetadata.proto\x12\x13pulsekv.metadata.v1\"\x14\n\x12HealthCheckRequest\"9\n\x13HealthCheckResponse\x12\n\n\x02ok\x18\x01 \x01(\x08\x12\x16\n\x0euptime_seconds\x18\x02 \x01(\x03\";\n\x08NodeInfo\x12\x0f\n\x07node_id\x18\x01 \x01(\t\x12\x0f\n\x07\x61\x64\x64ress\x18\x02 \x01(\t\x12\r\n\x05\x61live\x18\x03 \x01(\x08\"\x14\n\x12GetNodeListRequest\"~\n\x13GetNodeListResponse\x12,\n\x05nodes\x18\x01 \x03(\x0b\x32\x1d.pulsekv.metadata.v1.NodeInfo\x12\x1b\n\x13topology_generation\x18\x02 \x01(\x04\x12\x1c\n\x14topology_fingerprint\x18\x03 \x01(\x0c\"\x14\n\x12GetShardMapRequest\"\xf2\x01\n\x13GetShardMapResponse\x12U\n\x10shard_to_node_id\x18\x01 \x03(\x0b\x32;.pulsekv.metadata.v1.GetShardMapResponse.ShardToNodeIdEntry\x12\x1b\n\x13topology_generation\x18\x02 \x01(\x04\x12\x1c\n\x14topology_fingerprint\x18\x03 \x01(\x0c\x12\x13\n\x0bshard_count\x18\x04 \x01(\r\x1a\x34\n\x12ShardToNodeIdEntry\x12\x0b\n\x03key\x18\x01 \x01(\r\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\x32\xbe\x02\n\x16\x43lusterMetadataService\x12`\n\x0bHealthCheck\x12\'.pulsekv.metadata.v1.HealthCheckRequest\x1a(.pulsekv.metadata.v1.HealthCheckResponse\x12`\n\x0bGetNodeList\x12\'.pulsekv.metadata.v1.GetNodeListRequest\x1a(.pulsekv.metadata.v1.GetNodeListResponse\x12`\n\x0bGetShardMap\x12\'.pulsekv.metadata.v1.GetShardMapRequest\x1a(.pulsekv.metadata.v1.GetShardMapResponseB,Z*pulsekv/control/gen/metadata/v1;metadatav1b\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -43,13 +43,13 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_GETNODELISTREQUEST']._serialized_start=181
   _globals['_GETNODELISTREQUEST']._serialized_end=201
   _globals['_GETNODELISTRESPONSE']._serialized_start=203
-  _globals['_GETNODELISTRESPONSE']._serialized_end=270
-  _globals['_GETSHARDMAPREQUEST']._serialized_start=272
-  _globals['_GETSHARDMAPREQUEST']._serialized_end=292
-  _globals['_GETSHARDMAPRESPONSE']._serialized_start=295
-  _globals['_GETSHARDMAPRESPONSE']._serialized_end=457
-  _globals['_GETSHARDMAPRESPONSE_SHARDTONODEIDENTRY']._serialized_start=405
-  _globals['_GETSHARDMAPRESPONSE_SHARDTONODEIDENTRY']._serialized_end=457
-  _globals['_CLUSTERMETADATASERVICE']._serialized_start=460
-  _globals['_CLUSTERMETADATASERVICE']._serialized_end=778
+  _globals['_GETNODELISTRESPONSE']._serialized_end=329
+  _globals['_GETSHARDMAPREQUEST']._serialized_start=331
+  _globals['_GETSHARDMAPREQUEST']._serialized_end=351
+  _globals['_GETSHARDMAPRESPONSE']._serialized_start=354
+  _globals['_GETSHARDMAPRESPONSE']._serialized_end=596
+  _globals['_GETSHARDMAPRESPONSE_SHARDTONODEIDENTRY']._serialized_start=544
+  _globals['_GETSHARDMAPRESPONSE_SHARDTONODEIDENTRY']._serialized_end=596
+  _globals['_CLUSTERMETADATASERVICE']._serialized_start=599
+  _globals['_CLUSTERMETADATASERVICE']._serialized_end=917
 # @@protoc_insertion_point(module_scope)

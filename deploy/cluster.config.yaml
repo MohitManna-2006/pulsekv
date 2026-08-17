@@ -1,9 +1,9 @@
-# PulseKV v2 -- static cluster definition for the local multi-process dev cluster.
+# PulseKV v2 -- launch/bootstrap inventory for the local dev cluster.
 #
 # This file is the single source of truth for the dev cluster's shape. It is
 # read by:
-#   * the Go control plane, which serves it back over
-#     ClusterMetadataService.GetNodeList / GetShardMap
+#   * the Go control plane, which uses it for its fixed shard count and gossip
+#     bootstrap endpoints; live membership itself comes from SWIM
 #   * deploy/run-local-cluster.sh and deploy/stop-local-cluster.sh, which get
 #     the node list by shelling out to `controlplane --print-nodes` rather than
 #     parsing YAML themselves
@@ -15,19 +15,19 @@
 # The default is 4 nodes: enough to prove routing and multi-process boot, small
 # enough for a fast edit-run-check loop.
 #
-# The design target for later chaos, gossip, and Raft testing (Phases 3 and 5)
-# is 8-32 simulated nodes on one machine -- that range is what makes gossip
+# The design target for gossip/chaos and later Raft testing (Phases 3 and 5) is
+# 8-32 simulated nodes on one machine -- that range is what makes gossip
 # convergence, rendezvous-hash key movement, and Raft leader election
 # meaningful to measure without real multi-host infrastructure. Adding entries
 # to `nodes:` below is the ONLY change needed to get there; no script takes the
 # node count as an argument or hardcodes it anywhere.
 #
-# To scale up, keep node_id unique and ports contiguous from 7100:
+# To scale up, keep node_id unique and both port ranges contiguous:
 #
 #   nodes:
-#     - {node_id: node-0, port: 7100}
+#     - {node_id: node-0, port: 7100, gossip_port: 7201}
 #     ...
-#     - {node_id: node-31, port: 7131}
+#     - {node_id: node-31, port: 7131, gossip_port: 7232}
 #
 # Port 7100 + N keeps 32 nodes inside 7100-7131, clear of the control plane.
 # The config loader rejects duplicate node IDs and duplicate host:port pairs
@@ -35,28 +35,38 @@
 # cluster where two nodes quietly fight over one port.
 #
 # ---------------------------------------------------------------------------
-# What Phase 2 does NOT do with this file
+# Authority boundaries
 # ---------------------------------------------------------------------------
-# There is no replication factor, no per-node capacity, and no explicit shard
-# assignment here yet. Those arrive with the phases that need them:
-#   Phase 3  gossip membership replaces this file as the source of the node list
+# The nodes here are processes the local launcher should create and addresses
+# participants may use to bootstrap. They are not the runtime node list: a
+# sidecar must join the gossip ring before ClusterMetadataService publishes it,
+# and a terminal leave/death removes it without changing this file.
+#
+# There is no replication factor or explicit shard assignment here:
 #   Phase 4  adds replication factor
 #   Phase 5  a Raft state machine replaces this file as the source of the shard map
-# The ClusterMetadataService contract does not change when that happens -- only
-# where the data comes from. That is the point of routing it all through this
-# file today.
+# The ClusterMetadataService methods remain stable; a content-derived topology
+# fingerprint prevents clients from combining epochs across its two calls.
 
 control_plane:
   # host is optional and defaults to 127.0.0.1.
   port: 7000
+  # memberlist uses this port for both TCP state exchange and UDP probes.
+  gossip_port: 7200
+
+# The label carried by every memberlist packet. Participants with a different
+# label cannot accidentally merge into this ring. The local demo binds every
+# endpoint to loopback; authenticated/encrypted gossip is production hardening,
+# not part of the Phase 3 local-cluster claim.
+membership:
+  cluster_name: pulsekv-v2
 
 # Number of logical cluster shards. These are the unit of ownership and, from
 # Phase 3 on, the unit of rebalancing.
 #
-# Phase 2 assigns them with deterministic rendezvous (HRW) hashing over the
-# static node list. That gives the minimal-key-movement property the design doc
-# requires; Phase 3 will recompute the same function from live gossip
-# membership rather than this startup-only list.
+# Phase 3 assigns them with deterministic rendezvous (HRW) hashing over the
+# live gossip snapshot. That gives the minimal-key-movement property the design
+# requires while nodes join, leave, fail, and recover.
 #
 # 256 gives a 4-node cluster 64 shards each and a 32-node cluster 8 each, which
 # is fine-grained enough for Phase 3 to have something real to move around.
@@ -96,9 +106,13 @@ engine:
 nodes:
   - node_id: node-0
     port: 7100
+    gossip_port: 7201
   - node_id: node-1
     port: 7101
+    gossip_port: 7202
   - node_id: node-2
     port: 7102
+    gossip_port: 7203
   - node_id: node-3
     port: 7103
+    gossip_port: 7204

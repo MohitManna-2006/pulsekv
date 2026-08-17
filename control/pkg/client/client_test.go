@@ -16,6 +16,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/status"
 
 	metadatav1 "pulsekv/control/gen/metadata/v1"
@@ -29,6 +30,9 @@ type testMetadata struct {
 	mu         sync.RWMutex
 	nodes      []*metadatav1.NodeInfo
 	shards     map[uint32]string
+	nodeGen    uint64
+	shardGen   uint64
+	shardCount uint32
 	nodeErr    error
 	shardErr   error
 	nodeCalls  atomic.Int64
@@ -42,7 +46,10 @@ func (m *testMetadata) GetNodeList(context.Context, *metadatav1.GetNodeListReque
 	if m.nodeErr != nil {
 		return nil, m.nodeErr
 	}
-	return &metadatav1.GetNodeListResponse{Nodes: m.nodes}, nil
+	return &metadatav1.GetNodeListResponse{
+		Nodes:              m.nodes,
+		TopologyGeneration: m.nodeGen,
+	}, nil
 }
 
 func (m *testMetadata) GetShardMap(context.Context, *metadatav1.GetShardMapRequest) (*metadatav1.GetShardMapResponse, error) {
@@ -52,7 +59,11 @@ func (m *testMetadata) GetShardMap(context.Context, *metadatav1.GetShardMapReque
 	if m.shardErr != nil {
 		return nil, m.shardErr
 	}
-	return &metadatav1.GetShardMapResponse{ShardToNodeId: m.shards}, nil
+	return &metadatav1.GetShardMapResponse{
+		ShardToNodeId:      m.shards,
+		TopologyGeneration: m.shardGen,
+		ShardCount:         m.shardCount,
+	}, nil
 }
 
 func (m *testMetadata) setTopology(nodes []*metadatav1.NodeInfo, shards map[uint32]string) {
@@ -60,6 +71,29 @@ func (m *testMetadata) setTopology(nodes []*metadatav1.NodeInfo, shards map[uint
 	defer m.mu.Unlock()
 	m.nodes = nodes
 	m.shards = shards
+	m.shardCount = uint32(len(shards))
+	m.nodeErr = nil
+	m.shardErr = nil
+}
+
+func (m *testMetadata) setTopologyGeneration(nodes []*metadatav1.NodeInfo,
+	shards map[uint32]string, generation uint64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.nodes = nodes
+	m.shards = shards
+	m.shardCount = uint32(len(shards))
+	m.nodeGen = generation
+	m.shardGen = generation
+	m.nodeErr = nil
+	m.shardErr = nil
+}
+
+func (m *testMetadata) setGenerations(nodeGeneration, shardGeneration uint64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.nodeGen = nodeGeneration
+	m.shardGen = shardGeneration
 	m.nodeErr = nil
 	m.shardErr = nil
 }
@@ -80,6 +114,7 @@ type testNode struct {
 	puts         int
 	chunkedPuts  int
 	chunkedGets  int
+	prefixScans  int
 }
 
 func newTestNode() *testNode {
@@ -170,6 +205,7 @@ func (n *testNode) GetChunked(req *nodev1.GetRequest, stream grpc.ServerStreamin
 
 func (n *testNode) PrefixMatch(req *nodev1.PrefixMatchRequest, stream grpc.ServerStreamingServer[nodev1.PrefixMatchResponse]) error {
 	n.mu.Lock()
+	n.prefixScans++
 	keys := make([]string, 0)
 	for key := range n.values {
 		if strings.HasPrefix(key, string(req.GetPrefix())) {
@@ -231,6 +267,24 @@ func keyOwnedBy(t *testing.T, owner string, shards map[uint32]string, shardCount
 	}
 	t.Fatalf("could not find a key owned by %s", owner)
 	return nil
+}
+
+func waitForTopologyGeneration(t *testing.T, c *Client, want uint64) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		c.mu.RLock()
+		generation := c.topology.Generation
+		c.mu.RUnlock()
+		if generation == want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	c.mu.RLock()
+	got := c.topology.Generation
+	c.mu.RUnlock()
+	t.Fatalf("topology generation = %d, want %d before deadline", got, want)
 }
 
 func TestClientRoutesAndScansCluster(t *testing.T) {
@@ -405,6 +459,297 @@ func TestRefreshInstallsOnlyCompleteValidTopology(t *testing.T) {
 	}
 }
 
+func TestRefreshRejectsTornGenerationAndRetainsLastGood(t *testing.T) {
+	nodeA, nodeB := newTestNode(), newTestNode()
+	addrA := serveTestGRPC(t, func(s *grpc.Server) { nodev1.RegisterNodeServiceServer(s, nodeA) })
+	addrB := serveTestGRPC(t, func(s *grpc.Server) { nodev1.RegisterNodeServiceServer(s, nodeB) })
+	nodes := []*metadatav1.NodeInfo{
+		{NodeId: "node-a", Address: addrA, Alive: true},
+		{NodeId: "node-b", Address: addrB, Alive: true},
+	}
+	md := &testMetadata{}
+	md.setTopologyGeneration(nodes, map[uint32]string{0: "node-a"}, 1)
+	mdAddr := serveTestGRPC(t, func(s *grpc.Server) {
+		metadatav1.RegisterClusterMetadataServiceServer(s, md)
+	})
+
+	c, err := New(mdAddr, WithRefreshInterval(0))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	md.setTopology(nodes, map[uint32]string{0: "node-b"})
+	md.setGenerations(2, 3)
+	if err := c.refresh(context.Background()); err == nil || !strings.Contains(err.Error(), "did not converge") {
+		t.Fatalf("torn refresh error = %v, want convergence error", err)
+	}
+
+	key := []byte("torn-generation")
+	if err := c.Put(context.Background(), key, []byte("last-good")); err != nil {
+		t.Fatalf("Put with retained topology: %v", err)
+	}
+	if !nodeA.has(key) || nodeB.has(key) {
+		t.Fatal("torn refresh replaced the last complete generation")
+	}
+	c.mu.RLock()
+	generation := c.topology.Generation
+	c.mu.RUnlock()
+	if generation != 1 {
+		t.Fatalf("installed generation = %d, want retained generation 1", generation)
+	}
+}
+
+func TestBackgroundRefreshTracksJoinAndLeave(t *testing.T) {
+	nodeA, nodeB := newTestNode(), newTestNode()
+	addrA := serveTestGRPC(t, func(s *grpc.Server) { nodev1.RegisterNodeServiceServer(s, nodeA) })
+	addrB := serveTestGRPC(t, func(s *grpc.Server) { nodev1.RegisterNodeServiceServer(s, nodeB) })
+	nodeAInfo := &metadatav1.NodeInfo{NodeId: "node-a", Address: addrA, Alive: true}
+	nodeBInfo := &metadatav1.NodeInfo{NodeId: "node-b", Address: addrB, Alive: true}
+
+	md := &testMetadata{}
+	md.setTopologyGeneration([]*metadatav1.NodeInfo{nodeAInfo}, map[uint32]string{0: "node-a"}, 1)
+	mdAddr := serveTestGRPC(t, func(s *grpc.Server) {
+		metadatav1.RegisterClusterMetadataServiceServer(s, md)
+	})
+	c, err := New(mdAddr,
+		WithRefreshInterval(2*time.Millisecond),
+		WithRefreshTimeout(250*time.Millisecond))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	// node-b joins and takes the only shard.
+	md.setTopologyGeneration([]*metadatav1.NodeInfo{nodeAInfo, nodeBInfo},
+		map[uint32]string{0: "node-b"}, 2)
+	waitForTopologyGeneration(t, c, 2)
+	joinedKey := []byte("after-join")
+	if err := c.Put(context.Background(), joinedKey, []byte("b")); err != nil {
+		t.Fatalf("Put after join: %v", err)
+	}
+	if !nodeB.has(joinedKey) || nodeA.has(joinedKey) {
+		t.Fatal("background refresh did not route through the joined node")
+	}
+
+	// node-b leaves; ownership returns to node-a without recreating the client.
+	md.setTopologyGeneration([]*metadatav1.NodeInfo{nodeAInfo},
+		map[uint32]string{0: "node-a"}, 3)
+	waitForTopologyGeneration(t, c, 3)
+	leftKey := []byte("after-leave")
+	if err := c.Put(context.Background(), leftKey, []byte("a")); err != nil {
+		t.Fatalf("Put after leave: %v", err)
+	}
+	if !nodeA.has(leftKey) || nodeB.has(leftKey) {
+		t.Fatal("background refresh did not route away from the departed node")
+	}
+}
+
+func TestRefreshInstallsAuthoritativeEmptyTopology(t *testing.T) {
+	node := newTestNode()
+	address := serveTestGRPC(t, func(s *grpc.Server) { nodev1.RegisterNodeServiceServer(s, node) })
+	md := &testMetadata{}
+	md.setTopologyGeneration([]*metadatav1.NodeInfo{
+		{NodeId: "node-a", Address: address, Alive: true},
+	}, map[uint32]string{0: "node-a"}, 1)
+	mdAddr := serveTestGRPC(t, func(s *grpc.Server) {
+		metadatav1.RegisterClusterMetadataServiceServer(s, md)
+	})
+	c, err := New(mdAddr, WithRefreshInterval(0))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	if err := c.Put(context.Background(), []byte("before-empty"), []byte("value")); err != nil {
+		t.Fatalf("initial Put: %v", err)
+	}
+	c.mu.RLock()
+	oldConn := c.nodeConns[address]
+	c.mu.RUnlock()
+	if oldConn == nil {
+		t.Fatal("initial Put did not cache a node connection")
+	}
+
+	md.mu.Lock()
+	md.nodes = nil
+	md.shards = map[uint32]string{}
+	md.nodeGen = 2
+	md.shardGen = 2
+	md.shardCount = 8
+	md.mu.Unlock()
+	if err := c.refresh(context.Background()); err != nil {
+		t.Fatalf("refresh empty topology: %v", err)
+	}
+	if err := c.Put(context.Background(), []byte("after-empty"), []byte("value")); !errors.Is(err, ErrNoLiveNodes) {
+		t.Fatalf("Put error = %v, want ErrNoLiveNodes", err)
+	}
+	if state := oldConn.GetState(); state != connectivity.Shutdown {
+		t.Fatalf("retired connection state = %s, want SHUTDOWN", state)
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.topology.Generation != 2 || c.topology.ShardCount != 8 ||
+		len(c.topology.Nodes) != 0 || len(c.topology.ShardMap) != 0 {
+		t.Fatalf("installed empty topology = %+v", c.topology)
+	}
+}
+
+func TestRefreshAddressChangeRetiresOldConnection(t *testing.T) {
+	nodeAtOldAddress, nodeAtNewAddress := newTestNode(), newTestNode()
+	oldAddress := serveTestGRPC(t, func(s *grpc.Server) {
+		nodev1.RegisterNodeServiceServer(s, nodeAtOldAddress)
+	})
+	newAddress := serveTestGRPC(t, func(s *grpc.Server) {
+		nodev1.RegisterNodeServiceServer(s, nodeAtNewAddress)
+	})
+	md := &testMetadata{}
+	md.setTopologyGeneration([]*metadatav1.NodeInfo{
+		{NodeId: "node-a", Address: oldAddress, Alive: true},
+	}, map[uint32]string{0: "node-a"}, 1)
+	mdAddr := serveTestGRPC(t, func(s *grpc.Server) {
+		metadatav1.RegisterClusterMetadataServiceServer(s, md)
+	})
+	c, err := New(mdAddr, WithRefreshInterval(0))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	if err := c.Put(context.Background(), []byte("before-address-change"), []byte("old")); err != nil {
+		t.Fatalf("initial Put: %v", err)
+	}
+	c.mu.RLock()
+	oldConn := c.nodeConns[oldAddress]
+	c.mu.RUnlock()
+	if oldConn == nil {
+		t.Fatal("initial operation did not cache the old connection")
+	}
+
+	md.setTopologyGeneration([]*metadatav1.NodeInfo{
+		{NodeId: "node-a", Address: newAddress, Alive: true},
+	}, map[uint32]string{0: "node-a"}, 2)
+	if err := c.refresh(context.Background()); err != nil {
+		t.Fatalf("refresh address change: %v", err)
+	}
+
+	c.mu.RLock()
+	_, oldConnCached := c.nodeConns[oldAddress]
+	_, oldClientCached := c.nodeClients[oldAddress]
+	c.mu.RUnlock()
+	if oldConnCached || oldClientCached {
+		t.Fatal("old address remained in the connection cache")
+	}
+	if state := oldConn.GetState(); state != connectivity.Shutdown {
+		t.Fatalf("old connection state = %s, want SHUTDOWN", state)
+	}
+
+	key := []byte("after-address-change")
+	if err := c.Put(context.Background(), key, []byte("new")); err != nil {
+		t.Fatalf("Put after address change: %v", err)
+	}
+	if !nodeAtNewAddress.has(key) || nodeAtOldAddress.has(key) {
+		t.Fatal("address refresh did not route to the new endpoint")
+	}
+}
+
+func TestConnectionCreatedDuringRemovalIsNotCached(t *testing.T) {
+	oldNode, newNode := newTestNode(), newTestNode()
+	oldAddress := serveTestGRPC(t, func(s *grpc.Server) { nodev1.RegisterNodeServiceServer(s, oldNode) })
+	newAddress := serveTestGRPC(t, func(s *grpc.Server) { nodev1.RegisterNodeServiceServer(s, newNode) })
+	md := &testMetadata{}
+	md.setTopologyGeneration([]*metadatav1.NodeInfo{
+		{NodeId: "node-a", Address: oldAddress, Alive: true},
+	}, map[uint32]string{0: "node-a"}, 1)
+	mdAddr := serveTestGRPC(t, func(s *grpc.Server) {
+		metadatav1.RegisterClusterMetadataServiceServer(s, md)
+	})
+	c, err := New(mdAddr, WithRefreshInterval(0))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	originalFactory := c.nodeConnFactory
+	dialStarted := make(chan struct{})
+	releaseDial := make(chan struct{})
+	c.nodeConnFactory = func(address string) (*grpc.ClientConn, error) {
+		close(dialStarted)
+		<-releaseDial
+		return originalFactory(address)
+	}
+	dialResult := make(chan error, 1)
+	go func() {
+		_, err := c.clientForAddress(oldAddress)
+		dialResult <- err
+	}()
+	<-dialStarted
+
+	md.setTopologyGeneration([]*metadatav1.NodeInfo{
+		{NodeId: "node-b", Address: newAddress, Alive: true},
+	}, map[uint32]string{0: "node-b"}, 2)
+	if err := c.refresh(context.Background()); err != nil {
+		t.Fatalf("refresh removal: %v", err)
+	}
+	close(releaseDial)
+	if err := <-dialResult; err == nil || !strings.Contains(err.Error(), "stopped owning shards") {
+		t.Fatalf("racing dial error = %v, want stale-address error", err)
+	}
+
+	c.mu.RLock()
+	_, connCached := c.nodeConns[oldAddress]
+	_, clientCached := c.nodeClients[oldAddress]
+	c.mu.RUnlock()
+	if connCached || clientCached {
+		t.Fatal("connection created during removal was cached after the refresh")
+	}
+}
+
+func TestPrefixMatchScansOnlyShardOwners(t *testing.T) {
+	owner, knownButUnowned := newTestNode(), newTestNode()
+	ownerAddress := serveTestGRPC(t, func(s *grpc.Server) {
+		nodev1.RegisterNodeServiceServer(s, owner)
+	})
+	unownedAddress := serveTestGRPC(t, func(s *grpc.Server) {
+		nodev1.RegisterNodeServiceServer(s, knownButUnowned)
+	})
+	md := &testMetadata{}
+	md.setTopologyGeneration([]*metadatav1.NodeInfo{
+		{NodeId: "node-a", Address: ownerAddress, Alive: true},
+		{NodeId: "node-b", Address: unownedAddress, Alive: false},
+	}, map[uint32]string{0: "node-a"}, 1)
+	mdAddr := serveTestGRPC(t, func(s *grpc.Server) {
+		metadatav1.RegisterClusterMetadataServiceServer(s, md)
+	})
+	c, err := New(mdAddr, WithRefreshInterval(0))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	key := []byte("owner-only:one")
+	if err := c.Put(context.Background(), key, []byte("value")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	matches, err := c.PrefixMatch(context.Background(), []byte("owner-only:"))
+	if err != nil {
+		t.Fatalf("PrefixMatch: %v", err)
+	}
+	if got := matches[string(key)]; !bytes.Equal(got, []byte("value")) {
+		t.Fatalf("match = %q, want value", got)
+	}
+
+	owner.mu.Lock()
+	ownerScans := owner.prefixScans
+	owner.mu.Unlock()
+	knownButUnowned.mu.Lock()
+	unownedScans := knownButUnowned.prefixScans
+	knownButUnowned.mu.Unlock()
+	if ownerScans != 1 || unownedScans != 0 {
+		t.Fatalf("prefix scans = owner %d, unowned %d; want 1 and 0", ownerScans, unownedScans)
+	}
+}
+
 func TestClientLargeValueUsesChunkedTransport(t *testing.T) {
 	node := newTestNode()
 	nodeAddr := serveTestGRPC(t, func(s *grpc.Server) { nodev1.RegisterNodeServiceServer(s, node) })
@@ -573,7 +918,7 @@ func TestValidateTopologyRejectsIncompleteMaps(t *testing.T) {
 		shards map[uint32]string
 		want   string
 	}{
-		{"empty", map[uint32]string{}, "empty shard map"},
+		{"empty", map[uint32]string{}, "zero shard count"},
 		{"gap", map[uint32]string{0: "node-a", 2: "node-a"}, "missing shard 1"},
 		{"unknown owner", map[uint32]string{0: "node-b"}, "unknown owner"},
 	}

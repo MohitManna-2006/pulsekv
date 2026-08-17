@@ -1,12 +1,9 @@
-// Package config loads the static cluster definition that Phases 0-2 use in
-// place of a membership protocol.
+// Package config loads the local cluster's launch and bootstrap inventory.
 //
-// Everything here is deliberately dumb: a YAML file lists the control plane's
-// port and one entry per data-plane node. Phase 3 replaces the node list with
-// gossip membership and Phase 5 replaces the shard map with a Raft-backed
-// state machine. Both of those swap out the *source* of this data without
-// changing the ClusterMetadataService contract that exposes it, which is the
-// whole reason this file exists rather than the node list being hardcoded.
+// Phase 3 no longer treats Nodes as authoritative metadata: each entry starts
+// one data-plane process and one gossip sidecar, and the live gossip view is
+// what ClusterMetadataService publishes. Phase 5 replaces the derived shard
+// map with a Raft-backed state machine.
 package config
 
 import (
@@ -14,6 +11,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"regexp"
 	"strconv"
 
 	"gopkg.in/yaml.v3"
@@ -30,7 +28,7 @@ const (
 	DefaultShardCount = 256
 
 	// DefaultHost is where a node listens when the config omits `host`. The
-	// The pre-membership dev cluster is single-machine by definition.
+	// local dev cluster is single-machine by definition.
 	DefaultHost = "127.0.0.1"
 
 	// Engine defaults, mirroring PK_ENGINE_DEFAULT_* in
@@ -41,6 +39,12 @@ const (
 	DefaultRAMBudgetBytes = 256 * 1024 * 1024
 	DefaultMaxValueBytes  = 64 * 1024 * 1024
 	DefaultDataRoot       = "run/data"
+	DefaultClusterName    = "pulsekv-v2"
+
+	DefaultControlPlaneGossipPort = 7200
+	DefaultNodeGossipPortBase     = 7201
+	MaxClusterNameBytes           = 255 // memberlist.LabelMaxSize
+	MaxNodeIDBytes                = 64
 
 	// EngineShards is the engine's fixed lock-shard count (PK_TABLE_SHARDS).
 	// Needed here only to warn about the per-shard budget split.
@@ -53,10 +57,13 @@ const (
 	maxPort = 65535
 )
 
+var nodeIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+
 // Endpoint is a host:port the control plane itself listens on.
 type Endpoint struct {
-	Host string `yaml:"host"`
-	Port int    `yaml:"port"`
+	Host       string `yaml:"host"`
+	Port       int    `yaml:"port"`
+	GossipPort int    `yaml:"gossip_port"`
 }
 
 // Address renders the endpoint as a gRPC dial target.
@@ -64,17 +71,37 @@ func (e Endpoint) Address() string {
 	return net.JoinHostPort(e.Host, strconv.Itoa(e.Port))
 }
 
+// GossipAddress is the memberlist TCP/UDP endpoint for the control plane.
+func (e Endpoint) GossipAddress() string {
+	return net.JoinHostPort(e.Host, strconv.Itoa(e.GossipPort))
+}
+
 // Node is one data-plane process: a node/grpc_shim binary serving NodeService.
 type Node struct {
-	NodeID string `yaml:"node_id"`
-	Host   string `yaml:"host"`
-	Port   int    `yaml:"port"`
+	NodeID     string `yaml:"node_id"`
+	Host       string `yaml:"host"`
+	Port       int    `yaml:"port"`
+	GossipPort int    `yaml:"gossip_port"`
 }
 
 // Address renders the node as a gRPC dial target. This is exactly the string
 // reported as NodeInfo.address.
 func (n Node) Address() string {
 	return net.JoinHostPort(n.Host, strconv.Itoa(n.Port))
+}
+
+// GossipAddress is the memberlist TCP/UDP endpoint for this node's Go
+// membership sidecar.
+func (n Node) GossipAddress() string {
+	return net.JoinHostPort(n.Host, strconv.Itoa(n.GossipPort))
+}
+
+// Membership contains settings shared by all gossip participants.
+type Membership struct {
+	// ClusterName becomes memberlist's packet label, preventing an accidental
+	// merge with an unrelated gossip ring. Gossip encryption is a later
+	// production-hardening concern; the dev ring binds to loopback by default.
+	ClusterName string `yaml:"cluster_name"`
 }
 
 // Engine is the per-node data-plane configuration, applied identically to
@@ -92,10 +119,11 @@ type Engine struct {
 
 // Config is the whole of deploy/cluster.config.yaml.
 type Config struct {
-	ControlPlane Endpoint `yaml:"control_plane"`
-	ShardCount   uint32   `yaml:"shard_count"`
-	Engine       Engine   `yaml:"engine"`
-	Nodes        []Node   `yaml:"nodes"`
+	ControlPlane Endpoint   `yaml:"control_plane"`
+	Membership   Membership `yaml:"membership"`
+	ShardCount   uint32     `yaml:"shard_count"`
+	Engine       Engine     `yaml:"engine"`
+	Nodes        []Node     `yaml:"nodes"`
 
 	// Path records where this config came from, for error messages.
 	Path string `yaml:"-"`
@@ -135,6 +163,12 @@ func (c *Config) applyDefaults() {
 	if c.ControlPlane.Host == "" {
 		c.ControlPlane.Host = DefaultHost
 	}
+	if c.ControlPlane.GossipPort == 0 {
+		c.ControlPlane.GossipPort = DefaultControlPlaneGossipPort
+	}
+	if c.Membership.ClusterName == "" {
+		c.Membership.ClusterName = DefaultClusterName
+	}
 	if c.Engine.RAMBudgetBytes == 0 {
 		c.Engine.RAMBudgetBytes = DefaultRAMBudgetBytes
 	}
@@ -147,6 +181,9 @@ func (c *Config) applyDefaults() {
 	for i := range c.Nodes {
 		if c.Nodes[i].Host == "" {
 			c.Nodes[i].Host = DefaultHost
+		}
+		if c.Nodes[i].GossipPort == 0 {
+			c.Nodes[i].GossipPort = DefaultNodeGossipPortBase + i
 		}
 	}
 }
@@ -182,6 +219,15 @@ func (c *Config) Warnings() []string {
 			c.Engine.MaxValueBytes, UnaryValueLimitBytes))
 	}
 
+	nonLoopback := !net.ParseIP(c.ControlPlane.Host).IsLoopback()
+	for _, node := range c.Nodes {
+		nonLoopback = nonLoopback || !net.ParseIP(node.Host).IsLoopback()
+	}
+	if nonLoopback {
+		out = append(out,
+			"membership is bound or advertised beyond loopback, but the local Phase 3 config only supplies a cluster label; labels isolate accidental rings but do not authenticate or encrypt gossip")
+	}
+
 	return out
 }
 
@@ -192,6 +238,18 @@ func (c *Config) Validate() error {
 
 	if err := validatePort("control_plane.port", c.ControlPlane.Port); err != nil {
 		problems = append(problems, err)
+	}
+	if err := validatePort("control_plane.gossip_port", c.ControlPlane.GossipPort); err != nil {
+		problems = append(problems, err)
+	}
+	if err := validateGossipHost("control_plane.host", c.ControlPlane.Host); err != nil {
+		problems = append(problems, err)
+	}
+	if c.Membership.ClusterName == "" {
+		problems = append(problems, errors.New("membership.cluster_name: must not be empty"))
+	} else if len(c.Membership.ClusterName) > MaxClusterNameBytes {
+		problems = append(problems, fmt.Errorf("membership.cluster_name: %d bytes exceeds memberlist's %d-byte label limit",
+			len(c.Membership.ClusterName), MaxClusterNameBytes))
 	}
 	if len(c.Nodes) == 0 {
 		problems = append(problems, errors.New("nodes: at least one node is required"))
@@ -210,9 +268,19 @@ func (c *Config) Validate() error {
 	}
 
 	seenID := make(map[string]int, len(c.Nodes))
-	// The control plane's own port participates in the uniqueness check --
-	// on a single-machine dev cluster it is competing for the same range.
-	seenAddr := map[string]string{c.ControlPlane.Address(): "control_plane"}
+	// memberlist listens on both TCP and UDP. Its TCP endpoint must not share
+	// an address with any gRPC listener or other gossip participant.
+	seenAddr := make(map[string]string, 2+2*len(c.Nodes))
+	addAddress := func(address, owner string) {
+		if previous, exists := seenAddr[address]; exists {
+			problems = append(problems, fmt.Errorf(
+				"%s: address %s already used by %s", owner, address, previous))
+			return
+		}
+		seenAddr[address] = owner
+	}
+	addAddress(c.ControlPlane.Address(), "control_plane")
+	addAddress(c.ControlPlane.GossipAddress(), "control_plane.gossip")
 
 	for i, n := range c.Nodes {
 		where := fmt.Sprintf("nodes[%d]", i)
@@ -220,6 +288,12 @@ func (c *Config) Validate() error {
 		switch {
 		case n.NodeID == "":
 			problems = append(problems, fmt.Errorf("%s.node_id: must not be empty", where))
+		case len(n.NodeID) > MaxNodeIDBytes:
+			problems = append(problems, fmt.Errorf("%s.node_id: %d bytes exceeds the %d-byte limit",
+				where, len(n.NodeID), MaxNodeIDBytes))
+		case !nodeIDPattern.MatchString(n.NodeID):
+			problems = append(problems, fmt.Errorf(
+				"%s.node_id: %q must match [A-Za-z0-9][A-Za-z0-9._-]*", where, n.NodeID))
 		default:
 			if prev, dup := seenID[n.NodeID]; dup {
 				problems = append(problems, fmt.Errorf(
@@ -230,16 +304,29 @@ func (c *Config) Validate() error {
 
 		if err := validatePort(where+".port", n.Port); err != nil {
 			problems = append(problems, err)
-			continue
 		}
-		addr := n.Address()
-		if owner, dup := seenAddr[addr]; dup {
-			problems = append(problems, fmt.Errorf("%s: address %s already used by %s", where, addr, owner))
+		if err := validatePort(where+".gossip_port", n.GossipPort); err != nil {
+			problems = append(problems, err)
 		}
-		seenAddr[addr] = where
+		if err := validateGossipHost(where+".host", n.Host); err != nil {
+			problems = append(problems, err)
+		}
+		addAddress(n.Address(), where)
+		addAddress(n.GossipAddress(), where+".gossip")
 	}
 
 	return errors.Join(problems...)
+}
+
+func validateGossipHost(field, host string) error {
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return fmt.Errorf("%s: %q must be an IP address because memberlist binds directly to it", field, host)
+	}
+	if ip.IsUnspecified() {
+		return fmt.Errorf("%s: %q cannot be advertised to gossip peers; use a routable interface address", field, host)
+	}
+	return nil
 }
 
 func validatePort(field string, port int) error {

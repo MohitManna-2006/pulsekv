@@ -7,19 +7,23 @@ from one config file.
 ```
 deploy/
 ├── Dockerfile              polyglot build image (C/C++/Go/Python + gRPC codegen)
-├── cluster.config.yaml     the cluster's shape — the only file you edit to resize it
+├── cluster.config.yaml     four-node fast-loop launch/bootstrap inventory
+├── cluster.chaos.config.yaml eight-node gossip/chaos fixture
 ├── common.sh               shared paths and helpers, sourced by the scripts
 ├── gen-proto.sh            regenerate the Go and Python stubs
-├── run-local-cluster.sh    build + boot + wait for health
+├── run-local-cluster.sh    build + boot + wait for health and membership
+├── local-node.sh           leave, crash, start, and restart one node pair
+├── chaos-test.sh           deterministic failure/rejoin test under sustained load
 ├── smoke-test.sh           assert the contract against the live cluster
 ├── stop-local-cluster.sh   terminate everything, sweep orphans
 ├── test-engine.sh          the C engine's suite: release / TSan / Valgrind
 └── bench-node.sh           node benchmark, fits-in-RAM vs exceeds-RAM
 ```
 
-`run-local-cluster.sh` also builds the Phase 2 Go tools under
-`deploy/build/bin/`: `pulsekv-example`, `pulsekv-cluster-bench`, and the
-single-node `pulsekv-node-bench`.
+`run-local-cluster.sh` also builds the Go membership sidecar and Phase 2/3
+tools under `deploy/build/bin/`: `pulsekv-member`, `pulsekv-example`,
+`pulsekv-cluster-bench`, `pulsekv-chaos`, and the single-node
+`pulsekv-node-bench`.
 
 Build output goes to `deploy/build/`, runtime state to `deploy/run/`. Both are
 gitignored. They live under `deploy/` rather than the repo-root `build/`
@@ -43,6 +47,7 @@ deploy/run-local-cluster.sh
 deploy/smoke-test.sh
 deploy/build/bin/pulsekv-example
 deploy/build/bin/pulsekv-cluster-bench --ops 10000 --warmup-ops 1000
+deploy/chaos-test.sh --target node-2 --cycles 3 --seed 7
 deploy/stop-local-cluster.sh
 ```
 
@@ -50,8 +55,10 @@ One-shot, CI shape:
 
 ```sh
 docker run --rm -v "$PWD:/src" -w /src pulsekv-v2-dev bash -c '
-  deploy/run-local-cluster.sh && deploy/smoke-test.sh; rc=$?
-  deploy/stop-local-cluster.sh; exit $rc'
+  trap "deploy/stop-local-cluster.sh || true" EXIT
+  deploy/run-local-cluster.sh
+  deploy/smoke-test.sh --no-install
+  deploy/chaos-test.sh --target node-2 --cycles 3 --seed 7'
 ```
 
 `pulsekv-v2-versions` inside the image prints every resolved toolchain version.
@@ -60,8 +67,10 @@ docker run --rm -v "$PWD:/src" -w /src pulsekv-v2-dev bash -c '
 
 `run-local-cluster.sh` starts processes **in the background** and records their
 PIDs in `deploy/run/cluster.pids`; per-process stdout/stderr goes to
-`deploy/run/logs/<label>.log`. The script returns once every process passes its
-health check, and the cluster keeps running until `stop-local-cluster.sh`.
+`deploy/run/logs/<label>.log`. It starts one C++ data process and one Go gossip
+sidecar per node. The script returns only after direct health checks pass and
+the control plane publishes the exact configured live set with a coherent HRW
+map. The cluster keeps running until `stop-local-cluster.sh`.
 
 The alternative — holding everything in the foreground — would make it
 impossible to run `smoke-test.sh` against the cluster from the same shell,
@@ -73,29 +82,32 @@ Consequences worth knowing:
   command finishes and takes the cluster with it. Use the one-shot form above,
   or an interactive shell.
 - `run-local-cluster.sh --restart` stops an existing cluster first.
-- `stop-local-cluster.sh` finishes with an orphan sweep: any `pulsekv-node` or
-  `pulsekv-controlplane` still alive that is *not* in the pid file gets found,
-  reported, and killed. A stop that leaves something holding port 7100 makes
-  the next boot fail for reasons that look nothing like the actual cause.
+- `stop-local-cluster.sh` gracefully removes sidecars before stopping data
+  processes, then stops the control-plane observer. Its orphan sweep also
+  covers the membership and chaos processes. A stop that leaves something
+  holding a service or gossip port makes the next boot fail for reasons that
+  look nothing like the actual cause.
 
 ## Resizing the cluster
 
-Edit `nodes:` in `cluster.config.yaml`. Nothing else. No script takes the node
-count as an argument or hardcodes it — they all read the config through
-`controlplane --print-nodes`, which is the server's own parser, so the scripts
-and the server cannot disagree about what the file says.
+Edit `nodes:` in `cluster.config.yaml`, assigning each node a unique service
+port and gossip port. No script takes the node count as an argument or
+hardcodes it — they all read the config through the control plane's own parser,
+so the scripts and server cannot disagree about what the file says.
 
-Default is 4 nodes (fast loop). The design target for Phase 3 gossip and Phase
-5 Raft chaos testing is 8–32 nodes on one machine; `cluster.config.yaml`
-documents the port layout for that.
+Default is 4 nodes (fast loop). `cluster.chaos.config.yaml` provides the
+eight-node Phase 3 fixture; the broader design target for gossip and Phase 5
+Raft chaos testing is 8–32 nodes on one machine.
 
 ## What each script guarantees
 
 | Script | Guarantee |
 |---|---|
-| `run-local-cluster.sh` | Every process is listening and answering `HealthCheck` before the "cluster ready" banner prints. On timeout it dumps each process's log, says whether it exited or just never answered, stops the partial cluster, and exits non-zero. |
+| `run-local-cluster.sh` | Every service answers `HealthCheck`, every sidecar is running, and metadata publishes the exact live node set and HRW map before the ready banner. On timeout it dumps logs, stops the partial cluster, and exits non-zero. |
+| `local-node.sh` | Operates on one configured data/sidecar pair. Graceful leave is published before data shutdown; crash paths exercise either SWIM detection or the local-service watchdog; start waits for data health before advertising it. |
+| `chaos-test.sh` | Runs one sustained correctness watcher while a target repeatedly leaves/fails and rejoins. It verifies every topology generation, exact minimal HRW movement, stable-key operations, and physical placement, then writes a JSON report. |
 | `smoke-test.sh` | Three legs — Go contract and routing assertions, the Python adapters client, and an optional grpcurl reflection check. The Go leg independently reproduces the HRW shard map and proves SDK writes hit the predicted owner and miss a different node. Non-zero on any failure. |
-| `stop-local-cluster.sh` | SIGTERM, up to 10s grace, then SIGKILL; plus the orphan sweep. Non-zero only if something could not be stopped. |
+| `stop-local-cluster.sh` | Stops watcher → sidecars → data nodes → control plane, with bounded SIGTERM grace, SIGKILL fallback, PID-identity guards, and an orphan sweep. |
 | `test-engine.sh` | Builds and runs the pure-C engine suite. No cluster, no gRPC, no network. |
 | `bench-node.sh` | Boots a dedicated node with a small RAM budget and benchmarks it twice — inside and well outside that budget. Fails the run on any unverified read. |
 
@@ -128,14 +140,40 @@ bridge instead of the tier. The script warns if you point it back into the repo.
 
 | Process | Port |
 |---|---|
-| control plane | 7000 |
-| `node-N` | 7100 + N |
+| control-plane gRPC | 7000 |
+| `node-N` gRPC | 7100 + N |
+| control-plane gossip (TCP + UDP) | 7200 |
+| `node-N` sidecar gossip (TCP + UDP) | 7201 + N |
 
-All on `127.0.0.1`. 7100–7131 leaves room for the full 32-node test cluster
-without touching the control plane's port. The config loader rejects duplicate
-node IDs and duplicate `host:port` pairs outright, so a copy-paste slip fails at
-startup instead of producing a cluster where two nodes quietly fight over one
-port.
+All on `127.0.0.1`. The config loader rejects duplicate node IDs and any reused
+service/gossip address, so a copy-paste slip fails at startup instead of
+producing processes that quietly fight over one port.
+
+## Watching membership change
+
+With the cluster running, each command blocks until metadata has converged:
+
+```sh
+deploy/local-node.sh status node-2
+deploy/local-node.sh leave node-2       # graceful gossip leave, then data stop
+deploy/local-node.sh start node-2       # data health, sidecar join, full topology
+deploy/local-node.sh crash node-2       # SIGKILL both; peers detect the failure
+deploy/local-node.sh start node-2
+deploy/local-node.sh node-crash node-2  # sidecar watchdog detects C++ failure
+deploy/local-node.sh start node-2
+```
+
+On `node-crash`, the existing sidecar withdraws the unhealthy service after
+three failed probes, stays alive as its supervisor, and rebuilds/rejoins its
+gossip participant when the C++ service returns. `start` repairs the missing
+data half of that pair; it does not layer a second sidecar over the first.
+
+`GetNodeList` and `GetShardMap` carry a local `topology_generation` for
+diagnostics and a SHA-256 `topology_fingerprint` over the complete topology.
+Clients install a pair only when the fingerprints agree and match its content;
+this remains safe even if a restarted control plane reuses a local generation
+number. Gossip is eventually consistent; Phase 5 adds Raft authority across
+multiple control-plane replicas.
 
 ## Poking at a running cluster
 

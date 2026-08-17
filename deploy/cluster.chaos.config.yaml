@@ -1,0 +1,28 @@
+# Eight-node local fixture for Phase 3 membership/elasticity chaos runs.
+# It uses the same service and gossip ranges as the four-node fast-loop config,
+# extended contiguously. Run only one fixture at a time.
+
+control_plane:
+  host: 127.0.0.1
+  port: 7000
+  gossip_port: 7200
+
+membership:
+  cluster_name: pulsekv-v2-chaos
+
+shard_count: 256
+
+engine:
+  ram_budget_bytes: 268435456
+  max_value_bytes: 67108864
+  data_root: run/data
+
+nodes:
+  - {node_id: node-0, host: 127.0.0.1, port: 7100, gossip_port: 7201}
+  - {node_id: node-1, host: 127.0.0.1, port: 7101, gossip_port: 7202}
+  - {node_id: node-2, host: 127.0.0.1, port: 7102, gossip_port: 7203}
+  - {node_id: node-3, host: 127.0.0.1, port: 7103, gossip_port: 7204}
+  - {node_id: node-4, host: 127.0.0.1, port: 7104, gossip_port: 7205}
+  - {node_id: node-5, host: 127.0.0.1, port: 7105, gossip_port: 7206}
+  - {node_id: node-6, host: 127.0.0.1, port: 7106, gossip_port: 7207}
+  - {node_id: node-7, host: 127.0.0.1, port: 7107, gossip_port: 7208}

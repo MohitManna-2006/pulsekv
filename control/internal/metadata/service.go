@@ -1,58 +1,39 @@
 // Package metadata implements ClusterMetadataService.
 //
-// Phase 2 scope: the node list is static, read once from
-// deploy/cluster.config.yaml at startup, and the shard map is a pure
-// rendezvous-hash computation over that list. NodeInfo.alive is still a direct,
-// bounded NodeService.HealthCheck probe -- see aliveness() for why that is not
-// the same thing as the gossip membership Phase 3 adds.
+// Phase 3 serves immutable generations from the SWIM gossip membership view.
+// Every published node is an active data member, and the shard map is the pure
+// rendezvous-hash assignment over exactly that generation's node IDs.
 package metadata
 
 import (
 	"context"
+	"errors"
 	"log"
-	"sync"
 	"time"
 
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	metadatav1 "pulsekv/control/gen/metadata/v1"
-	nodev1 "pulsekv/control/gen/node/v1"
 	"pulsekv/control/internal/config"
+	"pulsekv/control/internal/membership"
 	"pulsekv/control/internal/router"
+	clustertopology "pulsekv/control/internal/topology"
 )
 
-// DefaultProbeTimeout bounds how long GetNodeList will wait on an unresponsive
-// node before calling it not-alive. Kept short: the caller is asking for the
-// cluster's shape, not for a definitive verdict on any one node.
-const DefaultProbeTimeout = 300 * time.Millisecond
-
-// Service serves ClusterMetadataService from static configuration.
+// Service serves ClusterMetadataService from a maintained membership source.
 type Service struct {
 	metadatav1.UnimplementedClusterMetadataServiceServer
 
-	cfg     *config.Config
-	started time.Time
-
-	probeTimeout time.Duration
-	// clients is keyed by node ID. grpc.NewClient is lazy, so constructing
-	// these up front costs nothing until the first probe and saves a
-	// connection setup per GetNodeList afterwards.
-	clients map[string]nodev1.NodeServiceClient
-	conns   []*grpc.ClientConn
+	shardCount uint32
+	source     membership.Source
+	configPath string
+	started    time.Time
 }
 
 // Option customises a Service.
 type Option func(*Service)
-
-// WithProbeTimeout overrides how long each liveness probe may take.
-func WithProbeTimeout(d time.Duration) Option {
-	return func(s *Service) {
-		if d > 0 {
-			s.probeTimeout = d
-		}
-	}
-}
 
 // WithStartTime pins the instant uptime is measured from. Used by tests; the
 // server otherwise uses process start.
@@ -60,43 +41,35 @@ func WithStartTime(t time.Time) Option {
 	return func(s *Service) { s.started = t }
 }
 
-// New builds a Service over cfg. The returned Service owns one lazy gRPC
-// client connection per configured node and must be Closed.
-func New(cfg *config.Config, opts ...Option) (*Service, error) {
+// New builds a Service over cfg's fixed shard count and a live membership
+// source. The config's Nodes remain launch inventory and are not consulted by
+// request handlers.
+func New(cfg *config.Config, source membership.Source, opts ...Option) (*Service, error) {
+	if cfg == nil {
+		return nil, errors.New("metadata config must not be nil")
+	}
+	if source == nil {
+		return nil, errors.New("metadata membership source must not be nil")
+	}
+	if cfg.ShardCount == 0 {
+		return nil, errors.New("metadata shard count must be positive")
+	}
 	s := &Service{
-		cfg:          cfg,
-		started:      time.Now(),
-		probeTimeout: DefaultProbeTimeout,
-		clients:      make(map[string]nodev1.NodeServiceClient, len(cfg.Nodes)),
+		shardCount: cfg.ShardCount,
+		source:     source,
+		configPath: cfg.Path,
+		started:    time.Now(),
 	}
 	for _, o := range opts {
 		o(s)
 	}
 
-	for _, n := range cfg.Nodes {
-		conn, err := grpc.NewClient(n.Address(),
-			grpc.WithTransportCredentials(insecure.NewCredentials()))
-		if err != nil {
-			s.Close()
-			return nil, err
-		}
-		s.conns = append(s.conns, conn)
-		s.clients[n.NodeID] = nodev1.NewNodeServiceClient(conn)
-	}
 	return s, nil
 }
 
-// Close releases the per-node client connections.
-func (s *Service) Close() error {
-	var firstErr error
-	for _, c := range s.conns {
-		if err := c.Close(); err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
-	s.conns = nil
-	return firstErr
-}
+// Close exists for lifecycle symmetry. The membership manager is owned and
+// closed by the control-plane process, not by this service.
+func (s *Service) Close() error { return nil }
 
 // Register wires the service into a gRPC server.
 func (s *Service) Register(srv grpc.ServiceRegistrar) {
@@ -111,73 +84,99 @@ func (s *Service) HealthCheck(_ context.Context, _ *metadatav1.HealthCheckReques
 	}, nil
 }
 
-// GetNodeList returns the statically configured nodes, each annotated with a
-// freshly probed liveness bit.
-func (s *Service) GetNodeList(ctx context.Context, _ *metadatav1.GetNodeListRequest) (*metadatav1.GetNodeListResponse, error) {
-	alive := s.aliveness(ctx)
-
-	nodes := make([]*metadatav1.NodeInfo, 0, len(s.cfg.Nodes))
-	for _, n := range s.cfg.Nodes {
+// GetNodeList returns the active data nodes in one published generation.
+func (s *Service) GetNodeList(_ context.Context, _ *metadatav1.GetNodeListRequest) (*metadatav1.GetNodeListResponse, error) {
+	snapshot, err := s.snapshot()
+	if err != nil {
+		return nil, err
+	}
+	nodes := make([]*metadatav1.NodeInfo, 0, len(snapshot.Nodes))
+	for _, n := range snapshot.Nodes {
 		nodes = append(nodes, &metadatav1.NodeInfo{
 			NodeId:  n.NodeID,
-			Address: n.Address(),
-			Alive:   alive[n.NodeID],
+			Address: n.Address,
+			Alive:   true,
 		})
 	}
-	return &metadatav1.GetNodeListResponse{Nodes: nodes}, nil
-}
-
-// GetShardMap returns the shard assignment for the statically configured nodes.
-func (s *Service) GetShardMap(_ context.Context, _ *metadatav1.GetShardMapRequest) (*metadatav1.GetShardMapResponse, error) {
-	return &metadatav1.GetShardMapResponse{
-		ShardToNodeId: router.AssignShards(s.cfg.NodeIDs(), s.cfg.ShardCount),
+	return &metadatav1.GetNodeListResponse{
+		Nodes:               nodes,
+		TopologyGeneration:  snapshot.Generation,
+		TopologyFingerprint: topologyFingerprint(s.shardCount, snapshot.Nodes, nil),
 	}, nil
 }
 
-// aliveness probes every node's NodeService.HealthCheck in parallel, bounded
-// by probeTimeout.
-//
-// This is deliberately *not* membership. It is a point-in-time question asked
-// synchronously by the caller, with no failure detector, no suspicion state,
-// and no effect on the shard map -- a node that fails this probe still owns
-// its shards. Phase 3 replaces this with SWIM gossip, at which point aliveness
-// becomes a maintained view rather than a probe, and starts feeding shard
-// recomputation. Reporting alive=true unconditionally here would have been
-// less code and a lie.
-func (s *Service) aliveness(ctx context.Context) map[string]bool {
-	ctx, cancel := context.WithTimeout(ctx, s.probeTimeout)
-	defer cancel()
-
-	var (
-		mu     sync.Mutex
-		result = make(map[string]bool, len(s.clients))
-		wg     sync.WaitGroup
-	)
-
-	for nodeID, client := range s.clients {
-		wg.Add(1)
-		go func(nodeID string, client nodev1.NodeServiceClient) {
-			defer wg.Done()
-
-			resp, err := client.HealthCheck(ctx, &nodev1.HealthCheckRequest{})
-			ok := err == nil && resp.GetOk()
-
-			mu.Lock()
-			result[nodeID] = ok
-			mu.Unlock()
-		}(nodeID, client)
+// GetShardMap returns the assignment for one published membership generation.
+func (s *Service) GetShardMap(_ context.Context, _ *metadatav1.GetShardMapRequest) (*metadatav1.GetShardMapResponse, error) {
+	snapshot, err := s.snapshot()
+	if err != nil {
+		return nil, err
 	}
-	wg.Wait()
-	return result
+	nodeIDs := make([]string, 0, len(snapshot.Nodes))
+	for _, n := range snapshot.Nodes {
+		nodeIDs = append(nodeIDs, n.NodeID)
+	}
+	shardMap := router.AssignShards(nodeIDs, s.shardCount)
+	return &metadatav1.GetShardMapResponse{
+		ShardToNodeId:       shardMap,
+		TopologyGeneration:  snapshot.Generation,
+		TopologyFingerprint: topologyFingerprint(s.shardCount, snapshot.Nodes, shardMap),
+		ShardCount:          s.shardCount,
+	}, nil
+}
+
+// topologyFingerprint is the cross-publisher identity used to join the two
+// metadata RPCs safely. The membership generation is intentionally not part of
+// it: two observers can reach the same valid topology through different event
+// histories, while a restarted observer can reuse an old local generation for
+// different content.
+func topologyFingerprint(shardCount uint32, nodes []membership.Node, shardMap map[uint32]string) []byte {
+	addresses := make(map[string]string, len(nodes))
+	ids := make([]string, 0, len(nodes))
+	for _, node := range nodes {
+		addresses[node.NodeID] = node.Address
+		ids = append(ids, node.NodeID)
+	}
+	if shardMap == nil {
+		shardMap = router.AssignShards(ids, shardCount)
+	}
+	return clustertopology.Fingerprint(shardCount, addresses, shardMap)
+}
+
+func (s *Service) snapshot() (membership.Snapshot, error) {
+	snapshot := s.source.Snapshot()
+	seenIDs := make(map[string]bool, len(snapshot.Nodes))
+	seenAddresses := make(map[string]bool, len(snapshot.Nodes))
+	for _, node := range snapshot.Nodes {
+		if node.NodeID == "" || node.Address == "" {
+			return membership.Snapshot{}, status.Error(codes.Internal,
+				"membership source returned an empty node ID or address")
+		}
+		if seenIDs[node.NodeID] {
+			return membership.Snapshot{}, status.Errorf(codes.Internal,
+				"membership source returned duplicate node ID %q", node.NodeID)
+		}
+		if seenAddresses[node.Address] {
+			return membership.Snapshot{}, status.Errorf(codes.Internal,
+				"membership source returned duplicate node address %q", node.Address)
+		}
+		seenIDs[node.NodeID] = true
+		seenAddresses[node.Address] = true
+	}
+	return snapshot, nil
 }
 
 // LogSummary prints what this service is serving, once, at startup. Useful
 // because "the control plane is up" and "the control plane is up with the
 // config you meant" are different claims.
 func (s *Service) LogSummary() {
-	log.Printf("metadata: serving %d node(s) and %d shard(s) from %s",
-		len(s.cfg.Nodes), s.cfg.ShardCount, s.cfg.Path)
-	for _, n := range s.cfg.Nodes {
-		log.Printf("metadata:   %-10s %s", n.NodeID, n.Address())
+	snapshot := s.source.Snapshot()
+	where := s.configPath
+	if where == "" {
+		where = "launch config"
+	}
+	log.Printf("metadata: gossip generation %d has %d live data node(s); serving %d shard(s) (bootstrap %s)",
+		snapshot.Generation, len(snapshot.Nodes), s.shardCount, where)
+	for _, n := range snapshot.Nodes {
+		log.Printf("metadata:   %-10s %s", n.NodeID, n.Address)
 	}
 }

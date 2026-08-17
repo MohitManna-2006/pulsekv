@@ -33,17 +33,21 @@ class GetNodeListRequest(_message.Message):
     def __init__(self) -> None: ...
 
 class GetNodeListResponse(_message.Message):
-    __slots__ = ("nodes",)
+    __slots__ = ("nodes", "topology_generation", "topology_fingerprint")
     NODES_FIELD_NUMBER: _ClassVar[int]
+    TOPOLOGY_GENERATION_FIELD_NUMBER: _ClassVar[int]
+    TOPOLOGY_FINGERPRINT_FIELD_NUMBER: _ClassVar[int]
     nodes: _containers.RepeatedCompositeFieldContainer[NodeInfo]
-    def __init__(self, nodes: _Optional[_Iterable[_Union[NodeInfo, _Mapping]]] = ...) -> None: ...
+    topology_generation: int
+    topology_fingerprint: bytes
+    def __init__(self, nodes: _Optional[_Iterable[_Union[NodeInfo, _Mapping]]] = ..., topology_generation: _Optional[int] = ..., topology_fingerprint: _Optional[bytes] = ...) -> None: ...
 
 class GetShardMapRequest(_message.Message):
     __slots__ = ()
     def __init__(self) -> None: ...
 
 class GetShardMapResponse(_message.Message):
-    __slots__ = ("shard_to_node_id",)
+    __slots__ = ("shard_to_node_id", "topology_generation", "topology_fingerprint", "shard_count")
     class ShardToNodeIdEntry(_message.Message):
         __slots__ = ("key", "value")
         KEY_FIELD_NUMBER: _ClassVar[int]
@@ -52,5 +56,11 @@ class GetShardMapResponse(_message.Message):
         value: str
         def __init__(self, key: _Optional[int] = ..., value: _Optional[str] = ...) -> None: ...
     SHARD_TO_NODE_ID_FIELD_NUMBER: _ClassVar[int]
+    TOPOLOGY_GENERATION_FIELD_NUMBER: _ClassVar[int]
+    TOPOLOGY_FINGERPRINT_FIELD_NUMBER: _ClassVar[int]
+    SHARD_COUNT_FIELD_NUMBER: _ClassVar[int]
     shard_to_node_id: _containers.ScalarMap[int, str]
-    def __init__(self, shard_to_node_id: _Optional[_Mapping[int, str]] = ...) -> None: ...
+    topology_generation: int
+    topology_fingerprint: bytes
+    shard_count: int
+    def __init__(self, shard_to_node_id: _Optional[_Mapping[int, str]] = ..., topology_generation: _Optional[int] = ..., topology_fingerprint: _Optional[bytes] = ..., shard_count: _Optional[int] = ...) -> None: ...

@@ -36,8 +36,17 @@ func TestLoadAppliesDefaults(t *testing.T) {
 	if got, want := cfg.ControlPlane.Address(), "127.0.0.1:7000"; got != want {
 		t.Errorf("control plane address = %q, want %q", got, want)
 	}
+	if got, want := cfg.ControlPlane.GossipAddress(), "127.0.0.1:7200"; got != want {
+		t.Errorf("control plane gossip address = %q, want %q", got, want)
+	}
 	if got, want := cfg.Nodes[1].Address(), "127.0.0.1:7101"; got != want {
 		t.Errorf("node-1 address = %q, want %q", got, want)
+	}
+	if got, want := cfg.Nodes[1].GossipAddress(), "127.0.0.1:7202"; got != want {
+		t.Errorf("node-1 gossip address = %q, want %q", got, want)
+	}
+	if got, want := cfg.Membership.ClusterName, DefaultClusterName; got != want {
+		t.Errorf("membership cluster name = %q, want %q", got, want)
 	}
 	if got, want := len(cfg.Nodes), 2; got != want {
 		t.Errorf("node count = %d, want %d", got, want)
@@ -84,9 +93,49 @@ func TestLoadRejectsBadConfigs(t *testing.T) {
 			want: "already used by control_plane",
 		},
 		{
+			name: "node service collides with control plane gossip",
+			body: "control_plane:\n  port: 7000\n  gossip_port: 7100\nnodes:\n  - {node_id: a, port: 7100, gossip_port: 7201}\n",
+			want: "already used by control_plane.gossip",
+		},
+		{
+			name: "duplicate gossip address",
+			body: "control_plane:\n  port: 7000\nnodes:\n  - {node_id: a, port: 7100, gossip_port: 7300}\n  - {node_id: b, port: 7101, gossip_port: 7300}\n",
+			want: "already used by nodes[0].gossip",
+		},
+		{
+			name: "gossip port out of range",
+			body: "control_plane:\n  port: 7000\nnodes:\n  - {node_id: a, port: 7100, gossip_port: 70000}\n",
+			want: "gossip_port: 70000 is not in 1..65535",
+		},
+		{
+			name: "hostname cannot be a memberlist bind address",
+			body: "control_plane:\n  host: localhost\n  port: 7000\nnodes:\n  - {node_id: a, port: 7100}\n",
+			want: "must be an IP address because memberlist binds directly",
+		},
+		{
+			name: "unspecified address cannot be advertised",
+			body: "control_plane:\n  host: 0.0.0.0\n  port: 7000\nnodes:\n  - {node_id: a, port: 7100}\n",
+			want: "cannot be advertised to gossip peers",
+		},
+		{
+			name: "cluster label too long",
+			body: "control_plane:\n  port: 7000\nmembership:\n  cluster_name: " + strings.Repeat("x", MaxClusterNameBytes+1) + "\nnodes:\n  - {node_id: a, port: 7100}\n",
+			want: "exceeds memberlist's 255-byte label limit",
+		},
+		{
 			name: "empty node id",
 			body: "control_plane:\n  port: 7000\nnodes:\n  - {node_id: \"\", port: 7100}\n",
 			want: "must not be empty",
+		},
+		{
+			name: "unsafe node id",
+			body: "control_plane:\n  port: 7000\nnodes:\n  - {node_id: ../outside, port: 7100}\n",
+			want: "must match [A-Za-z0-9][A-Za-z0-9._-]*",
+		},
+		{
+			name: "node id delimiter",
+			body: "control_plane:\n  port: 7000\nnodes:\n  - {node_id: 'node,other', port: 7100}\n",
+			want: "must match [A-Za-z0-9][A-Za-z0-9._-]*",
 		},
 		{
 			name: "no nodes",

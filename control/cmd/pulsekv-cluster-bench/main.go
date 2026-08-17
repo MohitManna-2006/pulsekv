@@ -26,6 +26,7 @@ import (
 	metadatav1 "pulsekv/control/gen/metadata/v1"
 	nodev1 "pulsekv/control/gen/node/v1"
 	"pulsekv/control/internal/router"
+	clustertopology "pulsekv/control/internal/topology"
 	"pulsekv/control/internal/transport"
 	sdk "pulsekv/control/pkg/client"
 )
@@ -48,6 +49,8 @@ func main() {
 		keyPrefix       = flag.String("key-prefix", "cluster-bench", "key namespace, so benchmark runs can be isolated")
 		metadataTimeout = flag.Duration("metadata-timeout", 5*time.Second, "deadline for each metadata RPC")
 		rpcTimeout      = flag.Duration("rpc-timeout", 60*time.Second, "deadline for each SDK or direct-node operation")
+		refreshInterval = flag.Duration("refresh-interval", time.Second,
+			"SDK topology polling interval; zero disables refresh")
 	)
 	flag.Parse()
 
@@ -63,6 +66,7 @@ func main() {
 		keyPrefix:       *keyPrefix,
 		metadataTimeout: *metadataTimeout,
 		rpcTimeout:      *rpcTimeout,
+		refreshInterval: *refreshInterval,
 	}
 	if err := b.validate(); err != nil {
 		fmt.Fprintf(os.Stderr, "pulsekv-cluster-bench: %v\n", err)
@@ -86,6 +90,7 @@ type benchmark struct {
 	keyPrefix       string
 	metadataTimeout time.Duration
 	rpcTimeout      time.Duration
+	refreshInterval time.Duration
 }
 
 func (b *benchmark) validate() error {
@@ -110,6 +115,8 @@ func (b *benchmark) validate() error {
 		return fmt.Errorf("--metadata-timeout must be positive")
 	case b.rpcTimeout <= 0:
 		return fmt.Errorf("--rpc-timeout must be positive")
+	case b.refreshInterval < 0:
+		return fmt.Errorf("--refresh-interval must not be negative")
 	default:
 		return nil
 	}
@@ -124,7 +131,7 @@ func (b *benchmark) run() (runErr error) {
 	}
 
 	cluster, err := sdk.New(b.controlPlane,
-		sdk.WithRefreshInterval(0),
+		sdk.WithRefreshInterval(b.refreshInterval),
 		sdk.WithRefreshTimeout(b.metadataTimeout))
 	if err != nil {
 		return fmt.Errorf("create SDK client: %w", err)
@@ -179,8 +186,8 @@ func (b *benchmark) printHeader(t clusterTopology) {
 	fmt.Println("=== PulseKV cluster benchmark ===")
 	fmt.Println()
 	fmt.Printf("control plane %s\n", b.controlPlane)
-	fmt.Printf("topology      %d shards, %d nodes (%d reported alive), %d shard owners\n",
-		t.shardCount, len(t.nodes), alive, len(t.ownerIDs))
+	fmt.Printf("topology      generation %d; %d shards, %d nodes (%d reported alive), %d shard owners\n",
+		t.generation, t.shardCount, len(t.nodes), alive, len(t.ownerIDs))
 	fmt.Printf("workers       %d\n", b.workers)
 	fmt.Printf("value size    %d B\n", b.valueSize)
 	fmt.Printf("working set   %d keys (%s)\n", b.keys,
@@ -189,7 +196,8 @@ func (b *benchmark) printHeader(t clusterTopology) {
 	fmt.Printf("read ratio    %.2f\n", b.readRatio)
 	fmt.Printf("seed          %d\n", b.seed)
 	fmt.Printf("key prefix    %s\n", b.keyPrefix)
-	fmt.Printf("timeouts      metadata=%s rpc=%s\n", b.metadataTimeout, b.rpcTimeout)
+	fmt.Printf("timeouts      metadata=%s rpc=%s refresh=%s\n",
+		b.metadataTimeout, b.rpcTimeout, b.refreshInterval)
 	fmt.Printf("path          %s\n", b.pathName())
 	fmt.Println()
 }
@@ -211,6 +219,7 @@ type nodeEndpoint struct {
 }
 
 type clusterTopology struct {
+	generation uint64
 	shardCount uint32
 	shardMap   map[uint32]string
 	nodes      map[string]nodeEndpoint
@@ -232,75 +241,37 @@ func (b *benchmark) fetchTopology() (clusterTopology, error) {
 
 	metadata := metadatav1.NewClusterMetadataServiceClient(conn)
 	ctx, cancel := context.WithTimeout(context.Background(), b.metadataTimeout)
-	nodes, err := metadata.GetNodeList(ctx, &metadatav1.GetNodeListRequest{})
-	cancel()
+	defer cancel()
+	snapshot, err := clustertopology.Fetch(ctx, metadata)
 	if err != nil {
-		return clusterTopology{}, fmt.Errorf("GetNodeList: %w", err)
+		return clusterTopology{}, err
 	}
-
-	ctx, cancel = context.WithTimeout(context.Background(), b.metadataTimeout)
-	shards, err := metadata.GetShardMap(ctx, &metadatav1.GetShardMapRequest{})
-	cancel()
-	if err != nil {
-		return clusterTopology{}, fmt.Errorf("GetShardMap: %w", err)
-	}
-	return validateTopology(nodes.GetNodes(), shards.GetShardToNodeId())
+	return validateTopology(snapshot)
 }
 
-func validateTopology(nodeList []*metadatav1.NodeInfo, shardMap map[uint32]string) (clusterTopology, error) {
-	if len(nodeList) == 0 {
-		return clusterTopology{}, fmt.Errorf("metadata returned no nodes")
-	}
-	nodes := make(map[string]nodeEndpoint, len(nodeList))
-	addresses := make(map[string]string, len(nodeList))
-	nodeIDs := make([]string, 0, len(nodeList))
-	for i, node := range nodeList {
-		if node == nil {
-			return clusterTopology{}, fmt.Errorf("metadata node %d is nil", i)
-		}
-		id, address := node.GetNodeId(), node.GetAddress()
-		if id == "" || address == "" {
-			return clusterTopology{}, fmt.Errorf("metadata node %d has an empty ID or address", i)
-		}
-		if _, exists := nodes[id]; exists {
-			return clusterTopology{}, fmt.Errorf("metadata returned duplicate node ID %q", id)
-		}
-		if previous, exists := addresses[address]; exists {
-			return clusterTopology{}, fmt.Errorf("metadata nodes %q and %q share address %q", previous, id, address)
-		}
-		nodes[id] = nodeEndpoint{address: address, alive: node.GetAlive()}
-		addresses[address] = id
+func validateTopology(snapshot clustertopology.Snapshot) (clusterTopology, error) {
+	nodes := make(map[string]nodeEndpoint, len(snapshot.Nodes))
+	nodeIDs := make([]string, 0, len(snapshot.Nodes))
+	for id, address := range snapshot.Nodes {
+		nodes[id] = nodeEndpoint{address: address, alive: true}
 		nodeIDs = append(nodeIDs, id)
 	}
 	sort.Strings(nodeIDs)
 
-	if len(shardMap) == 0 {
-		return clusterTopology{}, fmt.Errorf("metadata returned an empty shard map")
-	}
-	if uint64(len(shardMap)) > uint64(^uint32(0)) {
-		return clusterTopology{}, fmt.Errorf("metadata shard map is too large")
-	}
-	shardCount := uint32(len(shardMap))
 	owners := make(map[string]bool, len(nodes))
-	for shard := uint32(0); shard < shardCount; shard++ {
-		owner, ok := shardMap[shard]
-		if !ok {
-			return clusterTopology{}, fmt.Errorf("metadata shard map is missing shard %d", shard)
-		}
-		if _, ok := nodes[owner]; !ok {
-			return clusterTopology{}, fmt.Errorf("metadata shard %d has unknown owner %q", shard, owner)
-		}
+	for _, owner := range snapshot.ShardMap {
 		owners[owner] = true
 	}
 
 	// Phase 2 placement is a pure function of the static node list and shard
 	// count. Cross-checking it here prevents a malformed but superficially
 	// complete map from becoming the routing proof's own oracle.
-	want := router.AssignShards(nodeIDs, shardCount)
-	for shard := uint32(0); shard < shardCount; shard++ {
-		if shardMap[shard] != want[shard] {
+	want := router.AssignShards(nodeIDs, snapshot.ShardCount)
+	for shard := uint32(0); shard < snapshot.ShardCount; shard++ {
+		if snapshot.ShardMap[shard] != want[shard] {
 			return clusterTopology{}, fmt.Errorf(
-				"metadata shard %d owner is %q, want HRW owner %q", shard, shardMap[shard], want[shard])
+				"metadata shard %d owner is %q, want HRW owner %q",
+				shard, snapshot.ShardMap[shard], want[shard])
 		}
 	}
 
@@ -310,8 +281,9 @@ func validateTopology(nodeList []*metadatav1.NodeInfo, shardMap map[uint32]strin
 	}
 	sort.Strings(ownerIDs)
 	return clusterTopology{
-		shardCount: shardCount,
-		shardMap:   shardMap,
+		generation: snapshot.Generation,
+		shardCount: snapshot.ShardCount,
+		shardMap:   snapshot.ShardMap,
 		nodes:      nodes,
 		nodeIDs:    nodeIDs,
 		ownerIDs:   ownerIDs,

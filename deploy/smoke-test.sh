@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# End-to-end smoke test for the running Phase 2 dev cluster.
+# End-to-end smoke test for the running Phase 3 dev cluster.
 #
 #   deploy/run-local-cluster.sh
 #   deploy/smoke-test.sh [--config PATH] [--no-install] [--skip-build]
