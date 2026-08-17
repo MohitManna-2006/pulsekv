@@ -1,0 +1,5 @@
+# Build output: Go binaries, the CMake tree, and the generated C++ inside it.
+build/
+
+# Runtime state: PIDs and per-process logs from run-local-cluster.sh.
+run/

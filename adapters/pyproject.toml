@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=77.0.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pulsekv-adapters"
+version = "0.0.1"
+description = "PulseKV v2 LLM serving adapters (SGLang HiCache, vLLM KVConnector)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "Mohit Manna" }]
+keywords = ["llm", "kv-cache", "sglang", "vllm", "grpc", "inference"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Distributed Computing",
+]
+
+# Pinned exactly, not floored. The checked-in generated stubs under
+# pulsekv_adapters/gen/ were produced by grpcio-tools 1.83.0, and protobuf's
+# generated Python asserts its runtime version at import time -- a floating
+# range here turns into an import-time crash the first time a user's resolver
+# picks a different minor. See docs/pulsekv-v2-phase0-summary.md.
+dependencies = [
+    "grpcio==1.83.0",
+    "protobuf==7.35.1",
+]
+
+[project.optional-dependencies]
+# Only needed to regenerate the stubs; deploy/gen-proto.sh uses these.
+dev = [
+    "grpcio-tools==1.83.0",
+]
+
+[project.scripts]
+pulsekv-health = "pulsekv_adapters.health_client:main"
+
+[project.urls]
+Homepage = "https://github.com/mohitmanna/pulsekv"
+
+[tool.setuptools.packages.find]
+include = ["pulsekv_adapters*"]

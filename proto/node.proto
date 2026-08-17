@@ -1,0 +1,74 @@
+// NodeService — the interface a control-plane instance uses to talk to one
+// data-plane node.
+//
+// Phase 0 status: the C++ shim in node/grpc_shim/ implements HealthCheck for
+// real and returns UNIMPLEMENTED for everything else. Phase 1 backs the
+// remaining RPCs with the extracted C engine under node/engine/.
+//
+// This contract is frozen as of Phase 0. Phases 1-8 are written against this
+// shape; add fields rather than renaming or removing RPCs.
+
+syntax = "proto3";
+
+package pulsekv.node.v1;
+
+option go_package = "pulsekv/control/gen/node/v1;nodev1";
+
+service NodeService {
+  // Liveness plus node identity. Implemented for real in Phase 0.
+  rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+
+  // Point lookup. Phase 1.
+  rpc Get(GetRequest) returns (GetResponse);
+
+  // Point write. Phase 1.
+  rpc Put(PutRequest) returns (PutResponse);
+
+  // Streaming so a prefix scan can return more than fits in one message —
+  // KV-cache blocks are megabytes each. Phase 1.
+  rpc PrefixMatch(PrefixMatchRequest) returns (stream PrefixMatchResponse);
+
+  // Per-tier occupancy, used by the control plane for placement decisions.
+  // Phase 1 (RAM tier) and Phase 5 (NVMe tier).
+  rpc Capacity(CapacityRequest) returns (CapacityResponse);
+}
+
+message HealthCheckRequest {}
+
+message HealthCheckResponse {
+  bool ok = 1;
+  string node_id = 2;
+  int64 uptime_seconds = 3;
+}
+
+message GetRequest { bytes key = 1; }
+
+message GetResponse {
+  bool found = 1;
+  bytes value = 2;
+}
+
+message PutRequest {
+  bytes key = 1;
+  bytes value = 2;
+}
+
+message PutResponse {
+  bool ok = 1;
+  string error = 2;
+}
+
+message PrefixMatchRequest { bytes prefix = 1; }
+
+message PrefixMatchResponse {
+  bytes key = 1;
+  bytes value = 2;
+}
+
+message CapacityRequest {}
+
+message CapacityResponse {
+  uint64 resident_keys = 1;
+  uint64 bytes_in_ram_tier = 2;
+  uint64 bytes_in_nvme_tier = 3;
+}

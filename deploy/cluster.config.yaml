@@ -1,0 +1,75 @@
+# PulseKV v2 -- static cluster definition for the local multi-process dev cluster.
+#
+# This file is the single source of truth for the dev cluster's shape. It is
+# read by:
+#   * the Go control plane, which serves it back over
+#     ClusterMetadataService.GetNodeList / GetShardMap
+#   * deploy/run-local-cluster.sh and deploy/stop-local-cluster.sh, which get
+#     the node list by shelling out to `controlplane --print-nodes` rather than
+#     parsing YAML themselves
+#   * deploy/smoke-test.sh, which asserts the cluster matches what is here
+#
+# ---------------------------------------------------------------------------
+# Scaling the node count
+# ---------------------------------------------------------------------------
+# The default is 4 nodes: enough to prove routing and multi-process boot, small
+# enough for a fast edit-run-check loop.
+#
+# The design target for later chaos, gossip, and Raft testing (Phases 3 and 5)
+# is 8-32 simulated nodes on one machine -- that range is what makes gossip
+# convergence, rendezvous-hash key movement, and Raft leader election
+# meaningful to measure without real multi-host infrastructure. Adding entries
+# to `nodes:` below is the ONLY change needed to get there; no script takes the
+# node count as an argument or hardcodes it anywhere.
+#
+# To scale up, keep node_id unique and ports contiguous from 7100:
+#
+#   nodes:
+#     - {node_id: node-0, port: 7100}
+#     ...
+#     - {node_id: node-31, port: 7131}
+#
+# Port 7100 + N keeps 32 nodes inside 7100-7131, clear of the control plane.
+# The config loader rejects duplicate node IDs and duplicate host:port pairs
+# outright, so a copy-paste slip fails at startup rather than producing a
+# cluster where two nodes quietly fight over one port.
+#
+# ---------------------------------------------------------------------------
+# What Phase 0 does NOT do with this file
+# ---------------------------------------------------------------------------
+# There is no replication factor, no per-node capacity, and no explicit shard
+# assignment here yet. Those arrive with the phases that need them:
+#   Phase 3  gossip membership replaces this file as the source of the node list
+#   Phase 4  adds replication factor
+#   Phase 5  a Raft state machine replaces this file as the source of the shard map
+# The ClusterMetadataService contract does not change when that happens -- only
+# where the data comes from. That is the point of routing it all through this
+# file today.
+
+control_plane:
+  # host is optional and defaults to 127.0.0.1.
+  port: 7000
+
+# Number of logical cluster shards. These are the unit of ownership and, from
+# Phase 3 on, the unit of rebalancing.
+#
+# Phase 0 assigns them round-robin over the node list -- deterministic and
+# obviously a placeholder. Phase 2.1 replaces that with rendezvous (HRW)
+# hashing, which is what gives the minimal-key-movement property the design
+# doc requires. Nothing should depend on the current distribution.
+#
+# 256 gives a 4-node cluster 64 shards each and a 32-node cluster 8 each, which
+# is fine-grained enough for Phase 3 to have something real to move around.
+# Unrelated to v1's 256 intra-process hashtable shards, which exist for lock
+# striping inside one process.
+shard_count: 256
+
+nodes:
+  - node_id: node-0
+    port: 7100
+  - node_id: node-1
+    port: 7101
+  - node_id: node-2
+    port: 7102
+  - node_id: node-3
+    port: 7103

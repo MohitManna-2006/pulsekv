@@ -1,0 +1,7 @@
+# Generated protobuf/gRPC C++ sources. Not checked in: .pb.cc is tied to the
+# exact libprotobuf/libgrpc++ ABI it links against, so CMake regenerates it on
+# every configure. See proto/README.md.
+grpc_shim/gen/
+
+# In-tree CMake output, if anyone configures here instead of deploy/build/.
+grpc_shim/build/

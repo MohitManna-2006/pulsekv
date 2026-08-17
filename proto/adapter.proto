@@ -1,0 +1,54 @@
+// AdapterService — the narrow surface the Python LLM adapters call.
+//
+// Deliberately shaped like SGLang HiCache's own get/exist/set backend
+// interface so the Phase 7 adapter is a thin pass-through rather than an
+// impedance-matching layer.
+//
+// Phase 0 status: NOTHING implements this service yet. It is generated for all
+// three languages so the contract is frozen and the stubs exist, but the
+// server side arrives in Phase 7. See adapters/pulsekv_adapters/health_client.py
+// for what the Python side proves in Phase 0 instead.
+
+syntax = "proto3";
+
+package pulsekv.adapter.v1;
+
+option go_package = "pulsekv/control/gen/adapter/v1;adapterv1";
+
+service AdapterService {
+  rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+
+  // Mirrors SGLang HiCache's get(key).
+  rpc Get(AdapterGetRequest) returns (AdapterGetResponse);
+
+  // Mirrors SGLang HiCache's exist(key).
+  rpc Exists(AdapterExistsRequest) returns (AdapterExistsResponse);
+
+  // Mirrors SGLang HiCache's set(key, value).
+  rpc Set(AdapterSetRequest) returns (AdapterSetResponse);
+}
+
+message HealthCheckRequest {}
+
+message HealthCheckResponse { bool ok = 1; }
+
+message AdapterGetRequest { bytes key = 1; }
+
+message AdapterGetResponse {
+  bool found = 1;
+  bytes value = 2;
+}
+
+message AdapterExistsRequest { bytes key = 1; }
+
+message AdapterExistsResponse { bool exists = 1; }
+
+message AdapterSetRequest {
+  bytes key = 1;
+  bytes value = 2;
+}
+
+message AdapterSetResponse {
+  bool ok = 1;
+  string error = 2;
+}

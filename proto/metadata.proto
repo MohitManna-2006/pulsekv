@@ -1,0 +1,50 @@
+// ClusterMetadataService — the interface clients and adapters use to discover
+// cluster shape.
+//
+// Phase 0 status: implemented by the Go control plane in control/, served from
+// the static deploy/cluster.config.yaml. Phase 3 replaces the source of the
+// node list with gossip membership and Phase 5 replaces the source of the
+// shard map with a Raft-backed state machine. Neither changes this contract.
+
+syntax = "proto3";
+
+package pulsekv.metadata.v1;
+
+option go_package = "pulsekv/control/gen/metadata/v1;metadatav1";
+
+service ClusterMetadataService {
+  // Liveness of the control plane itself. Implemented for real in Phase 0.
+  rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+
+  // Every node the control plane knows about.
+  rpc GetNodeList(GetNodeListRequest) returns (GetNodeListResponse);
+
+  // Shard-to-owner assignment.
+  rpc GetShardMap(GetShardMapRequest) returns (GetShardMapResponse);
+}
+
+message HealthCheckRequest {}
+
+message HealthCheckResponse {
+  bool ok = 1;
+  int64 uptime_seconds = 2;
+}
+
+message NodeInfo {
+  string node_id = 1;
+  string address = 2;  // host:port where this node's NodeService listens
+  bool alive = 3;
+}
+
+message GetNodeListRequest {}
+
+message GetNodeListResponse { repeated NodeInfo nodes = 1; }
+
+message GetShardMapRequest {}
+
+message GetShardMapResponse {
+  // Phase 0: static, loaded from deploy/cluster.config.yaml.
+  // Phase 3+ replaces the source of this data with gossip/Raft; the RPC shape
+  // does not change.
+  map<uint32, string> shard_to_node_id = 1;
+}

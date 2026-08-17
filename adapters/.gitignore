@@ -1,0 +1,10 @@
+# Python build/run artefacts. Note that pulsekv_adapters/gen/ is deliberately
+# NOT ignored -- the generated stubs are checked in so `pip install ./adapters`
+# works without protoc. See proto/README.md.
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
