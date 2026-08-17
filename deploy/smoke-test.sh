@@ -1,17 +1,16 @@
 #!/usr/bin/env bash
 #
-# End-to-end smoke test for the running Phase 0 dev cluster.
+# End-to-end smoke test for the running Phase 2 dev cluster.
 #
 #   deploy/run-local-cluster.sh
 #   deploy/smoke-test.sh [--config PATH] [--no-install] [--skip-build]
 #
 # Three legs, all against the live cluster:
 #
-#   1. Go   -- pulsekv-smoke asserts the whole Phase 0 contract through the
-#              checked-in generated stubs: real HealthCheck data from the
-#              control plane and every node, static metadata matching the
-#              config, and UNIMPLEMENTED (never a fake success) from every RPC
-#              Phase 0 does not implement.
+#   1. Go   -- pulsekv-smoke asserts the contract through the checked-in
+#              generated stubs, independently reproduces the HRW shard map,
+#              writes through the public SDK, and directly proves each sample
+#              key hit its predicted owner and missed a different node.
 #   2. Python -- the adapters package health-checks the Go control plane and a
 #              C++ node, proving both cross-language boundaries.
 #   3. grpcurl -- optional; only runs if grpcurl is on PATH. Verifies server
@@ -19,9 +18,9 @@
 #
 # Exits non-zero, loudly, if any check fails.
 #
-# The Go leg is what enforces the UNIMPLEMENTED requirement, rather than
-# grpcurl: it compiles against the same generated stubs the control plane does,
-# so it is testing the contract rather than a second copy of it.
+# The Go leg compiles against the same generated stubs and router package as
+# the control plane, so it checks the actual contract and exact assignment
+# function rather than approximating either in shell.
 
 set -euo pipefail
 
@@ -72,7 +71,7 @@ FIRST_NODE_ADDRESS="${FIRST_NODE_HOST}:${FIRST_NODE_PORT}"
 # ---------------------------------------------------------------------------
 # Leg 1 -- Go, the full contract.
 # ---------------------------------------------------------------------------
-pk_step "Leg 1/3: Go contract assertions (control plane + every node)"
+pk_step "Leg 1/3: Go contract + routing assertions (control plane + every node)"
 
 go_output=""
 go_rc=0
@@ -80,9 +79,9 @@ go_output="$("$PULSEKV_SMOKE_BIN" --config "$PULSEKV_CONFIG" --mode=smoke 2>&1)"
 printf '%s\n' "$go_output" | sed 's/^/    /'
 
 if [ "$go_rc" -eq 0 ]; then
-    record_pass "Go contract assertions passed"
+    record_pass "Go contract + routing assertions passed"
 else
-    record_fail "Go contract assertions failed (exit $go_rc)"
+    record_fail "Go contract + routing assertions failed (exit $go_rc)"
 fi
 
 # ---------------------------------------------------------------------------

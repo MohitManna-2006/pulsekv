@@ -118,36 +118,6 @@ func TestLoadRejectsBadConfigs(t *testing.T) {
 	}
 }
 
-func TestShardMapCoversEveryShard(t *testing.T) {
-	cfg, err := Load(write(t, goodConfig))
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-
-	m := cfg.ShardMap()
-	if got, want := uint32(len(m)), cfg.ShardCount; got != want {
-		t.Fatalf("shard map has %d entries, want %d", got, want)
-	}
-
-	known := map[string]int{}
-	for shard := uint32(0); shard < cfg.ShardCount; shard++ {
-		owner, ok := m[shard]
-		if !ok {
-			t.Fatalf("shard %d has no owner", shard)
-		}
-		known[owner]++
-	}
-	// Round-robin over 2 nodes with 8 shards: 4 each. Phase 2.1 replaces this
-	// with rendezvous hashing, at which point the balance assertion becomes a
-	// distribution assertion rather than an exact one.
-	for _, n := range cfg.Nodes {
-		if known[n.NodeID] != int(cfg.ShardCount)/len(cfg.Nodes) {
-			t.Errorf("node %s owns %d shard(s), want %d",
-				n.NodeID, known[n.NodeID], int(cfg.ShardCount)/len(cfg.Nodes))
-		}
-	}
-}
-
 func TestLoadMissingFile(t *testing.T) {
 	if _, err := Load(filepath.Join(t.TempDir(), "nope.yaml")); err == nil {
 		t.Fatal("Load on a missing file succeeded; want an error")

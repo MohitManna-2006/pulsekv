@@ -35,7 +35,7 @@
 # cluster where two nodes quietly fight over one port.
 #
 # ---------------------------------------------------------------------------
-# What Phase 0 does NOT do with this file
+# What Phase 2 does NOT do with this file
 # ---------------------------------------------------------------------------
 # There is no replication factor, no per-node capacity, and no explicit shard
 # assignment here yet. Those arrive with the phases that need them:
@@ -53,10 +53,10 @@ control_plane:
 # Number of logical cluster shards. These are the unit of ownership and, from
 # Phase 3 on, the unit of rebalancing.
 #
-# Phase 0 assigns them round-robin over the node list -- deterministic and
-# obviously a placeholder. Phase 2.1 replaces that with rendezvous (HRW)
-# hashing, which is what gives the minimal-key-movement property the design
-# doc requires. Nothing should depend on the current distribution.
+# Phase 2 assigns them with deterministic rendezvous (HRW) hashing over the
+# static node list. That gives the minimal-key-movement property the design doc
+# requires; Phase 3 will recompute the same function from live gossip
+# membership rather than this startup-only list.
 #
 # 256 gives a 4-node cluster 64 shards each and a 32-node cluster 8 each, which
 # is fine-grained enough for Phase 3 to have something real to move around.

@@ -17,6 +17,10 @@ deploy/
 └── bench-node.sh           node benchmark, fits-in-RAM vs exceeds-RAM
 ```
 
+`run-local-cluster.sh` also builds the Phase 2 Go tools under
+`deploy/build/bin/`: `pulsekv-example`, `pulsekv-cluster-bench`, and the
+single-node `pulsekv-node-bench`.
+
 Build output goes to `deploy/build/`, runtime state to `deploy/run/`. Both are
 gitignored. They live under `deploy/` rather than the repo-root `build/`
 because v1's `make clean` does `rm -rf build/`, and v2 artefacts disappearing
@@ -37,6 +41,8 @@ docker run --rm -it -v "$PWD:/src" -w /src pulsekv-v2-dev bash
 # then, inside the container
 deploy/run-local-cluster.sh
 deploy/smoke-test.sh
+deploy/build/bin/pulsekv-example
+deploy/build/bin/pulsekv-cluster-bench --ops 10000 --warmup-ops 1000
 deploy/stop-local-cluster.sh
 ```
 
@@ -88,7 +94,7 @@ documents the port layout for that.
 | Script | Guarantee |
 |---|---|
 | `run-local-cluster.sh` | Every process is listening and answering `HealthCheck` before the "cluster ready" banner prints. On timeout it dumps each process's log, says whether it exited or just never answered, stops the partial cluster, and exits non-zero. |
-| `smoke-test.sh` | Three legs — Go contract assertions, the Python adapters client, and an optional grpcurl reflection check. Non-zero on any failure. |
+| `smoke-test.sh` | Three legs — Go contract and routing assertions, the Python adapters client, and an optional grpcurl reflection check. The Go leg independently reproduces the HRW shard map and proves SDK writes hit the predicted owner and miss a different node. Non-zero on any failure. |
 | `stop-local-cluster.sh` | SIGTERM, up to 10s grace, then SIGKILL; plus the orphan sweep. Non-zero only if something could not be stopped. |
 | `test-engine.sh` | Builds and runs the pure-C engine suite. No cluster, no gRPC, no network. |
 | `bench-node.sh` | Boots a dedicated node with a small RAM budget and benchmarks it twice — inside and well outside that budget. Fails the run on any unverified read. |
@@ -139,5 +145,5 @@ Both servers enable gRPC server reflection, and `grpcurl` is in the image:
 grpcurl -plaintext 127.0.0.1:7000 list
 grpcurl -plaintext 127.0.0.1:7000 pulsekv.metadata.v1.ClusterMetadataService/GetNodeList
 grpcurl -plaintext 127.0.0.1:7100 pulsekv.node.v1.NodeService/HealthCheck
-grpcurl -plaintext 127.0.0.1:7100 pulsekv.node.v1.NodeService/Capacity   # UNIMPLEMENTED
+grpcurl -plaintext 127.0.0.1:7100 pulsekv.node.v1.NodeService/Capacity
 ```

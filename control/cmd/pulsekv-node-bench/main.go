@@ -25,7 +25,6 @@ import (
 	"encoding/binary"
 	"flag"
 	"fmt"
-	"io"
 	"math/rand"
 	"os"
 	"sort"
@@ -36,11 +35,10 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 
 	nodev1 "pulsekv/control/gen/node/v1"
+	"pulsekv/control/internal/transport"
 )
 
 const (
-	unaryValueLimit = int(nodev1.UnaryLimit_UNARY_VALUE_LIMIT_BYTES)
-	chunkBytes      = 1024 * 1024
 	// Matches the node's own ceiling so a large-value run is not rejected by
 	// the transport before it reaches the handler.
 	maxMessageBytes = 8 * 1024 * 1024
@@ -233,7 +231,7 @@ func (b *bench) printHeader() {
 }
 
 func (b *bench) pathName() string {
-	if b.valueSize > unaryValueLimit {
+	if b.valueSize > transport.UnaryValueLimit {
 		return "PutChunked/GetChunked (value exceeds the 4 MiB unary limit)"
 	}
 	return "unary Put/Get"
@@ -315,10 +313,11 @@ func (b *bench) mixed(clients []nodev1.NodeServiceClient, total int, record bool
 				if isRead {
 					r.reads++
 					var got []byte
-					got, err = b.get(client, b.keyFor(keyIdx))
+					var found bool
+					got, found, err = b.get(client, b.keyFor(keyIdx))
 					d := time.Since(begin)
 					if err == nil {
-						if got == nil {
+						if !found {
 							// Every key was populated and nothing is ever
 							// dropped when a data-dir is configured, so a miss
 							// here is a real correctness failure, not a cache
@@ -376,79 +375,13 @@ func bytesEqual(a, b []byte) bool {
 func (b *bench) put(client nodev1.NodeServiceClient, key, value []byte) error {
 	ctx, cancel := context.WithTimeout(context.Background(), b.timeout)
 	defer cancel()
-
-	if len(value) <= unaryValueLimit {
-		_, err := client.Put(ctx, &nodev1.PutRequest{Key: key, Value: value})
-		return err
-	}
-
-	total := (len(value) + chunkBytes - 1) / chunkBytes
-	if total == 0 {
-		total = 1
-	}
-	stream, err := client.PutChunked(ctx)
-	if err != nil {
-		return err
-	}
-	for i := 0; i < total; i++ {
-		lo := i * chunkBytes
-		hi := lo + chunkBytes
-		if hi > len(value) {
-			hi = len(value)
-		}
-		chunk := &nodev1.PutChunk{
-			ChunkIndex:  uint32(i),
-			TotalChunks: uint32(total),
-			TotalLength: uint64(len(value)),
-			Data:        value[lo:hi],
-		}
-		if i == 0 {
-			chunk.Key = key
-		}
-		if err := stream.Send(chunk); err != nil {
-			return err
-		}
-	}
-	_, err = stream.CloseAndRecv()
-	return err
+	return transport.Put(ctx, client, key, value)
 }
 
-// get returns nil (with no error) on a miss.
-func (b *bench) get(client nodev1.NodeServiceClient, key []byte) ([]byte, error) {
+func (b *bench) get(client nodev1.NodeServiceClient, key []byte) ([]byte, bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), b.timeout)
 	defer cancel()
-
-	if b.valueSize <= unaryValueLimit {
-		resp, err := client.Get(ctx, &nodev1.GetRequest{Key: key})
-		if err != nil {
-			return nil, err
-		}
-		if !resp.GetFound() {
-			return nil, nil
-		}
-		return resp.GetValue(), nil
-	}
-
-	stream, err := client.GetChunked(ctx, &nodev1.GetRequest{Key: key})
-	if err != nil {
-		return nil, err
-	}
-	var out []byte
-	for {
-		chunk, err := stream.Recv()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return nil, err
-		}
-		if out == nil {
-			out = make([]byte, 0, chunk.GetTotalLength())
-		}
-		out = append(out, chunk.GetData()...)
-	}
-	// An empty stream means a miss, mirroring Get's found = false.
-	return out, nil
+	return transport.GetWithMode(ctx, client, key, transport.ReadModeForSize(b.valueSize))
 }
 
 func (b *bench) capacity(client nodev1.NodeServiceClient) (*nodev1.CapacityResponse, error) {

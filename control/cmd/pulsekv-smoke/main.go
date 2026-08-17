@@ -1,4 +1,4 @@
-// Command pulsekv-smoke is the Phase 0 cluster verifier.
+// Command pulsekv-smoke is the live PulseKV v2 cluster verifier.
 //
 // It is the "small throwaway client using the generated stubs" that
 // deploy/smoke-test.sh needs, kept inside the Go module so it compiles against
@@ -10,10 +10,9 @@
 //	--mode=wait   poll every process's HealthCheck until all report ok, or fail
 //	              loudly naming exactly which ones did not come up. Used by
 //	              deploy/run-local-cluster.sh.
-//	--mode=smoke  assert the full Phase 0 contract: real HealthCheck data
-//	              everywhere, static metadata that matches the config, and
-//	              UNIMPLEMENTED -- not a fake success -- from every RPC that
-//	              Phase 0 does not implement. Used by deploy/smoke-test.sh.
+//	--mode=smoke  assert the live contract and Phase 2 routing: exact HRW
+//	              metadata, SDK round-trips, direct physical placement, and
+//	              every data-plane RPC. Used by deploy/smoke-test.sh.
 package main
 
 import (
@@ -39,6 +38,8 @@ import (
 	metadatav1 "pulsekv/control/gen/metadata/v1"
 	nodev1 "pulsekv/control/gen/node/v1"
 	"pulsekv/control/internal/config"
+	"pulsekv/control/internal/router"
+	pulsekvclient "pulsekv/control/pkg/client"
 )
 
 const (
@@ -49,6 +50,10 @@ const (
 	// Matched to the node's own ceiling; the chunked round-trip below moves
 	// 6 MiB and must not be cut off by the client's default 4 MiB limit.
 	maxMessageBytes = 8 * 1024 * 1024
+
+	// Enough keys to exercise more than one route in the four-node dev
+	// cluster without making the smoke leg materially slower.
+	routingSampleCount = 6
 )
 
 func main() {
@@ -56,7 +61,7 @@ func main() {
 		configPath = flag.String("config", "deploy/cluster.config.yaml",
 			"path to the static cluster config")
 		mode = flag.String("mode", "smoke",
-			"`wait` (poll until healthy) or `smoke` (assert the full Phase 0 contract)")
+			"`wait` (poll until healthy) or `smoke` (assert the live contract and routing)")
 		timeout = flag.Duration("timeout", 15*time.Second,
 			"overall budget for --mode=wait")
 		rpcTimeout = flag.Duration("rpc-timeout", 2*time.Second,
@@ -215,6 +220,7 @@ func runSmoke(cfg *config.Config, rpcTimeout time.Duration) int {
 	defer cpConn.Close()
 
 	checkControlPlane(r, cfg, cpConn, rpcTimeout)
+	checkRouting(r, cfg, cpConn, rpcTimeout)
 
 	for _, n := range cfg.Nodes {
 		conn, err := dial(n.Address())
@@ -311,7 +317,8 @@ func checkControlPlane(r *reporter, cfg *config.Config, conn *grpc.ClientConn, r
 			fmt.Sprintf("%d node(s), all alive, addresses match config", len(resp.GetNodes())))
 	}()
 
-	// --- GetShardMap must cover every shard with a configured owner.
+	// --- GetShardMap must cover every shard with a configured owner and match
+	// a fresh, independent computation of the routing algorithm exactly.
 	func() {
 		ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
 		defer cancel()
@@ -328,6 +335,7 @@ func checkControlPlane(r *reporter, cfg *config.Config, conn *grpc.ClientConn, r
 		}
 
 		got := resp.GetShardToNodeId()
+		want := router.AssignShards(cfg.NodeIDs(), cfg.ShardCount)
 		var problems []string
 		if uint32(len(got)) != cfg.ShardCount {
 			problems = append(problems, fmt.Sprintf("%d entries, want shard_count=%d",
@@ -350,6 +358,7 @@ func checkControlPlane(r *reporter, cfg *config.Config, conn *grpc.ClientConn, r
 				problems = append(problems, fmt.Sprintf("node %q owns no shards", n.NodeID))
 			}
 		}
+		problems = append(problems, shardMapDifferences(got, want, 5)...)
 
 		if len(problems) > 0 {
 			sort.Strings(problems)
@@ -361,7 +370,8 @@ func checkControlPlane(r *reporter, cfg *config.Config, conn *grpc.ClientConn, r
 			return
 		}
 		r.pass("controlplane/GetShardMap",
-			fmt.Sprintf("%d shard(s) over %d node(s), all owners known", len(got), len(owners)))
+			fmt.Sprintf("%d shard(s) over %d node(s), exact router.AssignShards match",
+				len(got), len(owners)))
 	}()
 
 	// --- AdapterService is generated and dial-able but has no server in
@@ -373,6 +383,274 @@ func checkControlPlane(r *reporter, cfg *config.Config, conn *grpc.ClientConn, r
 		_, err := adapterv1.NewAdapterServiceClient(conn).HealthCheck(ctx, &adapterv1.HealthCheckRequest{})
 		r.wantUnimplemented("controlplane/AdapterService.HealthCheck", err)
 	}()
+}
+
+// checkRouting closes the gap between "the SDK returned my value" and "the
+// SDK put it on the node the live shard map predicts". It fetches topology
+// independently, writes through the public SDK, then bypasses the SDK for two
+// direct physical-placement reads per key: a hit on the predicted owner and a
+// miss on a different node.
+func checkRouting(r *reporter, cfg *config.Config, conn *grpc.ClientConn, rpcTimeout time.Duration) {
+	md := metadatav1.NewClusterMetadataServiceClient(conn)
+	topology, err := fetchLiveRoutingTopology(md, rpcTimeout)
+	if err != nil {
+		r.fail("routing/live metadata", err)
+		return
+	}
+
+	wantShardMap := router.AssignShards(cfg.NodeIDs(), cfg.ShardCount)
+	if differences := shardMapDifferences(topology.shardMap, wantShardMap, 5); len(differences) > 0 {
+		r.fail("routing/live metadata", fmt.Errorf(
+			"live GetShardMap does not exactly match router.AssignShards: %s",
+			strings.Join(differences, "; ")))
+		return
+	}
+	if len(topology.nodes) < 2 {
+		r.fail("routing/live metadata", fmt.Errorf(
+			"need at least two live nodes to prove a predicted-owner hit and a different-node miss; got %d",
+			len(topology.nodes)))
+		return
+	}
+	r.pass("routing/live metadata", fmt.Sprintf(
+		"fetched %d node(s) and %d shard(s); exact router.AssignShards match",
+		len(topology.nodes), len(topology.shardMap)))
+
+	routed, err := pulsekvclient.New(
+		cfg.ControlPlane.Address(),
+		pulsekvclient.WithRefreshInterval(0),
+		pulsekvclient.WithRefreshTimeout(rpcTimeout),
+	)
+	if err != nil {
+		r.fail("routing/client.New", err)
+		return
+	}
+	defer routed.Close()
+
+	prefix := fmt.Sprintf("smoke:routing:%d:%d", os.Getpid(), time.Now().UnixNano())
+	keys, err := routingSampleKeys(prefix, routingSampleCount, cfg.ShardCount, topology.shardMap)
+	if err != nil {
+		r.fail("routing/sample keys", err)
+		return
+	}
+
+	nodeIDs := make([]string, 0, len(topology.nodes))
+	for id := range topology.nodes {
+		nodeIDs = append(nodeIDs, id)
+	}
+	sort.Strings(nodeIDs)
+
+	// These clients intentionally do not go through pkg/client. They are the
+	// independent observation path that proves where the SDK physically wrote.
+	directConns := make(map[string]*grpc.ClientConn, len(topology.nodes))
+	directClients := make(map[string]nodev1.NodeServiceClient, len(topology.nodes))
+	defer func() {
+		for _, directConn := range directConns {
+			_ = directConn.Close()
+		}
+	}()
+	for id, address := range topology.nodes {
+		directConn, err := dial(address)
+		if err != nil {
+			r.fail("routing/direct dial", fmt.Errorf("%s at %s: %w", id, address, err))
+			return
+		}
+		directConns[id] = directConn
+		directClients[id] = nodev1.NewNodeServiceClient(directConn)
+	}
+
+	for i, key := range keys {
+		owner, ok := router.OwnerForKey(key, cfg.ShardCount, topology.shardMap)
+		if !ok {
+			r.fail(fmt.Sprintf("routing/key[%d]", i), fmt.Errorf(
+				"live shard map has no owner for shard %d", router.ShardForKey(key, cfg.ShardCount)))
+			continue
+		}
+		other := differentNode(owner, nodeIDs)
+		if other == "" {
+			r.fail(fmt.Sprintf("routing/key[%d]", i), fmt.Errorf(
+				"no node differs from predicted owner %q", owner))
+			continue
+		}
+
+		value := deterministicValue(256+i*37, uint64(101+i))
+		var problems []string
+
+		ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
+		putErr := routed.Put(ctx, key, value)
+		cancel()
+		if putErr != nil {
+			problems = append(problems, fmt.Sprintf("SDK Put: %v", putErr))
+		} else {
+			ctx, cancel = context.WithTimeout(context.Background(), rpcTimeout)
+			got, found, getErr := routed.Get(ctx, key)
+			cancel()
+			switch {
+			case getErr != nil:
+				problems = append(problems, fmt.Sprintf("SDK Get: %v", getErr))
+			case !found:
+				problems = append(problems, "SDK Get returned found=false after Put")
+			case !bytes.Equal(got, value):
+				problems = append(problems, fmt.Sprintf(
+					"SDK Get returned %d bytes with different contents", len(got)))
+			}
+
+			ownerResp, directErr := directGet(directClients[owner], key, rpcTimeout)
+			switch {
+			case directErr != nil:
+				problems = append(problems, fmt.Sprintf("direct Get on predicted owner %s: %v", owner, directErr))
+			case !ownerResp.GetFound():
+				problems = append(problems, fmt.Sprintf("predicted owner %s returned found=false", owner))
+			case !bytes.Equal(ownerResp.GetValue(), value):
+				problems = append(problems, fmt.Sprintf(
+					"predicted owner %s returned %d bytes with different contents",
+					owner, len(ownerResp.GetValue())))
+			}
+
+			otherResp, directErr := directGet(directClients[other], key, rpcTimeout)
+			switch {
+			case directErr != nil:
+				problems = append(problems, fmt.Sprintf("direct Get on non-owner %s: %v", other, directErr))
+			case otherResp.GetFound():
+				problems = append(problems, fmt.Sprintf("non-owner %s unexpectedly returned found=true", other))
+			}
+		}
+
+		name := fmt.Sprintf("routing/key[%d]", i)
+		if len(problems) > 0 {
+			r.fail(name, errors.New(strings.Join(problems, "; ")))
+			continue
+		}
+		r.pass(name, fmt.Sprintf(
+			"shard=%d owner=%s; SDK round-trip; direct owner hit; %s miss",
+			router.ShardForKey(key, cfg.ShardCount), owner, other))
+	}
+}
+
+type liveRoutingTopology struct {
+	nodes    map[string]string
+	shardMap map[uint32]string
+}
+
+func fetchLiveRoutingTopology(md metadatav1.ClusterMetadataServiceClient,
+	rpcTimeout time.Duration) (liveRoutingTopology, error) {
+
+	ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
+	nodesResp, err := md.GetNodeList(ctx, &metadatav1.GetNodeListRequest{})
+	cancel()
+	if err != nil {
+		return liveRoutingTopology{}, fmt.Errorf("GetNodeList: %w", err)
+	}
+
+	ctx, cancel = context.WithTimeout(context.Background(), rpcTimeout)
+	shardsResp, err := md.GetShardMap(ctx, &metadatav1.GetShardMapRequest{})
+	cancel()
+	if err != nil {
+		return liveRoutingTopology{}, fmt.Errorf("GetShardMap: %w", err)
+	}
+
+	nodes := make(map[string]string, len(nodesResp.GetNodes()))
+	for _, node := range nodesResp.GetNodes() {
+		if node == nil || node.GetNodeId() == "" || node.GetAddress() == "" {
+			return liveRoutingTopology{}, errors.New("GetNodeList returned a node with an empty ID or address")
+		}
+		if _, duplicate := nodes[node.GetNodeId()]; duplicate {
+			return liveRoutingTopology{}, fmt.Errorf("GetNodeList returned duplicate node %q", node.GetNodeId())
+		}
+		if !node.GetAlive() {
+			return liveRoutingTopology{}, fmt.Errorf("GetNodeList reports node %q not alive", node.GetNodeId())
+		}
+		nodes[node.GetNodeId()] = node.GetAddress()
+	}
+	if len(nodes) == 0 {
+		return liveRoutingTopology{}, errors.New("GetNodeList returned no nodes")
+	}
+
+	shardMap := make(map[uint32]string, len(shardsResp.GetShardToNodeId()))
+	for shard, owner := range shardsResp.GetShardToNodeId() {
+		if _, known := nodes[owner]; !known {
+			return liveRoutingTopology{}, fmt.Errorf(
+				"GetShardMap shard %d has unknown owner %q", shard, owner)
+		}
+		shardMap[shard] = owner
+	}
+	if len(shardMap) == 0 {
+		return liveRoutingTopology{}, errors.New("GetShardMap returned no shards")
+	}
+	return liveRoutingTopology{nodes: nodes, shardMap: shardMap}, nil
+}
+
+func routingSampleKeys(prefix string, count int, shardCount uint32,
+	shardMap map[uint32]string) ([][]byte, error) {
+
+	if count <= 0 {
+		return nil, errors.New("routing sample count must be positive")
+	}
+	owners := make(map[string]struct{})
+	for _, owner := range shardMap {
+		if owner != "" {
+			owners[owner] = struct{}{}
+		}
+	}
+	if len(owners) == 0 {
+		return nil, errors.New("cannot sample keys from a shard map with no owners")
+	}
+
+	// First cover as many distinct owners as the sample budget permits. This
+	// makes the normal four-node smoke test exercise all four SDK routes rather
+	// than merely hoping six arbitrary keys happen to spread out.
+	wantDistinct := count
+	if wantDistinct > len(owners) {
+		wantDistinct = len(owners)
+	}
+	seenOwners := make(map[string]struct{}, wantDistinct)
+	keys := make([][]byte, 0, count)
+	candidate := 0
+	const maxCandidates = 1_000_000
+	for candidate < maxCandidates && len(seenOwners) < wantDistinct {
+		key := []byte(fmt.Sprintf("%s:%d", prefix, candidate))
+		candidate++
+		owner, ok := router.OwnerForKey(key, shardCount, shardMap)
+		if !ok {
+			continue
+		}
+		if _, seen := seenOwners[owner]; seen {
+			continue
+		}
+		seenOwners[owner] = struct{}{}
+		keys = append(keys, key)
+	}
+	if len(seenOwners) < wantDistinct {
+		return nil, fmt.Errorf("found keys for only %d of %d shard-map owner(s) after %d candidates",
+			len(seenOwners), wantDistinct, maxCandidates)
+	}
+
+	for len(keys) < count && candidate < maxCandidates {
+		key := []byte(fmt.Sprintf("%s:%d", prefix, candidate))
+		candidate++
+		if _, ok := router.OwnerForKey(key, shardCount, shardMap); ok {
+			keys = append(keys, key)
+		}
+	}
+	if len(keys) != count {
+		return nil, fmt.Errorf("found only %d of %d requested routing sample keys", len(keys), count)
+	}
+	return keys, nil
+}
+
+func differentNode(owner string, sortedNodeIDs []string) string {
+	for _, id := range sortedNodeIDs {
+		if id != owner {
+			return id
+		}
+	}
+	return ""
+}
+
+func directGet(client nodev1.NodeServiceClient, key []byte,
+	rpcTimeout time.Duration) (*nodev1.GetResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
+	defer cancel()
+	return client.Get(ctx, &nodev1.GetRequest{Key: key})
 }
 
 // Phase 1: every NodeService RPC is real. These assertions replaced Phase 0's
@@ -923,6 +1201,54 @@ func humanSize(n int) string {
 	default:
 		return fmt.Sprintf("%d B", n)
 	}
+}
+
+// shardMapDifferences returns a bounded, deterministic description of every
+// way got differs from want. The bound keeps one stale control plane from
+// printing hundreds of near-identical shard complaints, while the exact map
+// comparison still checks every entry.
+func shardMapDifferences(got, want map[uint32]string, limit int) []string {
+	var shards []uint32
+	seen := make(map[uint32]struct{}, len(got)+len(want))
+	for shard := range got {
+		seen[shard] = struct{}{}
+	}
+	for shard := range want {
+		seen[shard] = struct{}{}
+	}
+	for shard := range seen {
+		gotOwner, gotOK := got[shard]
+		wantOwner, wantOK := want[shard]
+		if gotOK != wantOK || gotOwner != wantOwner {
+			shards = append(shards, shard)
+		}
+	}
+	sort.Slice(shards, func(i, j int) bool { return shards[i] < shards[j] })
+
+	count := len(shards)
+	if limit >= 0 && len(shards) > limit {
+		shards = shards[:limit]
+	}
+	problems := make([]string, 0, len(shards)+1)
+	for _, shard := range shards {
+		gotOwner, gotOK := got[shard]
+		wantOwner, wantOK := want[shard]
+		switch {
+		case !gotOK:
+			problems = append(problems, fmt.Sprintf(
+				"live map missing shard %d (router.AssignShards owner %q)", shard, wantOwner))
+		case !wantOK:
+			problems = append(problems, fmt.Sprintf(
+				"live map has unexpected shard %d owned by %q", shard, gotOwner))
+		default:
+			problems = append(problems, fmt.Sprintf(
+				"shard %d owner %q, router.AssignShards wants %q", shard, gotOwner, wantOwner))
+		}
+	}
+	if count > len(shards) {
+		problems = append(problems, fmt.Sprintf("shard map differs on %d more shard(s)", count-len(shards)))
+	}
+	return problems
 }
 
 // compact flattens gRPC's multi-line error strings so one failure stays on one

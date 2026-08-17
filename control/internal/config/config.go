@@ -1,4 +1,4 @@
-// Package config loads the static cluster definition that Phase 0 uses in
+// Package config loads the static cluster definition that Phases 0-2 use in
 // place of a membership protocol.
 //
 // Everything here is deliberately dumb: a YAML file lists the control plane's
@@ -30,7 +30,7 @@ const (
 	DefaultShardCount = 256
 
 	// DefaultHost is where a node listens when the config omits `host`. The
-	// Phase 0 dev cluster is single-machine by definition.
+	// The pre-membership dev cluster is single-machine by definition.
 	DefaultHost = "127.0.0.1"
 
 	// Engine defaults, mirroring PK_ENGINE_DEFAULT_* in
@@ -256,22 +256,4 @@ func (c *Config) NodeIDs() []string {
 		ids = append(ids, n.NodeID)
 	}
 	return ids
-}
-
-// ShardMap assigns every logical shard to a node.
-//
-// Phase 0 placeholder: plain round-robin over the configured node list. It is
-// deterministic and obviously not the real strategy -- Phase 2.1 replaces this
-// with rendezvous (highest-random-weight) hashing, which is what gives the
-// minimal-key-movement property the design doc requires. Nothing should be
-// built on the *distribution* this produces; only on the shape of the map.
-func (c *Config) ShardMap() map[uint32]string {
-	m := make(map[uint32]string, c.ShardCount)
-	if len(c.Nodes) == 0 {
-		return m
-	}
-	for shard := uint32(0); shard < c.ShardCount; shard++ {
-		m[shard] = c.Nodes[int(shard)%len(c.Nodes)].NodeID
-	}
-	return m
 }

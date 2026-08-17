@@ -1,10 +1,10 @@
 // Package metadata implements ClusterMetadataService.
 //
-// Phase 0 scope: the node list and shard map are static, read once from
-// deploy/cluster.config.yaml at startup. The only thing computed at request
-// time is NodeInfo.alive, which is a direct, bounded NodeService.HealthCheck
-// probe of each node -- see aliveness() for why that is not the same thing as
-// the gossip membership Phase 3 adds.
+// Phase 2 scope: the node list is static, read once from
+// deploy/cluster.config.yaml at startup, and the shard map is a pure
+// rendezvous-hash computation over that list. NodeInfo.alive is still a direct,
+// bounded NodeService.HealthCheck probe -- see aliveness() for why that is not
+// the same thing as the gossip membership Phase 3 adds.
 package metadata
 
 import (
@@ -19,6 +19,7 @@ import (
 	metadatav1 "pulsekv/control/gen/metadata/v1"
 	nodev1 "pulsekv/control/gen/node/v1"
 	"pulsekv/control/internal/config"
+	"pulsekv/control/internal/router"
 )
 
 // DefaultProbeTimeout bounds how long GetNodeList will wait on an unresponsive
@@ -30,9 +31,8 @@ const DefaultProbeTimeout = 300 * time.Millisecond
 type Service struct {
 	metadatav1.UnimplementedClusterMetadataServiceServer
 
-	cfg      *config.Config
-	shardMap map[uint32]string // immutable after New
-	started  time.Time
+	cfg     *config.Config
+	started time.Time
 
 	probeTimeout time.Duration
 	// clients is keyed by node ID. grpc.NewClient is lazy, so constructing
@@ -65,7 +65,6 @@ func WithStartTime(t time.Time) Option {
 func New(cfg *config.Config, opts ...Option) (*Service, error) {
 	s := &Service{
 		cfg:          cfg,
-		shardMap:     cfg.ShardMap(),
 		started:      time.Now(),
 		probeTimeout: DefaultProbeTimeout,
 		clients:      make(map[string]nodev1.NodeServiceClient, len(cfg.Nodes)),
@@ -128,9 +127,11 @@ func (s *Service) GetNodeList(ctx context.Context, _ *metadatav1.GetNodeListRequ
 	return &metadatav1.GetNodeListResponse{Nodes: nodes}, nil
 }
 
-// GetShardMap returns the static shard assignment computed at startup.
+// GetShardMap returns the shard assignment for the statically configured nodes.
 func (s *Service) GetShardMap(_ context.Context, _ *metadatav1.GetShardMapRequest) (*metadatav1.GetShardMapResponse, error) {
-	return &metadatav1.GetShardMapResponse{ShardToNodeId: s.shardMap}, nil
+	return &metadatav1.GetShardMapResponse{
+		ShardToNodeId: router.AssignShards(s.cfg.NodeIDs(), s.cfg.ShardCount),
+	}, nil
 }
 
 // aliveness probes every node's NodeService.HealthCheck in parallel, bounded

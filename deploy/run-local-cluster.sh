@@ -88,7 +88,9 @@ run_logged() {
 
 if [ "$SKIP_BUILD" -eq 1 ]; then
     pk_step "Skipping build (--skip-build)"
-    for bin in "$PULSEKV_CONTROLPLANE_BIN" "$PULSEKV_SMOKE_BIN" "$PULSEKV_NODE_BIN"; do
+    for bin in "$PULSEKV_CONTROLPLANE_BIN" "$PULSEKV_SMOKE_BIN" \
+               "$PULSEKV_BENCH_BIN" "$PULSEKV_CLUSTER_BENCH_BIN" \
+               "$PULSEKV_EXAMPLE_BIN" "$PULSEKV_NODE_BIN"; do
         [ -x "$bin" ] || pk_die "$(pk_relpath "$bin") is missing; run without --skip-build"
     done
 else
@@ -103,10 +105,16 @@ else
             go build -o "$PULSEKV_SMOKE_BIN" ./cmd/pulsekv-smoke
         run_logged "$(build_log go-build-bench.log)" "go build (pulsekv-node-bench)" \
             go build -o "$PULSEKV_BENCH_BIN" ./cmd/pulsekv-node-bench
+        run_logged "$(build_log go-build-cluster-bench.log)" "go build (pulsekv-cluster-bench)" \
+            go build -o "$PULSEKV_CLUSTER_BENCH_BIN" ./cmd/pulsekv-cluster-bench
+        run_logged "$(build_log go-build-example.log)" "go build (pulsekv-example)" \
+            go build -o "$PULSEKV_EXAMPLE_BIN" ./cmd/pulsekv-example
     )
     pk_ok "$(pk_relpath "$PULSEKV_CONTROLPLANE_BIN")"
     pk_ok "$(pk_relpath "$PULSEKV_SMOKE_BIN")"
     pk_ok "$(pk_relpath "$PULSEKV_BENCH_BIN")"
+    pk_ok "$(pk_relpath "$PULSEKV_CLUSTER_BENCH_BIN")"
+    pk_ok "$(pk_relpath "$PULSEKV_EXAMPLE_BIN")"
 
     # Validate the config before paying for the C++ build.
     pk_step "Validating $(pk_relpath "$PULSEKV_CONFIG")"
@@ -244,7 +252,9 @@ pk_info "spill dirs: $(pk_relpath "$DATA_ROOT_ABS")/<node-id>  (purged at node s
 echo
 pk_info "smoke test:   deploy/smoke-test.sh"
 pk_info "engine tests: deploy/test-engine.sh"
-pk_info "benchmark:    deploy/build/bin/pulsekv-node-bench --address ${CP_HOST}:$(printf '%s' "${NODE_LINES[0]}" | cut -f3)"
+pk_info "example:      deploy/build/bin/pulsekv-example --control-plane ${CP_ADDRESS}"
+pk_info "cluster bench: deploy/build/bin/pulsekv-cluster-bench --control-plane ${CP_ADDRESS}"
+pk_info "node bench:   deploy/build/bin/pulsekv-node-bench --address ${CP_HOST}:$(printf '%s' "${NODE_LINES[0]}" | cut -f3)"
 pk_info "stop:         deploy/stop-local-cluster.sh"
 pk_info "poke by hand: grpcurl -plaintext ${CP_ADDRESS} list"
 echo

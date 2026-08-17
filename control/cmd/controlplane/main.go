@@ -1,9 +1,9 @@
 // Command controlplane is the PulseKV v2 control-plane process.
 //
-// Phase 0 scope: it serves ClusterMetadataService only, from the static
-// deploy/cluster.config.yaml. Gossip membership (Phase 3), the rendezvous-hash
-// router and generic client SDK (Phase 2), and the Raft metadata plane
-// (Phase 5) all attach here later.
+// Phase 2 scope: it serves ClusterMetadataService from the static node list in
+// deploy/cluster.config.yaml and computes shard ownership with rendezvous
+// hashing. Gossip membership (Phase 3) and the Raft metadata plane (Phase 5)
+// replace those static sources later without changing the RPC contract.
 //
 // It doubles as the config reader for deploy/*.sh -- `--print-nodes` and
 // `--print-control-plane` let the shell scripts get the cluster's shape from
