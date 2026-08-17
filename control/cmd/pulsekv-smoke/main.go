@@ -17,7 +17,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"flag"
 	"fmt"
@@ -37,6 +39,16 @@ import (
 	metadatav1 "pulsekv/control/gen/metadata/v1"
 	nodev1 "pulsekv/control/gen/node/v1"
 	"pulsekv/control/internal/config"
+)
+
+const (
+	// Taken from the contract rather than hardcoded here, so this file cannot
+	// drift from what the node enforces.
+	unaryValueLimit = int(nodev1.UnaryLimit_UNARY_VALUE_LIMIT_BYTES)
+
+	// Matched to the node's own ceiling; the chunked round-trip below moves
+	// 6 MiB and must not be cut off by the client's default 4 MiB limit.
+	maxMessageBytes = 8 * 1024 * 1024
 )
 
 func main() {
@@ -210,7 +222,7 @@ func runSmoke(cfg *config.Config, rpcTimeout time.Duration) int {
 			r.fail(n.NodeID+"/dial", err)
 			continue
 		}
-		checkNode(r, n, conn, rpcTimeout)
+		checkNode(r, n, cfg, conn, rpcTimeout)
 		conn.Close()
 	}
 
@@ -363,8 +375,19 @@ func checkControlPlane(r *reporter, cfg *config.Config, conn *grpc.ClientConn, r
 	}()
 }
 
-func checkNode(r *reporter, n config.Node, conn *grpc.ClientConn, rpcTimeout time.Duration) {
+// Phase 1: every NodeService RPC is real. These assertions replaced Phase 0's
+// "must return UNIMPLEMENTED" ones, exactly as the Phase 0 summary said they
+// would have to.
+func checkNode(r *reporter, n config.Node, cfg *config.Config,
+	conn *grpc.ClientConn, rpcTimeout time.Duration) {
+
 	client := nodev1.NewNodeServiceClient(conn)
+	id := n.NodeID
+
+	// Per-node key namespace so four nodes checked in sequence cannot see each
+	// other's keys through PrefixMatch.
+	ns := "smoke:" + id + ":"
+	key := func(s string) []byte { return []byte(ns + s) }
 
 	// --- HealthCheck must be real and must know its own identity.
 	func() {
@@ -374,56 +397,331 @@ func checkNode(r *reporter, n config.Node, conn *grpc.ClientConn, rpcTimeout tim
 		resp, err := client.HealthCheck(ctx, &nodev1.HealthCheckRequest{})
 		switch {
 		case err != nil:
-			r.fail(n.NodeID+"/HealthCheck", err)
+			r.fail(id+"/HealthCheck", err)
 		case !resp.GetOk():
-			r.fail(n.NodeID+"/HealthCheck", errors.New("ok=false"))
-		case resp.GetNodeId() != n.NodeID:
-			r.fail(n.NodeID+"/HealthCheck",
-				fmt.Errorf("reported node_id %q, config says %q", resp.GetNodeId(), n.NodeID))
+			r.fail(id+"/HealthCheck", errors.New("ok=false"))
+		case resp.GetNodeId() != id:
+			r.fail(id+"/HealthCheck",
+				fmt.Errorf("reported node_id %q, config says %q", resp.GetNodeId(), id))
 		case resp.GetUptimeSeconds() < 0:
-			r.fail(n.NodeID+"/HealthCheck",
+			r.fail(id+"/HealthCheck",
 				fmt.Errorf("negative uptime_seconds=%d", resp.GetUptimeSeconds()))
 		default:
-			r.pass(n.NodeID+"/HealthCheck",
+			r.pass(id+"/HealthCheck",
 				fmt.Sprintf("ok=true node_id=%s uptime=%ds", resp.GetNodeId(), resp.GetUptimeSeconds()))
 		}
 	}()
 
-	// --- Everything else is Phase 1. UNIMPLEMENTED, never a fake success.
+	// --- Put then Get: the whole point of the phase.
+	small := deterministicValue(4096, 1)
 	func() {
 		ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
 		defer cancel()
-		_, err := client.Get(ctx, &nodev1.GetRequest{Key: []byte("smoke")})
-		r.wantUnimplemented(n.NodeID+"/Get", err)
+
+		if _, err := client.Put(ctx, &nodev1.PutRequest{Key: key("small"), Value: small}); err != nil {
+			r.fail(id+"/Put", err)
+			return
+		}
+		resp, err := client.Get(ctx, &nodev1.GetRequest{Key: key("small")})
+		switch {
+		case err != nil:
+			r.fail(id+"/Put+Get", err)
+		case !resp.GetFound():
+			r.fail(id+"/Put+Get", errors.New("found=false immediately after a successful Put"))
+		case !bytes.Equal(resp.GetValue(), small):
+			r.fail(id+"/Put+Get", fmt.Errorf("got %d bytes, wrote %d, contents differ",
+				len(resp.GetValue()), len(small)))
+		default:
+			r.pass(id+"/Put+Get", fmt.Sprintf("%d-byte value round-tripped byte-for-byte", len(small)))
+		}
 	}()
 
+	// --- A miss is a successful response, not an error.
 	func() {
 		ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
 		defer cancel()
-		_, err := client.Put(ctx, &nodev1.PutRequest{Key: []byte("smoke"), Value: []byte("v")})
-		r.wantUnimplemented(n.NodeID+"/Put", err)
+
+		resp, err := client.Get(ctx, &nodev1.GetRequest{Key: key("never-written")})
+		switch {
+		case err != nil:
+			r.fail(id+"/Get(miss)", fmt.Errorf("a miss must be OK with found=false, got: %w", err))
+		case resp.GetFound():
+			r.fail(id+"/Get(miss)", errors.New("found=true for a key that was never written"))
+		default:
+			r.pass(id+"/Get(miss)", "found=false, status OK")
+		}
 	}()
 
+	// --- Overwrite replaces, and does not append or leak the old value.
 	func() {
 		ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
 		defer cancel()
-		// Server streaming: the status lands on the first Recv, not on the
-		// call that opens the stream.
-		stream, err := client.PrefixMatch(ctx, &nodev1.PrefixMatchRequest{Prefix: []byte("smoke")})
-		if err == nil {
-			_, err = stream.Recv()
+
+		replacement := deterministicValue(777, 2)
+		if _, err := client.Put(ctx, &nodev1.PutRequest{Key: key("small"), Value: replacement}); err != nil {
+			r.fail(id+"/Put(overwrite)", err)
+			return
+		}
+		resp, err := client.Get(ctx, &nodev1.GetRequest{Key: key("small")})
+		switch {
+		case err != nil:
+			r.fail(id+"/Put(overwrite)", err)
+		case !bytes.Equal(resp.GetValue(), replacement):
+			r.fail(id+"/Put(overwrite)", fmt.Errorf("got %d bytes, expected the %d-byte replacement",
+				len(resp.GetValue()), len(replacement)))
+		default:
+			r.pass(id+"/Put(overwrite)", "a shorter overwrite fully replaces the previous value")
+		}
+	}()
+
+	// --- Argument validation.
+	func() {
+		ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
+		defer cancel()
+		_, err := client.Get(ctx, &nodev1.GetRequest{Key: nil})
+		r.wantCode(id+"/Get(empty key)", err, codes.InvalidArgument, "key")
+	}()
+
+	// --- An oversized unary Put fails fast and names the RPC that can carry it.
+	func() {
+		ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
+		defer cancel()
+
+		oversized := make([]byte, unaryValueLimit+1)
+		_, err := client.Put(ctx, &nodev1.PutRequest{Key: key("too-big-unary"), Value: oversized})
+		r.wantCode(id+"/Put(>4MiB)", err, codes.InvalidArgument, "PutChunked")
+	}()
+
+	// --- The headline of Step 1.2: a multi-megabyte value through the
+	//     chunked path, verified byte for byte.
+	big := deterministicValue(6*1024*1024, 3)
+	func() {
+		ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
+		defer cancel()
+
+		if err := putChunked(ctx, client, key("big"), big, 1024*1024); err != nil {
+			r.fail(id+"/PutChunked", err)
+			return
+		}
+		got, found, err := getChunked(ctx, client, key("big"))
+		switch {
+		case err != nil:
+			r.fail(id+"/PutChunked+GetChunked", err)
+		case !found:
+			r.fail(id+"/PutChunked+GetChunked", errors.New("empty stream after a successful PutChunked"))
+		case !bytes.Equal(got, big):
+			r.fail(id+"/PutChunked+GetChunked",
+				fmt.Errorf("got %d bytes, wrote %d, contents differ", len(got), len(big)))
+		default:
+			r.pass(id+"/PutChunked+GetChunked",
+				fmt.Sprintf("%s round-tripped byte-for-byte over %d chunks",
+					humanSize(len(big)), (len(big)+1024*1024-1)/(1024*1024)))
+		}
+	}()
+
+	// --- Reading that value with unary Get must refuse, specifically.
+	func() {
+		ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
+		defer cancel()
+		_, err := client.Get(ctx, &nodev1.GetRequest{Key: key("big")})
+		r.wantCode(id+"/Get(>4MiB stored)", err, codes.FailedPrecondition, "GetChunked")
+	}()
+
+	// --- GetChunked on a miss is an empty stream, not an error.
+	func() {
+		ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
+		defer cancel()
+
+		got, found, err := getChunked(ctx, client, key("also-never-written"))
+		switch {
+		case err != nil:
+			r.fail(id+"/GetChunked(miss)", err)
+		case found || len(got) != 0:
+			r.fail(id+"/GetChunked(miss)", errors.New("a miss produced chunks"))
+		default:
+			r.pass(id+"/GetChunked(miss)", "empty stream, status OK")
+		}
+	}()
+
+	// --- The framing rules, each violated on purpose.
+	checkChunkedRejections(r, id, key, client, cfg, rpcTimeout)
+
+	// --- Capacity reflects what we just stored.
+	func() {
+		ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
+		defer cancel()
+
+		resp, err := client.Capacity(ctx, &nodev1.CapacityRequest{})
+		switch {
+		case err != nil:
+			r.fail(id+"/Capacity", err)
+		case resp.GetResidentKeys() == 0:
+			r.fail(id+"/Capacity", errors.New("resident_keys=0 after writing several keys"))
+		case resp.GetBytesInRamTier()+resp.GetBytesInNvmeTier() == 0:
+			r.fail(id+"/Capacity", errors.New("both tiers report zero bytes after writes"))
+		default:
+			r.pass(id+"/Capacity",
+				fmt.Sprintf("keys=%d ram=%s nvme=%s", resp.GetResidentKeys(),
+					humanSize(int(resp.GetBytesInRamTier())),
+					humanSize(int(resp.GetBytesInNvmeTier()))))
+		}
+	}()
+
+	// --- PrefixMatch sees exactly this node's namespace.
+	func() {
+		ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
+		defer cancel()
+
+		stream, err := client.PrefixMatch(ctx, &nodev1.PrefixMatchRequest{Prefix: []byte(ns)})
+		if err != nil {
+			r.fail(id+"/PrefixMatch", err)
+			return
+		}
+
+		seen := map[string]*nodev1.PrefixMatchResponse{}
+		for {
+			msg, err := stream.Recv()
 			if errors.Is(err, io.EOF) {
-				err = nil // a clean empty stream is a success, which is wrong here
+				break
+			}
+			if err != nil {
+				r.fail(id+"/PrefixMatch", err)
+				return
+			}
+			seen[string(msg.GetKey())] = msg
+		}
+
+		var problems []string
+		if _, ok := seen[ns+"small"]; !ok {
+			problems = append(problems, "did not return the small key")
+		}
+		bigMsg, ok := seen[ns+"big"]
+		if !ok {
+			problems = append(problems, "did not return the big key")
+		}
+		for k := range seen {
+			if !strings.HasPrefix(k, ns) {
+				problems = append(problems, fmt.Sprintf("returned out-of-namespace key %q", k))
 			}
 		}
-		r.wantUnimplemented(n.NodeID+"/PrefixMatch", err)
-	}()
+		if len(problems) > 0 {
+			sort.Strings(problems)
+			r.fail(id+"/PrefixMatch", errors.New(strings.Join(problems, "; ")))
+			return
+		}
+		r.pass(id+"/PrefixMatch", fmt.Sprintf("%d key(s), all within the requested prefix", len(seen)))
 
+		// A value above the unary limit is flagged rather than silently
+		// returned as empty -- the distinction the value_omitted field exists
+		// to make.
+		switch {
+		case bigMsg == nil:
+			// already reported above
+		case !bigMsg.GetValueOmitted():
+			r.fail(id+"/PrefixMatch(large value)",
+				errors.New("a 6 MiB value was not marked value_omitted"))
+		case len(bigMsg.GetValue()) != 0:
+			r.fail(id+"/PrefixMatch(large value)",
+				errors.New("value_omitted is set but a value was still inlined"))
+		default:
+			r.pass(id+"/PrefixMatch(large value)",
+				"the 6 MiB value is flagged value_omitted, not inlined")
+		}
+	}()
+}
+
+// checkChunkedRejections violates one framing rule at a time. Each of these is
+// a way a buggy or hostile client could otherwise get a corrupt value stored.
+func checkChunkedRejections(r *reporter, id string, key func(string) []byte,
+	client nodev1.NodeServiceClient, cfg *config.Config, rpcTimeout time.Duration) {
+
+	send := func(chunks []*nodev1.PutChunk) error {
+		ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
+		defer cancel()
+
+		stream, err := client.PutChunked(ctx)
+		if err != nil {
+			return err
+		}
+		for _, c := range chunks {
+			if err := stream.Send(c); err != nil {
+				// A stream the server has already rejected surfaces the real
+				// status on CloseAndRecv, not on Send.
+				break
+			}
+		}
+		_, err = stream.CloseAndRecv()
+		return err
+	}
+
+	// Chunk indices out of order. gRPC guarantees ordering, so this can only
+	// be a broken client.
+	r.wantCode(id+"/PutChunked(out of order)", send([]*nodev1.PutChunk{
+		{Key: key("bad1"), ChunkIndex: 0, TotalChunks: 2, TotalLength: 8, Data: []byte("1234")},
+		{ChunkIndex: 5, TotalChunks: 2, TotalLength: 8, Data: []byte("5678")},
+	}), codes.InvalidArgument, "chunk_index")
+
+	// Stream ends early: fewer chunks than declared.
+	r.wantCode(id+"/PutChunked(short stream)", send([]*nodev1.PutChunk{
+		{Key: key("bad2"), ChunkIndex: 0, TotalChunks: 3, TotalLength: 12, Data: []byte("1234")},
+	}), codes.InvalidArgument, "declared")
+
+	// More data than total_length claimed. Cut off at the point it starts
+	// lying, not after buffering all of it.
+	r.wantCode(id+"/PutChunked(data > total_length)", send([]*nodev1.PutChunk{
+		{Key: key("bad3"), ChunkIndex: 0, TotalChunks: 1, TotalLength: 2, Data: []byte("far too much")},
+	}), codes.InvalidArgument, "total_length")
+
+	// total_length that is under-declared relative to the data actually sent
+	// across two chunks.
+	r.wantCode(id+"/PutChunked(length mismatch)", send([]*nodev1.PutChunk{
+		{Key: key("bad4"), ChunkIndex: 0, TotalChunks: 2, TotalLength: 8, Data: []byte("1234")},
+		{ChunkIndex: 1, TotalChunks: 2, TotalLength: 8, Data: []byte("56")},
+	}), codes.InvalidArgument, "total_length")
+
+	// First chunk with no key.
+	r.wantCode(id+"/PutChunked(no key)", send([]*nodev1.PutChunk{
+		{ChunkIndex: 0, TotalChunks: 1, TotalLength: 4, Data: []byte("1234")},
+	}), codes.InvalidArgument, "key")
+
+	// A declared length past the node's hard ceiling must be refused on the
+	// number alone, before a byte is buffered.
+	r.wantCode(id+"/PutChunked(> max-value-bytes)", send([]*nodev1.PutChunk{
+		{
+			Key:         key("bad5"),
+			ChunkIndex:  0,
+			TotalChunks: 1,
+			TotalLength: cfg.Engine.MaxValueBytes + 1,
+			Data:        []byte("x"),
+		},
+	}), codes.OutOfRange, "max-value-bytes")
+
+	// A key that changes mid-stream would splice two writes into one value.
+	r.wantCode(id+"/PutChunked(key changed)", send([]*nodev1.PutChunk{
+		{Key: key("bad6"), ChunkIndex: 0, TotalChunks: 2, TotalLength: 8, Data: []byte("1234")},
+		{Key: key("other"), ChunkIndex: 1, TotalChunks: 2, TotalLength: 8, Data: []byte("5678")},
+	}), codes.InvalidArgument, "different key")
+
+	// Finally: none of the rejected writes may have stored anything.
 	func() {
 		ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
 		defer cancel()
-		_, err := client.Capacity(ctx, &nodev1.CapacityRequest{})
-		r.wantUnimplemented(n.NodeID+"/Capacity", err)
+
+		var stored []string
+		for _, k := range []string{"bad1", "bad2", "bad3", "bad4", "bad5", "bad6", "other", "too-big-unary"} {
+			resp, err := client.Get(ctx, &nodev1.GetRequest{Key: key(k)})
+			if err == nil && resp.GetFound() {
+				stored = append(stored, k)
+			}
+		}
+		if len(stored) > 0 {
+			r.fail(id+"/rejected writes stored nothing",
+				fmt.Errorf("these keys exist after their writes were rejected: %s",
+					strings.Join(stored, ", ")))
+			return
+		}
+		r.pass(id+"/rejected writes stored nothing",
+			"all 8 rejected writes left no key behind")
 	}()
 }
 
@@ -448,11 +746,22 @@ func (r *reporter) fail(name string, err error) {
 }
 
 // wantUnimplemented records a pass only if err is a gRPC UNIMPLEMENTED status.
-// A success is a failure here: Phase 0 returning fake data from an
-// unimplemented RPC is exactly the thing this check exists to catch.
+// Still used for AdapterService, which genuinely has no server until Phase 7 --
+// a success there would mean something is answering that should not be.
 func (r *reporter) wantUnimplemented(name string, err error) {
+	r.wantCode(name, err, codes.Unimplemented, "")
+}
+
+// wantCode records a pass only if err carries the expected gRPC status code and
+// its message mentions `substr`.
+//
+// A success is a failure here, and the message check is not decoration: an
+// oversized unary Put returning a bare INVALID_ARGUMENT is not good enough,
+// because the whole point is that it tells the caller to use PutChunked. These
+// assertions are what stop an error path from degrading into a generic one.
+func (r *reporter) wantCode(name string, err error, want codes.Code, substr string) {
 	if err == nil {
-		r.fail(name, errors.New("returned OK; expected UNIMPLEMENTED (a stub must not fake success)"))
+		r.fail(name, fmt.Errorf("returned OK; expected %s (a rejected call must not silently succeed)", want))
 		return
 	}
 	st, ok := status.FromError(err)
@@ -460,11 +769,19 @@ func (r *reporter) wantUnimplemented(name string, err error) {
 		r.fail(name, fmt.Errorf("non-gRPC error: %v", err))
 		return
 	}
-	if st.Code() != codes.Unimplemented {
-		r.fail(name, fmt.Errorf("expected UNIMPLEMENTED, got %s: %s", st.Code(), st.Message()))
+	if st.Code() != want {
+		r.fail(name, fmt.Errorf("expected %s, got %s: %s", want, st.Code(), st.Message()))
 		return
 	}
-	r.pass(name, "UNIMPLEMENTED as expected")
+	if substr != "" && !strings.Contains(st.Message(), substr) {
+		r.fail(name, fmt.Errorf("%s message does not mention %q: %s", want, substr, st.Message()))
+		return
+	}
+	detail := want.String() + " as expected"
+	if substr != "" {
+		detail += fmt.Sprintf(", message names %q", substr)
+	}
+	r.pass(name, detail)
 }
 
 // report prints every check and returns the process exit code.
@@ -499,7 +816,113 @@ func (r *reporter) report() int {
 // ---------------------------------------------------------------------------
 
 func dial(address string) (*grpc.ClientConn, error) {
-	return grpc.NewClient(address, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	return grpc.NewClient(address,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(
+			grpc.MaxCallRecvMsgSize(maxMessageBytes),
+			grpc.MaxCallSendMsgSize(maxMessageBytes),
+		))
+}
+
+// deterministicValue produces non-compressible bytes that no allocator or
+// filesystem will reproduce by accident, so a byte-for-byte comparison after a
+// round trip means something. Same xorshift64* the C engine tests use.
+func deterministicValue(n int, seed uint64) []byte {
+	buf := make([]byte, n)
+	state := seed*2862933555777941757 + 3037000493
+	if state == 0 {
+		state = 1
+	}
+	var scratch [8]byte
+	for off := 0; off < n; off += 8 {
+		state ^= state >> 12
+		state ^= state << 25
+		state ^= state >> 27
+		binary.LittleEndian.PutUint64(scratch[:], state*0x2545F4914F6CDD1D)
+		copy(buf[off:], scratch[:])
+	}
+	return buf
+}
+
+func putChunked(ctx context.Context, client nodev1.NodeServiceClient,
+	key, value []byte, chunkSize int) error {
+
+	total := (len(value) + chunkSize - 1) / chunkSize
+	if total == 0 {
+		total = 1 // a zero-length value is still one chunk
+	}
+
+	stream, err := client.PutChunked(ctx)
+	if err != nil {
+		return err
+	}
+	for i := 0; i < total; i++ {
+		lo := i * chunkSize
+		hi := lo + chunkSize
+		if hi > len(value) {
+			hi = len(value)
+		}
+		chunk := &nodev1.PutChunk{
+			ChunkIndex:  uint32(i),
+			TotalChunks: uint32(total),
+			TotalLength: uint64(len(value)),
+			Data:        value[lo:hi],
+		}
+		if i == 0 {
+			chunk.Key = key
+		}
+		if err := stream.Send(chunk); err != nil {
+			break // the real status arrives on CloseAndRecv
+		}
+	}
+	_, err = stream.CloseAndRecv()
+	return err
+}
+
+// getChunked reassembles a streamed value. found is false for the empty stream
+// that means a miss.
+func getChunked(ctx context.Context, client nodev1.NodeServiceClient, key []byte) ([]byte, bool, error) {
+	stream, err := client.GetChunked(ctx, &nodev1.GetRequest{Key: key})
+	if err != nil {
+		return nil, false, err
+	}
+
+	var (
+		out   []byte
+		found bool
+		next  uint32
+	)
+	for {
+		chunk, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return nil, false, err
+		}
+		if chunk.GetChunkIndex() != next {
+			return nil, false, fmt.Errorf("server sent chunk_index %d, expected %d",
+				chunk.GetChunkIndex(), next)
+		}
+		next++
+		found = true
+		if out == nil {
+			out = make([]byte, 0, chunk.GetTotalLength())
+		}
+		out = append(out, chunk.GetData()...)
+	}
+	return out, found, nil
+}
+
+func humanSize(n int) string {
+	switch {
+	case n >= 1024*1024:
+		return fmt.Sprintf("%.1f MiB", float64(n)/(1024*1024))
+	case n >= 1024:
+		return fmt.Sprintf("%.1f KiB", float64(n)/1024)
+	default:
+		return fmt.Sprintf("%d B", n)
+	}
 }
 
 // compact flattens gRPC's multi-line error strings so one failure stays on one

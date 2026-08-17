@@ -33,6 +33,23 @@ const (
 	// Phase 0 dev cluster is single-machine by definition.
 	DefaultHost = "127.0.0.1"
 
+	// Engine defaults, mirroring PK_ENGINE_DEFAULT_* in
+	// node/engine/include/pulsekv_engine.h. Duplicated rather than shared
+	// because Go cannot read a C header; the smoke test asserts the node
+	// actually runs with what this file says, which is what keeps them
+	// honest.
+	DefaultRAMBudgetBytes = 256 * 1024 * 1024
+	DefaultMaxValueBytes  = 64 * 1024 * 1024
+	DefaultDataRoot       = "run/data"
+
+	// EngineShards is the engine's fixed lock-shard count (PK_TABLE_SHARDS).
+	// Needed here only to warn about the per-shard budget split.
+	EngineShards = 256
+
+	// UnaryValueLimitBytes is the wire limit above which Get/Put refuse and
+	// the chunked RPCs are required. Fixed in proto/node.proto.
+	UnaryValueLimitBytes = 4 * 1024 * 1024
+
 	maxPort = 65535
 )
 
@@ -60,10 +77,24 @@ func (n Node) Address() string {
 	return net.JoinHostPort(n.Host, strconv.Itoa(n.Port))
 }
 
+// Engine is the per-node data-plane configuration, applied identically to
+// every node. The control plane does not use these itself; it carries them so
+// deploy/run-local-cluster.sh can read the cluster's shape through one parser
+// instead of two.
+type Engine struct {
+	RAMBudgetBytes uint64 `yaml:"ram_budget_bytes"`
+	MaxValueBytes  uint64 `yaml:"max_value_bytes"`
+
+	// Root for per-node spill directories, relative to the directory holding
+	// the config file. Each node gets <data_root>/<node_id>.
+	DataRoot string `yaml:"data_root"`
+}
+
 // Config is the whole of deploy/cluster.config.yaml.
 type Config struct {
 	ControlPlane Endpoint `yaml:"control_plane"`
 	ShardCount   uint32   `yaml:"shard_count"`
+	Engine       Engine   `yaml:"engine"`
 	Nodes        []Node   `yaml:"nodes"`
 
 	// Path records where this config came from, for error messages.
@@ -104,11 +135,54 @@ func (c *Config) applyDefaults() {
 	if c.ControlPlane.Host == "" {
 		c.ControlPlane.Host = DefaultHost
 	}
+	if c.Engine.RAMBudgetBytes == 0 {
+		c.Engine.RAMBudgetBytes = DefaultRAMBudgetBytes
+	}
+	if c.Engine.MaxValueBytes == 0 {
+		c.Engine.MaxValueBytes = DefaultMaxValueBytes
+	}
+	if c.Engine.DataRoot == "" {
+		c.Engine.DataRoot = DefaultDataRoot
+	}
 	for i := range c.Nodes {
 		if c.Nodes[i].Host == "" {
 			c.Nodes[i].Host = DefaultHost
 		}
 	}
+}
+
+// Warnings reports configurations that are legal and will start, but that will
+// behave in a way the operator probably did not intend. Returned rather than
+// logged so the caller decides where they go; the control plane prints them at
+// startup, which is where a dev cluster's boot log will surface them.
+func (c *Config) Warnings() []string {
+	var out []string
+
+	// The one that actually catches people: the RAM budget is split 256 ways,
+	// so a budget that looks generous can give each shard less than a single
+	// value. The engine keeps such a value resident anyway (it never evicts a
+	// shard's only entry), which means the node quietly runs above its stated
+	// budget instead of spilling.
+	perShard := c.Engine.RAMBudgetBytes / EngineShards
+	if perShard < c.Engine.MaxValueBytes {
+		out = append(out, fmt.Sprintf(
+			"engine.ram_budget_bytes/%d = %d bytes per shard, which is smaller than "+
+				"engine.max_value_bytes (%d): a single max-size value exceeds its shard's "+
+				"share, so it stays resident and the node can run above the stated budget. "+
+				"Raise ram_budget_bytes to at least %d to avoid it.",
+			EngineShards, perShard, c.Engine.MaxValueBytes,
+			c.Engine.MaxValueBytes*EngineShards))
+	}
+
+	if c.Engine.MaxValueBytes < UnaryValueLimitBytes {
+		out = append(out, fmt.Sprintf(
+			"engine.max_value_bytes (%d) is below the %d-byte unary wire limit: "+
+				"values between the two are accepted by Put and then rejected by the "+
+				"engine, which is a confusing pair of errors to debug.",
+			c.Engine.MaxValueBytes, UnaryValueLimitBytes))
+	}
+
+	return out
 }
 
 // Validate collects every problem rather than reporting the first, so a
@@ -124,6 +198,15 @@ func (c *Config) Validate() error {
 	}
 	if c.ShardCount == 0 {
 		problems = append(problems, errors.New("shard_count: must be greater than zero"))
+	}
+	if c.Engine.RAMBudgetBytes == 0 {
+		problems = append(problems, errors.New("engine.ram_budget_bytes: must be greater than zero"))
+	}
+	if c.Engine.MaxValueBytes == 0 {
+		problems = append(problems, errors.New("engine.max_value_bytes: must be greater than zero"))
+	}
+	if c.Engine.DataRoot == "" {
+		problems = append(problems, errors.New("engine.data_root: must not be empty"))
 	}
 
 	seenID := make(map[string]int, len(c.Nodes))

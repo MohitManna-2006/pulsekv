@@ -49,6 +49,16 @@ class NodeServiceStub:
                 request_serializer=node__pb2.PutRequest.SerializeToString,
                 response_deserializer=node__pb2.PutResponse.FromString,
                 _registered_method=True)
+        self.PutChunked = channel.stream_unary(
+                '/pulsekv.node.v1.NodeService/PutChunked',
+                request_serializer=node__pb2.PutChunk.SerializeToString,
+                response_deserializer=node__pb2.PutResponse.FromString,
+                _registered_method=True)
+        self.GetChunked = channel.unary_stream(
+                '/pulsekv.node.v1.NodeService/GetChunked',
+                request_serializer=node__pb2.GetRequest.SerializeToString,
+                response_deserializer=node__pb2.GetChunk.FromString,
+                _registered_method=True)
         self.PrefixMatch = channel.unary_stream(
                 '/pulsekv.node.v1.NodeService/PrefixMatch',
                 request_serializer=node__pb2.PrefixMatchRequest.SerializeToString,
@@ -65,21 +75,47 @@ class NodeServiceServicer:
     """Missing associated documentation comment in .proto file."""
 
     def HealthCheck(self, request, context):
-        """Liveness plus node identity. Implemented for real in Phase 0.
+        """Liveness plus node identity.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def Get(self, request, context):
-        """Point lookup. Phase 1.
+        """Point lookup, for values up to UNARY_VALUE_LIMIT_BYTES. A miss is a
+        successful response with found = false, not an error.
+
+        If the stored value exceeds the unary limit the call fails with
+        FAILED_PRECONDITION pointing at GetChunked; use GetChunked when the size
+        is unknown.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def Put(self, request, context):
-        """Point write. Phase 1.
+        """Point write, for values up to UNARY_VALUE_LIMIT_BYTES. A larger value
+        fails fast with INVALID_ARGUMENT pointing at PutChunked rather than being
+        silently accepted.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def PutChunked(self, request_iterator, context):
+        """Chunked write for values above the unary limit. Chunks must arrive in
+        strictly ascending chunk_index order starting at 0 — gRPC already
+        guarantees stream ordering, so a gap or a repeat means a buggy client and
+        is rejected rather than reassembled. See PutChunk.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetChunked(self, request, context):
+        """Chunked read. Always valid regardless of value size; a small value simply
+        arrives as a single chunk. A miss is an empty stream (zero messages,
+        status OK), not an error — mirroring Get's found = false.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -87,7 +123,7 @@ class NodeServiceServicer:
 
     def PrefixMatch(self, request, context):
         """Streaming so a prefix scan can return more than fits in one message —
-        KV-cache blocks are megabytes each. Phase 1.
+        KV-cache blocks are megabytes each.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -95,7 +131,6 @@ class NodeServiceServicer:
 
     def Capacity(self, request, context):
         """Per-tier occupancy, used by the control plane for placement decisions.
-        Phase 1 (RAM tier) and Phase 5 (NVMe tier).
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -118,6 +153,16 @@ def add_NodeServiceServicer_to_server(servicer, server):
                     servicer.Put,
                     request_deserializer=node__pb2.PutRequest.FromString,
                     response_serializer=node__pb2.PutResponse.SerializeToString,
+            ),
+            'PutChunked': grpc.stream_unary_rpc_method_handler(
+                    servicer.PutChunked,
+                    request_deserializer=node__pb2.PutChunk.FromString,
+                    response_serializer=node__pb2.PutResponse.SerializeToString,
+            ),
+            'GetChunked': grpc.unary_stream_rpc_method_handler(
+                    servicer.GetChunked,
+                    request_deserializer=node__pb2.GetRequest.FromString,
+                    response_serializer=node__pb2.GetChunk.SerializeToString,
             ),
             'PrefixMatch': grpc.unary_stream_rpc_method_handler(
                     servicer.PrefixMatch,
@@ -211,6 +256,60 @@ class NodeService:
             '/pulsekv.node.v1.NodeService/Put',
             node__pb2.PutRequest.SerializeToString,
             node__pb2.PutResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def PutChunked(request_iterator,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.stream_unary(
+            request_iterator,
+            target,
+            '/pulsekv.node.v1.NodeService/PutChunked',
+            node__pb2.PutChunk.SerializeToString,
+            node__pb2.PutResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetChunked(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_stream(
+            request,
+            target,
+            '/pulsekv.node.v1.NodeService/GetChunked',
+            node__pb2.GetRequest.SerializeToString,
+            node__pb2.GetChunk.FromString,
             options,
             channel_credentials,
             insecure,

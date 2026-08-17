@@ -95,16 +95,20 @@ target_compile_options(pulsekv_proto PRIVATE -w)
 # The shim binary.
 # ---------------------------------------------------------------------------
 
+# The Phase 1 seam, now closed. node/engine/ is a self-contained pure-C CMake
+# project; it knows nothing about gRPC or protobuf and is buildable and
+# testable on its own (cmake -S node/engine).
+#
+# The include scoping is what mechanically enforces the boundary rather than
+# leaving it to discipline: pulsekv_engine exports include/ as PUBLIC and src/
+# as PRIVATE, so pulsekv_engine.h is the only engine header main.cpp can reach.
+# hashtable.h and tiering.h are not on its include path at all, and a stray
+# #include of one fails to compile.
+add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../engine" engine)
+
 add_executable(pulsekv-node main.cpp)
 target_compile_options(pulsekv-node PRIVATE -Wall -Wextra)
-target_link_libraries(pulsekv-node PRIVATE pulsekv_proto Threads::Threads)
-
-# Phase 1 seam: the pure-C engine gets linked in right here, behind an
-# extern "C" header, and NodeServiceImpl's UNIMPLEMENTED bodies start calling
-# into it. Nothing else about this file should need to change.
-#
-#   add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../engine" engine)
-#   target_link_libraries(pulsekv-node PRIVATE pulsekv_engine)
+target_link_libraries(pulsekv-node PRIVATE pulsekv_proto pulsekv_engine Threads::Threads)
 
 # Server reflection lets grpcurl introspect a running node without the .proto
 # files. Optional: the shim compiles and serves identically without it, so a

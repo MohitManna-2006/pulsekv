@@ -26,6 +26,7 @@ PULSEKV_CONFIG="${PULSEKV_CONFIG:-${PULSEKV_DEPLOY_DIR}/cluster.config.yaml}"
 
 PULSEKV_CONTROLPLANE_BIN="${PULSEKV_BIN_DIR}/pulsekv-controlplane"
 PULSEKV_SMOKE_BIN="${PULSEKV_BIN_DIR}/pulsekv-smoke"
+PULSEKV_BENCH_BIN="${PULSEKV_BIN_DIR}/pulsekv-node-bench"
 PULSEKV_NODE_BIN="${PULSEKV_CMAKE_DIR}/pulsekv-node"
 
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then

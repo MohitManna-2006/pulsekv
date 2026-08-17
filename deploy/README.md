@@ -11,8 +11,10 @@ deploy/
 ├── common.sh               shared paths and helpers, sourced by the scripts
 ├── gen-proto.sh            regenerate the Go and Python stubs
 ├── run-local-cluster.sh    build + boot + wait for health
-├── smoke-test.sh           assert the Phase 0 contract against the live cluster
-└── stop-local-cluster.sh   terminate everything, sweep orphans
+├── smoke-test.sh           assert the contract against the live cluster
+├── stop-local-cluster.sh   terminate everything, sweep orphans
+├── test-engine.sh          the C engine's suite: release / TSan / Valgrind
+└── bench-node.sh           node benchmark, fits-in-RAM vs exceeds-RAM
 ```
 
 Build output goes to `deploy/build/`, runtime state to `deploy/run/`. Both are
@@ -88,11 +90,33 @@ documents the port layout for that.
 | `run-local-cluster.sh` | Every process is listening and answering `HealthCheck` before the "cluster ready" banner prints. On timeout it dumps each process's log, says whether it exited or just never answered, stops the partial cluster, and exits non-zero. |
 | `smoke-test.sh` | Three legs — Go contract assertions, the Python adapters client, and an optional grpcurl reflection check. Non-zero on any failure. |
 | `stop-local-cluster.sh` | SIGTERM, up to 10s grace, then SIGKILL; plus the orphan sweep. Non-zero only if something could not be stopped. |
+| `test-engine.sh` | Builds and runs the pure-C engine suite. No cluster, no gRPC, no network. |
+| `bench-node.sh` | Boots a dedicated node with a small RAM budget and benchmarks it twice — inside and well outside that budget. Fails the run on any unverified read. |
 
-`smoke-test.sh`'s Go leg is the one that enforces Phase 0's real requirement:
-every RPC other than `HealthCheck` must answer `UNIMPLEMENTED`, not a fake
-success. A `Get` returning `found=false` would be indistinguishable from a
-working engine that happens to be empty.
+`smoke-test.sh`'s Go leg is the one that enforces the real behaviour: a Put
+followed by a Get returns the value, a miss is `found=false` rather than an
+error, a multi-megabyte value round-trips through `PutChunked`/`GetChunked`
+byte-for-byte, and eight deliberately malformed chunked writes are each rejected
+with a specific status **and leave no key behind**.
+
+### Running `test-engine.sh --tsan` in Docker
+
+ThreadSanitizer disables ASLR through `personality(ADDR_NO_RANDOMIZE)`, which
+Docker's default seccomp profile blocks. Start the container with:
+
+```sh
+docker run --rm -it --security-opt seccomp=unconfined -v "$PWD:/src" -w /src pulsekv-v2-dev bash
+```
+
+Without it TSan aborts at startup; the script detects that specific failure and
+tells you the flag rather than reporting it as a test failure.
+
+### Where the benchmark's spill directory goes
+
+`bench-node.sh` defaults its `--data-dir` to `/tmp` **inside the container**,
+not `deploy/run/`. On the normal macOS + colima setup the repo is a virtiofs
+bind mount, and putting the NVMe tier there measures the host-to-VM filesystem
+bridge instead of the tier. The script warns if you point it back into the repo.
 
 ## Ports
 

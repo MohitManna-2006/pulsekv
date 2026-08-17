@@ -101,9 +101,12 @@ else
             go build -o "$PULSEKV_CONTROLPLANE_BIN" ./cmd/controlplane
         run_logged "$(build_log go-build-smoke.log)" "go build (pulsekv-smoke)" \
             go build -o "$PULSEKV_SMOKE_BIN" ./cmd/pulsekv-smoke
+        run_logged "$(build_log go-build-bench.log)" "go build (pulsekv-node-bench)" \
+            go build -o "$PULSEKV_BENCH_BIN" ./cmd/pulsekv-node-bench
     )
     pk_ok "$(pk_relpath "$PULSEKV_CONTROLPLANE_BIN")"
     pk_ok "$(pk_relpath "$PULSEKV_SMOKE_BIN")"
+    pk_ok "$(pk_relpath "$PULSEKV_BENCH_BIN")"
 
     # Validate the config before paying for the C++ build.
     pk_step "Validating $(pk_relpath "$PULSEKV_CONFIG")"
@@ -119,8 +122,12 @@ else
     run_logged "$(build_log cmake-configure.log)" "cmake configure" \
         cmake -S "$PULSEKV_REPO_ROOT/node/grpc_shim" -B "$PULSEKV_CMAKE_DIR" \
               -DCMAKE_BUILD_TYPE=Release
+    # Only the node binary: the engine's four test binaries live in the same
+    # CMake tree and there is no reason to compile them to boot a cluster.
+    # deploy/test-engine.sh builds and runs those.
     run_logged "$(build_log cmake-build.log)" "cmake build" \
-        cmake --build "$PULSEKV_CMAKE_DIR" -j "$(nproc 2>/dev/null || echo 4)"
+        cmake --build "$PULSEKV_CMAKE_DIR" -j "$(nproc 2>/dev/null || echo 4)" \
+              --target pulsekv-node
     pk_ok "$(pk_relpath "$PULSEKV_NODE_BIN")"
     grep -E '^-- pulsekv:' "$(build_log cmake-configure.log)" | sed 's/^-- pulsekv: /    /' || true
 fi
@@ -133,6 +140,14 @@ CP_ADDRESS="${CP_HOST}:${CP_PORT}"
 
 mapfile -t NODE_LINES < <(pk_config_read --print-nodes)
 [ "${#NODE_LINES[@]}" -gt 0 ] || pk_die "config defines no nodes"
+
+IFS=$'\t' read -r RAM_BUDGET MAX_VALUE DATA_ROOT < <(pk_config_read --print-engine)
+# data_root is relative to deploy/ unless it is already absolute.
+case "$DATA_ROOT" in
+    /*) DATA_ROOT_ABS="$DATA_ROOT" ;;
+    *)  DATA_ROOT_ABS="${PULSEKV_DEPLOY_DIR}/${DATA_ROOT}" ;;
+esac
+mkdir -p "$DATA_ROOT_ABS"
 
 # ---------------------------------------------------------------------------
 # Start everything.
@@ -159,11 +174,19 @@ start_process "controlplane" "$CP_ADDRESS" \
 
 for line in "${NODE_LINES[@]}"; do
     IFS=$'\t' read -r node_id node_host node_port <<< "$line"
+    # One spill directory per node, never shared: two engines purging and
+    # writing into the same tree would delete each other's values.
+    node_data_dir="${DATA_ROOT_ABS}/${node_id}"
+    mkdir -p "$node_data_dir"
     start_process "$node_id" "${node_host}:${node_port}" \
-        "$PULSEKV_NODE_BIN" --node-id "$node_id" --host "$node_host" --port "$node_port"
+        "$PULSEKV_NODE_BIN" --node-id "$node_id" --host "$node_host" --port "$node_port" \
+        --data-dir "$node_data_dir" \
+        --ram-budget-bytes "$RAM_BUDGET" \
+        --max-value-bytes "$MAX_VALUE"
 done
 
 pk_info "$(printf '%s process(es) launched, waiting for health checks' "${#STARTED_PIDS[@]}")"
+pk_dim "engine: ram-budget=$RAM_BUDGET max-value=$MAX_VALUE data-root=$(pk_relpath "$DATA_ROOT_ABS")"
 
 # ---------------------------------------------------------------------------
 # Wait for health, or fail with something actionable.
@@ -215,10 +238,13 @@ for i in "${!STARTED_LABELS[@]}"; do
 done
 echo
 pk_info "${#STARTED_PIDS[@]} process(es) running, all health checks passing."
-pk_info "config:  $(pk_relpath "$PULSEKV_CONFIG")"
-pk_info "pids:    $(pk_relpath "$PULSEKV_PID_FILE")"
+pk_info "config:    $(pk_relpath "$PULSEKV_CONFIG")"
+pk_info "pids:      $(pk_relpath "$PULSEKV_PID_FILE")"
+pk_info "spill dirs: $(pk_relpath "$DATA_ROOT_ABS")/<node-id>  (purged at node start and stop)"
 echo
-pk_info "smoke test:  deploy/smoke-test.sh"
-pk_info "stop:        deploy/stop-local-cluster.sh"
+pk_info "smoke test:   deploy/smoke-test.sh"
+pk_info "engine tests: deploy/test-engine.sh"
+pk_info "benchmark:    deploy/build/bin/pulsekv-node-bench --address ${CP_HOST}:$(printf '%s' "${NODE_LINES[0]}" | cut -f3)"
+pk_info "stop:         deploy/stop-local-cluster.sh"
 pk_info "poke by hand: grpcurl -plaintext ${CP_ADDRESS} list"
 echo

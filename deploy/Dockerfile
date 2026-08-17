@@ -62,6 +62,11 @@ ENV DEBIAN_FRONTEND=noninteractive
 #   protobuf-*, libgrpc++-dev   -- C++ and gRPC, for node/grpc_shim/
 #   python3, python3-venv       -- adapters/
 #   procps                      -- pgrep/ps, used by the deploy scripts
+#   valgrind                    -- deploy/test-engine.sh --valgrind. Same reason
+#                                  v1's Dockerfile carries it: the engine holds
+#                                  long-lived heap state whose ownership moves
+#                                  between RAM, disk, and the caller, and "the
+#                                  tests pass" is not evidence about lifetimes.
 #
 # The pkg-config and grpc_cpp_plugin checks at the end fail the image build
 # loudly here rather than at cmake-configure time on someone else's machine.
@@ -83,6 +88,7 @@ RUN apt-get update \
         python3 \
         python3-venv \
         procps \
+        valgrind \
  && rm -rf /var/lib/apt/lists/* \
  && pkg-config --exists grpc++ protobuf \
  && test -x /usr/bin/grpc_cpp_plugin

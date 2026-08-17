@@ -57,33 +57,41 @@ health, capacity, keys, iovec descriptors — and nothing large. Keeping the
 engine free of gRPC is what makes that second, leaner data path possible without
 a rewrite.
 
-## `engine/` — empty on purpose in Phase 0
+## `engine/` — the storage engine
 
-Phase 1.1 extracts v1's `src/hashtable.c` and the worker model from
-`src/main.c` into here, behind a clean internal API, with v1's existing test
-suite as the regression gate. Phase 0 deliberately does not touch it: the point
-of Phase 0 is to freeze the contract so Phases 1 (this directory) and 2 (the Go
-control plane) can proceed independently, and starting the extraction early
-would defeat that.
+Populated in Phase 1 by copying v1's `src/hashtable.c` and building a tiering
+layer underneath it. v1's `src/` and `include/` stay exactly where they are —
+v1 remains a standalone, complete, documented project, and its own test suite is
+the regression gate proving the copy did not disturb it.
 
-v1's `src/` and `include/` stay exactly where they are. v1 remains a standalone,
-complete, documented project; Phase 1 copies from it rather than moving it.
+**v1's epoll worker model was deliberately not extracted.** The Phase 1 plan
+called for it, but that instruction predates Phase 0's decision to put gRPC C++
+in front of the data plane: gRPC's server already owns its sockets and its
+thread pool, so v1's hand-rolled event loop would be dead code with no caller.
+Only the storage logic needed extracting. See `node/engine/README.md` for the
+full inventory of what came across and what did not.
 
-## `grpc_shim/` — Phase 0 behaviour
+## `grpc_shim/` — behaviour
 
-| RPC | Phase 0 | Arrives in |
-|---|---|---|
-| `HealthCheck` | real: `ok=true`, this node's ID, actual uptime | — |
-| `Get` | `UNIMPLEMENTED` | Phase 1.4 |
-| `Put` | `UNIMPLEMENTED` | Phase 1.4 |
-| `PrefixMatch` | `UNIMPLEMENTED` | Phase 1.4 |
-| `Capacity` | `UNIMPLEMENTED` | Phase 1.4 |
+Every RPC is real as of Phase 1; nothing returns `UNIMPLEMENTED`.
 
-`UNIMPLEMENTED` rather than an empty success is load-bearing. A `Get` that
-returned `found=false` would be indistinguishable from a working engine that
-simply has nothing stored, and every layer built on top would silently treat the
-skeleton as functional. `deploy/smoke-test.sh` asserts the status code on every
-one of these RPCs for exactly that reason.
+| RPC | Behaviour |
+|---|---|
+| `HealthCheck` | `ok=true`, this node's ID, actual uptime |
+| `Get` | value for keys up to 4 MiB; a miss is `found=false` with status OK, never an error. A stored value above the unary limit returns `FAILED_PRECONDITION` naming `GetChunked`. |
+| `Put` | writes values up to 4 MiB; above that, `INVALID_ARGUMENT` naming `PutChunked` |
+| `PutChunked` | client-streaming write for larger values. Chunks must arrive in order from index 0; `total_length` is validated against `--max-value-bytes` before a byte is buffered. |
+| `GetChunked` | server-streaming read, always valid. A miss is an empty stream. |
+| `PrefixMatch` | full scan of all 256 shards, O(total keys). Values above the unary limit are flagged `value_omitted` rather than inlined. |
+| `Capacity` | per-tier key and byte occupancy, straight from the engine |
+
+Two behaviours worth knowing because they are easy to get subtly wrong, and are
+asserted by `deploy/smoke-test.sh`:
+
+- **A miss is a success.** Reporting it as a gRPC error would make every cache
+  miss look like a failure in the caller's metrics.
+- **A rejected write stores nothing.** The smoke test writes eight deliberately
+  malformed requests per node and then checks that none of those keys exist.
 
 ## Building and running by hand
 

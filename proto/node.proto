@@ -1,12 +1,19 @@
 // NodeService — the interface a control-plane instance uses to talk to one
 // data-plane node.
 //
-// Phase 0 status: the C++ shim in node/grpc_shim/ implements HealthCheck for
-// real and returns UNIMPLEMENTED for everything else. Phase 1 backs the
-// remaining RPCs with the extracted C engine under node/engine/.
+// Phase 1 status: every RPC here is implemented by the C++ shim in
+// node/grpc_shim/ over the pure-C engine in node/engine/. Nothing returns
+// UNIMPLEMENTED any more.
 //
 // This contract is frozen as of Phase 0. Phases 1-8 are written against this
-// shape; add fields rather than renaming or removing RPCs.
+// shape; add fields and RPCs rather than renaming or removing them. Phase 1
+// added PutChunked/GetChunked and their messages; nothing existing changed.
+//
+// ERROR CHANNEL: gRPC status codes are the sole error channel for every RPC
+// here. A handler either returns OK with a valid response, or a non-OK status
+// — never OK with an in-band error string. gRPC discards the response message
+// when the status is non-OK, so an in-band error field would be unreadable
+// anyway. See PutResponse.error for the one field this leaves unused.
 
 syntax = "proto3";
 
@@ -15,22 +22,52 @@ package pulsekv.node.v1;
 option go_package = "pulsekv/control/gen/node/v1;nodev1";
 
 service NodeService {
-  // Liveness plus node identity. Implemented for real in Phase 0.
+  // Liveness plus node identity.
   rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
 
-  // Point lookup. Phase 1.
+  // Point lookup, for values up to UNARY_VALUE_LIMIT_BYTES. A miss is a
+  // successful response with found = false, not an error.
+  //
+  // If the stored value exceeds the unary limit the call fails with
+  // FAILED_PRECONDITION pointing at GetChunked; use GetChunked when the size
+  // is unknown.
   rpc Get(GetRequest) returns (GetResponse);
 
-  // Point write. Phase 1.
+  // Point write, for values up to UNARY_VALUE_LIMIT_BYTES. A larger value
+  // fails fast with INVALID_ARGUMENT pointing at PutChunked rather than being
+  // silently accepted.
   rpc Put(PutRequest) returns (PutResponse);
 
+  // Chunked write for values above the unary limit. Chunks must arrive in
+  // strictly ascending chunk_index order starting at 0 — gRPC already
+  // guarantees stream ordering, so a gap or a repeat means a buggy client and
+  // is rejected rather than reassembled. See PutChunk.
+  rpc PutChunked(stream PutChunk) returns (PutResponse);
+
+  // Chunked read. Always valid regardless of value size; a small value simply
+  // arrives as a single chunk. A miss is an empty stream (zero messages,
+  // status OK), not an error — mirroring Get's found = false.
+  rpc GetChunked(GetRequest) returns (stream GetChunk);
+
   // Streaming so a prefix scan can return more than fits in one message —
-  // KV-cache blocks are megabytes each. Phase 1.
+  // KV-cache blocks are megabytes each.
   rpc PrefixMatch(PrefixMatchRequest) returns (stream PrefixMatchResponse);
 
   // Per-tier occupancy, used by the control plane for placement decisions.
-  // Phase 1 (RAM tier) and Phase 5 (NVMe tier).
   rpc Capacity(CapacityRequest) returns (CapacityResponse);
+}
+
+// The value size above which the unary Get/Put path is refused and the chunked
+// path is required. Matches gRPC's own 4 MiB default max message size, which is
+// a reasonable line between "fits comfortably in one message" and "needs
+// streaming". Declared here so clients do not have to hardcode it.
+//
+// This is a WIRE limit. The engine's own hard ceiling on a stored value is a
+// separate, larger, per-node configuration value (--max-value-bytes, default
+// 64 MiB); exceeding that fails with OUT_OF_RANGE on either path.
+enum UnaryLimit {
+  UNARY_LIMIT_UNSPECIFIED = 0;
+  UNARY_VALUE_LIMIT_BYTES = 4194304;  // 4 MiB
 }
 
 message HealthCheckRequest {}
@@ -54,8 +91,50 @@ message PutRequest {
 }
 
 message PutResponse {
+  // Always true when the status is OK. A write that failed returns a non-OK
+  // gRPC status instead — see the ERROR CHANNEL note at the top of this file.
   bool ok = 1;
+
+  // Unused in Phase 1, and deliberately kept rather than removed: the contract
+  // is frozen, and this is the natural place for a future partial-success
+  // report — Phase 4's replication needs to say "committed locally, replica
+  // lagging", which is an OK status with a caveat, not an error.
   string error = 2;
+}
+
+// One frame of a PutChunked stream.
+//
+// Conventions, all enforced by the server:
+//   * key          — required on chunk 0. On later chunks it may be empty
+//                    (preferred, saves bytes) or byte-identical; a different
+//                    non-empty key aborts the stream.
+//   * chunk_index  — must start at 0 and increase by exactly 1 per message.
+//   * total_chunks — required on chunk 0, must be > 0, and must be repeated
+//                    identically or left 0 on later chunks. The stream must
+//                    contain exactly this many messages.
+//   * total_length — required on chunk 0. Checked against the node's
+//                    --max-value-bytes BEFORE a single byte is buffered, so a
+//                    corrupt or hostile length cannot force a large
+//                    allocation. The concatenated data must be exactly this
+//                    long; a lie in either direction aborts the stream.
+//   * data         — may be empty only for a zero-length value (one chunk,
+//                    total_length = 0).
+message PutChunk {
+  bytes key = 1;
+  uint32 chunk_index = 2;
+  uint32 total_chunks = 3;
+  uint64 total_length = 4;
+  bytes data = 5;
+}
+
+// One frame of a GetChunked stream. total_chunks and total_length are repeated
+// on every chunk so a client can size its buffer from the first message and
+// verify completeness without tracking state across the whole stream.
+message GetChunk {
+  uint32 chunk_index = 1;
+  uint32 total_chunks = 2;
+  uint64 total_length = 3;
+  bytes data = 4;
 }
 
 message PrefixMatchRequest { bytes prefix = 1; }
@@ -63,12 +142,32 @@ message PrefixMatchRequest { bytes prefix = 1; }
 message PrefixMatchResponse {
   bytes key = 1;
   bytes value = 2;
+
+  // Set when this key matched but its value is larger than
+  // UNARY_VALUE_LIMIT_BYTES, so it was not inlined: `value` is empty and the
+  // caller should fetch it with GetChunked.
+  //
+  // Added in Phase 1. Without it, a scan over a cache of multi-megabyte KV
+  // blocks has only bad options — fail the whole stream on the first large
+  // value, or return an empty `value` that is indistinguishable from a key
+  // whose stored value genuinely is empty. This makes the distinction explicit
+  // instead.
+  bool value_omitted = 3;
 }
 
 message CapacityRequest {}
 
 message CapacityResponse {
+  // Every key this node can serve, across both tiers. A spilled key keeps its
+  // index entry in RAM — only its value moves to NVMe — so it is still
+  // "resident" in the sense that matters to the control plane: this node
+  // answers for it.
   uint64 resident_keys = 1;
+
+  // Value bytes held in RAM, and value bytes spilled to NVMe. These are value
+  // bytes only; the in-RAM index (keys plus per-entry bookkeeping) is not
+  // counted, and neither is spill-file header overhead. Documented rather than
+  // silently approximated — see docs/pulsekv-v2-phase1-summary.md.
   uint64 bytes_in_ram_tier = 2;
   uint64 bytes_in_nvme_tier = 3;
 }

@@ -64,6 +64,35 @@ control_plane:
 # striping inside one process.
 shard_count: 256
 
+# ---------------------------------------------------------------------------
+# Data-plane engine settings (Phase 1)
+# ---------------------------------------------------------------------------
+# Applied identically to every node; run-local-cluster.sh passes them through as
+# --ram-budget-bytes / --max-value-bytes / --data-dir. Raw byte counts, not
+# "256MiB" strings, so the Go loader and the C++ node cannot disagree about what
+# a suffix means.
+engine:
+  # RAM tier budget per node. IMPORTANT: this is divided evenly across the
+  # engine's 256 lock shards, so each shard gets ram_budget_bytes / 256 -- here,
+  # 1 MiB. A global counter would be one contended cache line on every write,
+  # which is the bottleneck the 256-way striping exists to avoid; the price is
+  # that occupancy is only as even as the hash, and a shard holding a single
+  # entry never evicts it. Total resident bytes can therefore exceed this
+  # figure. See docs/pulsekv-v2-phase1-summary.md.
+  ram_budget_bytes: 268435456   # 256 MiB
+
+  # Hard ceiling on one stored value, enforced before anything is allocated for
+  # it. Values above 4 MiB (the unary wire limit, fixed in proto/node.proto)
+  # must use PutChunked/GetChunked.
+  max_value_bytes: 67108864     # 64 MiB
+
+  # Root for per-node NVMe spill directories, relative to deploy/. Each node
+  # gets its own <data_root>/<node_id>; nodes must never share one. The engine
+  # creates and exclusively owns <dir>/spill/ and PURGES IT at startup and
+  # shutdown -- the tier is a spill tier, not persistence, and nothing in it
+  # survives a restart.
+  data_root: run/data
+
 nodes:
   - node_id: node-0
     port: 7100

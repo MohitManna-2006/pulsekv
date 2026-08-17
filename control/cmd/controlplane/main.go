@@ -43,6 +43,8 @@ func main() {
 			"print `node_id<TAB>host<TAB>port` for each configured node and exit")
 		printControlPlane = flag.Bool("print-control-plane", false,
 			"print `host<TAB>port` for the control plane and exit")
+		printEngine = flag.Bool("print-engine", false,
+			"print `ram_budget_bytes<TAB>max_value_bytes<TAB>data_root` and exit")
 	)
 	flag.Parse()
 
@@ -67,6 +69,17 @@ func main() {
 	if *printControlPlane {
 		fmt.Printf("%s\t%d\n", cfg.ControlPlane.Host, cfg.ControlPlane.Port)
 		return
+	}
+	if *printEngine {
+		fmt.Printf("%d\t%d\t%s\n", cfg.Engine.RAMBudgetBytes,
+			cfg.Engine.MaxValueBytes, cfg.Engine.DataRoot)
+		return
+	}
+
+	// Legal-but-probably-not-what-you-meant configurations. Printed once, at
+	// startup, where a dev cluster's boot log will actually surface them.
+	for _, w := range cfg.Warnings() {
+		log.Printf("config warning: %s", w)
 	}
 
 	if err := run(cfg, *probeTimeout); err != nil {
