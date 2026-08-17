@@ -46,8 +46,16 @@ class GetShardMapRequest(_message.Message):
     __slots__ = ()
     def __init__(self) -> None: ...
 
+class ShardOwners(_message.Message):
+    __slots__ = ("primary", "replicas")
+    PRIMARY_FIELD_NUMBER: _ClassVar[int]
+    REPLICAS_FIELD_NUMBER: _ClassVar[int]
+    primary: str
+    replicas: _containers.RepeatedScalarFieldContainer[str]
+    def __init__(self, primary: _Optional[str] = ..., replicas: _Optional[_Iterable[str]] = ...) -> None: ...
+
 class GetShardMapResponse(_message.Message):
-    __slots__ = ("shard_to_node_id", "topology_generation", "topology_fingerprint", "shard_count")
+    __slots__ = ("shard_to_node_id", "topology_generation", "topology_fingerprint", "shard_count", "shard_to_owners", "replication_factor")
     class ShardToNodeIdEntry(_message.Message):
         __slots__ = ("key", "value")
         KEY_FIELD_NUMBER: _ClassVar[int]
@@ -55,12 +63,23 @@ class GetShardMapResponse(_message.Message):
         key: int
         value: str
         def __init__(self, key: _Optional[int] = ..., value: _Optional[str] = ...) -> None: ...
+    class ShardToOwnersEntry(_message.Message):
+        __slots__ = ("key", "value")
+        KEY_FIELD_NUMBER: _ClassVar[int]
+        VALUE_FIELD_NUMBER: _ClassVar[int]
+        key: int
+        value: ShardOwners
+        def __init__(self, key: _Optional[int] = ..., value: _Optional[_Union[ShardOwners, _Mapping]] = ...) -> None: ...
     SHARD_TO_NODE_ID_FIELD_NUMBER: _ClassVar[int]
     TOPOLOGY_GENERATION_FIELD_NUMBER: _ClassVar[int]
     TOPOLOGY_FINGERPRINT_FIELD_NUMBER: _ClassVar[int]
     SHARD_COUNT_FIELD_NUMBER: _ClassVar[int]
+    SHARD_TO_OWNERS_FIELD_NUMBER: _ClassVar[int]
+    REPLICATION_FACTOR_FIELD_NUMBER: _ClassVar[int]
     shard_to_node_id: _containers.ScalarMap[int, str]
     topology_generation: int
     topology_fingerprint: bytes
     shard_count: int
-    def __init__(self, shard_to_node_id: _Optional[_Mapping[int, str]] = ..., topology_generation: _Optional[int] = ..., topology_fingerprint: _Optional[bytes] = ..., shard_count: _Optional[int] = ...) -> None: ...
+    shard_to_owners: _containers.MessageMap[int, ShardOwners]
+    replication_factor: int
+    def __init__(self, shard_to_node_id: _Optional[_Mapping[int, str]] = ..., topology_generation: _Optional[int] = ..., topology_fingerprint: _Optional[bytes] = ..., shard_count: _Optional[int] = ..., shard_to_owners: _Optional[_Mapping[int, ShardOwners]] = ..., replication_factor: _Optional[int] = ...) -> None: ...

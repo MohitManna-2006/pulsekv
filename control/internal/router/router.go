@@ -5,6 +5,9 @@
 //	key   -> shard   ShardForKey.  Fixed forever for a given ShardCount,
 //	                 regardless of cluster membership.
 //	shard -> node    AssignShards. Recomputed whenever membership changes.
+//	shard -> owners  AssignShardOwners. The same computation carried further
+//	                 down the ranking, so a shard has a primary and an ordered
+//	                 list of replicas rather than a single owner.
 //
 // Keeping shard *identity* independent of shard *ownership* is the whole point:
 // it lets ownership move during a membership change without any key changing
@@ -153,6 +156,121 @@ func AssignShards(nodeIDs []string, shardCount uint32) map[uint32]string {
 		assignment[shard] = bestID
 	}
 	return assignment
+}
+
+// ShardOwners is every node holding one shard, in promotion order.
+//
+// Replicas are ranks 2..N of the same rendezvous ranking that produced Primary,
+// so "which replica gets promoted when the primary dies" needs no election and
+// no coordination: it is whatever AssignShards already returns for the smaller
+// node set. Replicas is nil when the replication factor is 0 or the cluster has
+// no other live node to hold a copy.
+type ShardOwners struct {
+	Primary  string
+	Replicas []string
+}
+
+// rankedNode is one candidate during the top-K selection below.
+type rankedNode struct {
+	id     string
+	weight uint64
+}
+
+// ranksBefore is the single ordering rule shared by AssignShards and
+// AssignShardOwners: higher weight wins, and an exact weight tie is broken
+// lexicographically so two control-plane replicas cannot disagree.
+//
+// AssignShards inlines this comparison rather than calling it, because it runs
+// once per (shard, node) pair on a hot recomputation path. The two must stay
+// identical; TestShardOwnersPrimaryMatchesAssignShards is what enforces that.
+func ranksBefore(a, b rankedNode) bool {
+	return a.weight > b.weight || (a.weight == b.weight && a.id < b.id)
+}
+
+// AssignShardOwners computes primary-plus-replica placement for a node set.
+//
+// For each shard it takes the top 1+replicaFactor distinct nodes by the exact
+// weight function AssignShards uses; rank 1 is the primary and ranks 2..N are
+// the replicas in order. That is what makes AssignShardOwners(...)[s].Primary
+// identically equal to AssignShards(...)[s] for every input, which in turn is
+// what lets every Phase 2/3 caller keep reading shard_to_node_id unmodified.
+//
+// Fewer than 1+replicaFactor live nodes is not an error. The shard simply gets
+// as many replicas as there are other nodes, which is the honest answer: a
+// three-node cluster cannot hold three copies plus a primary, and refusing to
+// publish a map would be strictly worse than publishing a less-replicated one.
+//
+// A negative replicaFactor is treated as 0 rather than rejected, so a
+// mis-parsed config degrades to "no replication" instead of panicking a
+// control plane.
+//
+// Cost is O(shardCount x len(nodeIDs) x replicaFactor). The K in the top-K is
+// 1, 2, or 3 in every configuration the design doc contemplates, so the
+// insertion scan below is cheaper than sorting all N candidates per shard.
+func AssignShardOwners(nodeIDs []string, shardCount uint32, replicaFactor int) map[uint32]ShardOwners {
+	assignment := make(map[uint32]ShardOwners, shardCount)
+	if len(nodeIDs) == 0 || shardCount == 0 {
+		return assignment
+	}
+	if replicaFactor < 0 {
+		replicaFactor = 0
+	}
+
+	// Same hoist as AssignShards: hash each node ID once for the whole loop.
+	seeds := make([]uint64, len(nodeIDs))
+	for i, id := range nodeIDs {
+		seeds[i] = nodeSeed(id)
+	}
+
+	wanted := replicaFactor + 1
+	if wanted > len(nodeIDs) {
+		wanted = len(nodeIDs)
+	}
+	top := make([]rankedNode, 0, wanted)
+
+	for shard := uint32(0); shard < shardCount; shard++ {
+		shardSeed := mix64(uint64(shard))
+		top = top[:0]
+
+		for i, id := range nodeIDs {
+			candidate := rankedNode{id: id, weight: mix64(seeds[i] ^ shardSeed)}
+
+			// Reject early once the list is full and this candidate cannot
+			// displace even the last entry.
+			if len(top) == wanted && !ranksBefore(candidate, top[len(top)-1]) {
+				continue
+			}
+			if len(top) < wanted {
+				top = append(top, rankedNode{})
+			}
+			position := len(top) - 1
+			for position > 0 && ranksBefore(candidate, top[position-1]) {
+				top[position] = top[position-1]
+				position--
+			}
+			top[position] = candidate
+		}
+
+		owners := ShardOwners{Primary: top[0].id}
+		if len(top) > 1 {
+			owners.Replicas = make([]string, 0, len(top)-1)
+			for _, replica := range top[1:] {
+				owners.Replicas = append(owners.Replicas, replica.id)
+			}
+		}
+		assignment[shard] = owners
+	}
+	return assignment
+}
+
+// PrimaryMap projects an owner map down to the plain shard-to-primary map that
+// every pre-Phase-4 caller expects. Useful for asserting the two agree.
+func PrimaryMap(owners map[uint32]ShardOwners) map[uint32]string {
+	primaries := make(map[uint32]string, len(owners))
+	for shard, owner := range owners {
+		primaries[shard] = owner.Primary
+	}
+	return primaries
 }
 
 // OwnerForKey resolves a key straight to its owning node ID, given a shard map.

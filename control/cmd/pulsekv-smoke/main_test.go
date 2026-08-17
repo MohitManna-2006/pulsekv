@@ -103,16 +103,43 @@ func TestRoutingSampleKeysCoverDistinctOwners(t *testing.T) {
 	}
 }
 
-func TestDifferentNode(t *testing.T) {
+// The exclusion node must hold NO copy of the shard. Picking merely "not the
+// primary" was correct until Phase 4 and is now actively wrong: a replica is
+// supposed to have the key, so an assertion against one would fail exactly when
+// replication is working.
+func TestNonHolderSkipsReplicasNotJustThePrimary(t *testing.T) {
 	nodes := []string{"node-0", "node-1", "node-2"}
-	if got := differentNode("node-0", nodes); got != "node-1" {
-		t.Fatalf("differentNode(node-0) = %q, want node-1", got)
+	topology := liveRoutingTopology{
+		shardMap: map[uint32]string{0: "node-0", 1: "node-2"},
+		owners: map[uint32]router.ShardOwners{
+			0: {Primary: "node-0", Replicas: []string{"node-1"}},
+			1: {Primary: "node-2"},
+		},
 	}
-	if got := differentNode("node-2", nodes); got != "node-0" {
-		t.Fatalf("differentNode(node-2) = %q, want node-0", got)
+
+	if got := nonHolder(0, topology, nodes); got != "node-2" {
+		t.Fatalf("nonHolder(shard 0) = %q; node-1 is a replica and must be skipped", got)
 	}
-	if got := differentNode("only", []string{"only"}); got != "" {
-		t.Fatalf("differentNode(only) = %q, want empty", got)
+	if got := nonHolder(1, topology, nodes); got != "node-0" {
+		t.Fatalf("nonHolder(shard 1) = %q, want node-0", got)
+	}
+
+	// Without an owner map -- a pre-Phase-4 publisher -- only the primary is
+	// excluded, which is exactly the old behaviour.
+	unreplicated := liveRoutingTopology{shardMap: map[uint32]string{0: "node-0"}}
+	if got := nonHolder(0, unreplicated, nodes); got != "node-1" {
+		t.Fatalf("nonHolder with no owner map = %q, want node-1", got)
+	}
+
+	// Fully replicated: no node can serve as an exclusion proof.
+	full := liveRoutingTopology{
+		shardMap: map[uint32]string{0: "node-0"},
+		owners: map[uint32]router.ShardOwners{
+			0: {Primary: "node-0", Replicas: []string{"node-1", "node-2"}},
+		},
+	}
+	if got := nonHolder(0, full, nodes); got != "" {
+		t.Fatalf("nonHolder on a fully replicated shard = %q, want empty", got)
 	}
 }
 

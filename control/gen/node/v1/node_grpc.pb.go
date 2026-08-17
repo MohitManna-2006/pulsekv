@@ -7,7 +7,8 @@
 //
 // This contract is frozen as of Phase 0. Phases 1-8 are written against this
 // shape; add fields and RPCs rather than renaming or removing them. Phase 1
-// added PutChunked/GetChunked and their messages; nothing existing changed.
+// added PutChunked/GetChunked and their messages; Phase 4 added the three
+// replication fields below. Nothing existing changed in either phase.
 //
 // ERROR CHANNEL: gRPC status codes are the sole error channel for every RPC
 // here. A handler either returns OK with a valid response, or a non-OK status
@@ -61,6 +62,10 @@ type NodeServiceClient interface {
 	// Point write, for values up to UNARY_VALUE_LIMIT_BYTES. A larger value
 	// fails fast with INVALID_ARGUMENT pointing at PutChunked rather than being
 	// silently accepted.
+	//
+	// Phase 4: a node that is the current primary for the key's shard also
+	// forwards the write to that shard's replicas. See PutRequest for the two
+	// modes and the loop-prevention rule.
 	Put(ctx context.Context, in *PutRequest, opts ...grpc.CallOption) (*PutResponse, error)
 	// Chunked write for values above the unary limit. Chunks must arrive in
 	// strictly ascending chunk_index order starting at 0 — gRPC already
@@ -193,6 +198,10 @@ type NodeServiceServer interface {
 	// Point write, for values up to UNARY_VALUE_LIMIT_BYTES. A larger value
 	// fails fast with INVALID_ARGUMENT pointing at PutChunked rather than being
 	// silently accepted.
+	//
+	// Phase 4: a node that is the current primary for the key's shard also
+	// forwards the write to that shard's replicas. See PutRequest for the two
+	// modes and the loop-prevention rule.
 	Put(context.Context, *PutRequest) (*PutResponse, error)
 	// Chunked write for values above the unary limit. Chunks must arrive in
 	// strictly ascending chunk_index order starting at 0 — gRPC already

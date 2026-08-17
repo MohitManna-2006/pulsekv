@@ -24,6 +24,12 @@ PULSEKV_PID_FILE="${PULSEKV_RUN_DIR}/cluster.pids"
 
 PULSEKV_CONFIG="${PULSEKV_CONFIG:-${PULSEKV_DEPLOY_DIR}/cluster.config.yaml}"
 
+# Phase 4 boot-time overrides, exported so a targeted local-node.sh restart
+# rebuilds the same command line the cluster was booted with. Empty means "use
+# the config file", which is why the replication override cannot just default to
+# 0 -- 0 is a real replication factor, not an absent one.
+PULSEKV_REPLICATION_FACTOR="${PULSEKV_REPLICATION_FACTOR:-}"
+
 PULSEKV_CONTROLPLANE_BIN="${PULSEKV_BIN_DIR}/pulsekv-controlplane"
 PULSEKV_MEMBER_BIN="${PULSEKV_BIN_DIR}/pulsekv-member"
 PULSEKV_SMOKE_BIN="${PULSEKV_BIN_DIR}/pulsekv-smoke"
@@ -307,16 +313,37 @@ pk_data_root_abs() {
     esac
 }
 
+# The effective replication factor: the boot-time override if one was given,
+# otherwise whatever the config says, read through the control plane's own
+# parser so the shell can never disagree with the server about it.
+pk_replication_factor() {
+    if [ -n "$PULSEKV_REPLICATION_FACTOR" ]; then
+        printf '%s\n' "$PULSEKV_REPLICATION_FACTOR"
+        return 0
+    fi
+    pk_config_read --print-replication
+}
+
 pk_start_controlplane() {
     local address log
     address="$(pk_controlplane_address)" || return 1
     log="$(pk_log_for_label controlplane)"
-    pk_start_managed controlplane "$address" "$log" \
-        "$PULSEKV_CONTROLPLANE_BIN" --config "$PULSEKV_CONFIG"
+    if [ -n "$PULSEKV_REPLICATION_FACTOR" ]; then
+        pk_start_managed controlplane "$address" "$log" \
+            "$PULSEKV_CONTROLPLANE_BIN" --config "$PULSEKV_CONFIG" \
+            --replication-factor "$PULSEKV_REPLICATION_FACTOR"
+    else
+        pk_start_managed controlplane "$address" "$log" \
+            "$PULSEKV_CONTROLPLANE_BIN" --config "$PULSEKV_CONFIG"
+    fi
 }
 
+# Data nodes are handed --metadata-addr so they can read their own replica
+# peers. They are NOT handed a replication factor: placement is the control
+# plane's decision, and a node that carried its own copy of the number could
+# disagree with the map it is being sent.
 pk_start_data_node() {
-    local node_id="$1" line host port ram_budget max_value _root data_root address log engine_line
+    local node_id="$1" line host port ram_budget max_value _root data_root address log engine_line cp_address
     line="$(pk_node_line "$node_id")" || {
         pk_err "unknown configured node: $node_id"
         return 1
@@ -326,6 +353,7 @@ pk_start_data_node() {
     IFS=$'\t' read -r ram_budget max_value _root <<< "$engine_line"
     [ -n "$ram_budget" ] && [ -n "$max_value" ] || return 1
     data_root="$(pk_data_root_abs)" || return 1
+    cp_address="$(pk_controlplane_address)" || return 1
     mkdir -p "${data_root}/${node_id}"
     address="$(pk_join_host_port "$host" "$port")"
     log="$(pk_log_for_label "data:${node_id}")"
@@ -333,7 +361,8 @@ pk_start_data_node() {
         "$PULSEKV_NODE_BIN" --node-id "$node_id" --host "$host" --port "$port" \
         --data-dir "${data_root}/${node_id}" \
         --ram-budget-bytes "$ram_budget" \
-        --max-value-bytes "$max_value"
+        --max-value-bytes "$max_value" \
+        --metadata-addr "$cp_address"
 }
 
 pk_start_member() {

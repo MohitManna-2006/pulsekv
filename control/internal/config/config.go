@@ -46,6 +46,20 @@ const (
 	MaxClusterNameBytes           = 255 // memberlist.LabelMaxSize
 	MaxNodeIDBytes                = 64
 
+	// DefaultReplicationFactor is the number of replicas per shard, beyond the
+	// primary, when the config does not say. The design doc's range is 0, 1, or
+	// 2; the default is 1 rather than 0 because a cluster that never keeps a
+	// second copy would never exercise replication at all, and "the feature is
+	// configured off by default" is a bad default for the feature's own dev
+	// cluster. An explicit 0 remains a fully supported configuration.
+	DefaultReplicationFactor = 1
+
+	// MaxReplicationFactor bounds the configured value. Well above the design
+	// doc's range, but finite: a typo'd replication_factor of 1000 would make
+	// every shard's owner list the whole cluster and turn one client write into
+	// a broadcast, which is worth refusing at startup rather than at 3am.
+	MaxReplicationFactor = 8
+
 	// EngineShards is the engine's fixed lock-shard count (PK_TABLE_SHARDS).
 	// Needed here only to warn about the per-shard budget split.
 	EngineShards = 256
@@ -125,6 +139,20 @@ type Config struct {
 	Engine       Engine     `yaml:"engine"`
 	Nodes        []Node     `yaml:"nodes"`
 
+	// ReplicationFactorSetting is the raw YAML value, and it is a pointer for
+	// one specific reason: 0 is a meaningful setting here, not an absent one.
+	// Every other field in this file can treat its zero value as "not
+	// configured" and default it; replication_factor: 0 means "no replicas",
+	// which is a legal configuration the design doc names explicitly. Reading
+	// it through an int would make that setting unreachable.
+	//
+	// Callers use ReplicationFactor below, which applyDefaults resolves.
+	ReplicationFactorSetting *int `yaml:"replication_factor"`
+
+	// ReplicationFactor is the effective number of replicas per shard, beyond
+	// the primary. Resolved by applyDefaults; never read from YAML directly.
+	ReplicationFactor int `yaml:"-"`
+
 	// Path records where this config came from, for error messages.
 	Path string `yaml:"-"`
 }
@@ -178,6 +206,11 @@ func (c *Config) applyDefaults() {
 	if c.Engine.DataRoot == "" {
 		c.Engine.DataRoot = DefaultDataRoot
 	}
+	if c.ReplicationFactorSetting == nil {
+		c.ReplicationFactor = DefaultReplicationFactor
+	} else {
+		c.ReplicationFactor = *c.ReplicationFactorSetting
+	}
 	for i := range c.Nodes {
 		if c.Nodes[i].Host == "" {
 			c.Nodes[i].Host = DefaultHost
@@ -217,6 +250,17 @@ func (c *Config) Warnings() []string {
 				"values between the two are accepted by Put and then rejected by the "+
 				"engine, which is a confusing pair of errors to debug.",
 			c.Engine.MaxValueBytes, UnaryValueLimitBytes))
+	}
+
+	// Legal, and it starts, but every shard silently gets fewer copies than
+	// asked for -- which looks exactly like working replication until a node
+	// dies. Worth saying out loud in the boot log.
+	if c.ReplicationFactor > 0 && len(c.Nodes) > 0 && c.ReplicationFactor > len(c.Nodes)-1 {
+		out = append(out, fmt.Sprintf(
+			"replication_factor (%d) exceeds the %d other configured node(s): every shard will hold "+
+				"at most %d replica(s), because a node never replicates to itself. This is not an "+
+				"error, but the cluster is less replicated than the number suggests.",
+			c.ReplicationFactor, len(c.Nodes)-1, len(c.Nodes)-1))
 	}
 
 	nonLoopback := !net.ParseIP(c.ControlPlane.Host).IsLoopback()
@@ -265,6 +309,14 @@ func (c *Config) Validate() error {
 	}
 	if c.Engine.DataRoot == "" {
 		problems = append(problems, errors.New("engine.data_root: must not be empty"))
+	}
+	if c.ReplicationFactor < 0 {
+		problems = append(problems, fmt.Errorf(
+			"replication_factor: %d must not be negative (0 disables replication)", c.ReplicationFactor))
+	} else if c.ReplicationFactor > MaxReplicationFactor {
+		problems = append(problems, fmt.Errorf(
+			"replication_factor: %d exceeds the supported maximum of %d",
+			c.ReplicationFactor, MaxReplicationFactor))
 	}
 
 	seenID := make(map[string]int, len(c.Nodes))

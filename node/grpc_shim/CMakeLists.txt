@@ -50,10 +50,21 @@ message(STATUS "pulsekv: protoc ${PROTOC_EXECUTABLE}, plugin ${GRPC_CPP_PLUGIN}"
 set(PROTO_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../proto")
 set(GEN_DIR "${CMAKE_CURRENT_SOURCE_DIR}/gen")
 
-# All three are generated, not just node.proto. The shim only implements
-# NodeService, but Phase 0's exit criteria require proving the whole contract
-# compiles under protoc's C++ backend, and a compile error in adapter.proto is
-# far cheaper to find now than in Phase 7.
+# All three are generated, not just node.proto, and two of them are load-bearing
+# now rather than only proving the contract compiles:
+#
+#   node      -- the service this process implements, and (since Phase 4) also
+#                the client stub it uses to forward writes to its replica peers.
+#   metadata  -- Phase 4's topology poller is a real ClusterMetadataService
+#                CLIENT. Phase 0 generated this purely to prove the whole
+#                contract compiles under protoc's C++ backend; the shim now
+#                links and calls it.
+#   adapter   -- still generation-only. Nothing here implements or calls it, but
+#                a compile error in adapter.proto is far cheaper to find now than
+#                in Phase 7.
+#
+# All of them land in the pulsekv_proto static library below, which pulsekv-node
+# links, so no per-proto wiring is needed when one of them starts being used.
 set(PROTO_NAMES node metadata adapter)
 
 # Composed as one variable rather than written inline as

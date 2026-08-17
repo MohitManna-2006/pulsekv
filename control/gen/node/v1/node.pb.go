@@ -7,7 +7,8 @@
 //
 // This contract is frozen as of Phase 0. Phases 1-8 are written against this
 // shape; add fields and RPCs rather than renaming or removing them. Phase 1
-// added PutChunked/GetChunked and their messages; nothing existing changed.
+// added PutChunked/GetChunked and their messages; Phase 4 added the three
+// replication fields below. Nothing existing changed in either phase.
 //
 // ERROR CHANNEL: gRPC status codes are the sole error channel for every RPC
 // here. A handler either returns OK with a valid response, or a non-OK status
@@ -285,11 +286,31 @@ func (x *GetResponse) GetValue() []byte {
 }
 
 type PutRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Key           []byte                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
-	Value         []byte                 `protobuf:"bytes,2,opt,name=value,proto3" json:"value,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Key   []byte                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+	Value []byte                 `protobuf:"bytes,2,opt,name=value,proto3" json:"value,omitempty"`
+	// Set by a primary forwarding this write to one of its replicas; NEVER set
+	// by a client. A node that receives it stores the value and returns, without
+	// forwarding anything itself — that single rule is the whole of the
+	// replication loop prevention.
+	//
+	// This is a cooperation flag, not an authorisation one: a client that sets it
+	// suppresses its own write's replication. Authenticated peer identity is a
+	// production-hardening concern, not a Phase 4 one.
+	FromReplication bool `protobuf:"varint,3,opt,name=from_replication,json=fromReplication,proto3" json:"from_replication,omitempty"`
+	// 0 (the default) means the primary commits locally, answers immediately, and
+	// replicates in the background — cache writes should not pay replication
+	// latency. N > 0 means the primary answers only after N replicas have acked,
+	// for callers who would rather pay that latency than lose the write.
+	//
+	// N greater than the primary's current live replica count is INVALID_ARGUMENT
+	// rather than a call that hangs until its deadline. On a timeout or an ack
+	// shortfall the call fails with DEADLINE_EXCEEDED — but note the local write
+	// already happened and is NOT rolled back, so that error means "your write is
+	// less replicated than you asked for", not "your write was lost".
+	RequireReplicaAcks uint32 `protobuf:"varint,4,opt,name=require_replica_acks,json=requireReplicaAcks,proto3" json:"require_replica_acks,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *PutRequest) Reset() {
@@ -336,16 +357,35 @@ func (x *PutRequest) GetValue() []byte {
 	return nil
 }
 
+func (x *PutRequest) GetFromReplication() bool {
+	if x != nil {
+		return x.FromReplication
+	}
+	return false
+}
+
+func (x *PutRequest) GetRequireReplicaAcks() uint32 {
+	if x != nil {
+		return x.RequireReplicaAcks
+	}
+	return 0
+}
+
 type PutResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Always true when the status is OK. A write that failed returns a non-OK
 	// gRPC status instead — see the ERROR CHANNEL note at the top of this file.
 	Ok bool `protobuf:"varint,1,opt,name=ok,proto3" json:"ok,omitempty"`
-	// Unused in Phase 1, and deliberately kept rather than removed: the contract
-	// is frozen, and this is the natural place for a future partial-success
-	// report — Phase 4's replication needs to say "committed locally, replica
-	// lagging", which is an OK status with a caveat, not an error.
-	Error         string `protobuf:"bytes,2,opt,name=error,proto3" json:"error,omitempty"`
+	// Still unused, and deliberately kept rather than removed: the contract is
+	// frozen. Phase 4 reported its partial-success information in the dedicated
+	// replicas_acked field below instead, because a machine-readable count is
+	// what a caller can actually act on.
+	Error string `protobuf:"bytes,2,opt,name=error,proto3" json:"error,omitempty"`
+	// How many replicas acked before this response was sent. Always 0 for a
+	// require_replica_acks = 0 write: nothing was waited for, so nothing is
+	// claimed. Exactly require_replica_acks (or more) for an OK response to a
+	// strong-ack write.
+	ReplicasAcked uint32 `protobuf:"varint,3,opt,name=replicas_acked,json=replicasAcked,proto3" json:"replicas_acked,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -394,6 +434,13 @@ func (x *PutResponse) GetError() string {
 	return ""
 }
 
+func (x *PutResponse) GetReplicasAcked() uint32 {
+	if x != nil {
+		return x.ReplicasAcked
+	}
+	return 0
+}
+
 // One frame of a PutChunked stream.
 //
 // Conventions, all enforced by the server:
@@ -411,15 +458,24 @@ func (x *PutResponse) GetError() string {
 //     long; a lie in either direction aborts the stream.
 //   - data         — may be empty only for a zero-length value (one chunk,
 //     total_length = 0).
+//   - from_replication — chunk 0 only; ignored on later chunks.
 type PutChunk struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Key           []byte                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
-	ChunkIndex    uint32                 `protobuf:"varint,2,opt,name=chunk_index,json=chunkIndex,proto3" json:"chunk_index,omitempty"`
-	TotalChunks   uint32                 `protobuf:"varint,3,opt,name=total_chunks,json=totalChunks,proto3" json:"total_chunks,omitempty"`
-	TotalLength   uint64                 `protobuf:"varint,4,opt,name=total_length,json=totalLength,proto3" json:"total_length,omitempty"`
-	Data          []byte                 `protobuf:"bytes,5,opt,name=data,proto3" json:"data,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	Key         []byte                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+	ChunkIndex  uint32                 `protobuf:"varint,2,opt,name=chunk_index,json=chunkIndex,proto3" json:"chunk_index,omitempty"`
+	TotalChunks uint32                 `protobuf:"varint,3,opt,name=total_chunks,json=totalChunks,proto3" json:"total_chunks,omitempty"`
+	TotalLength uint64                 `protobuf:"varint,4,opt,name=total_length,json=totalLength,proto3" json:"total_length,omitempty"`
+	Data        []byte                 `protobuf:"bytes,5,opt,name=data,proto3" json:"data,omitempty"`
+	// Same meaning as PutRequest.from_replication, read from chunk 0 only.
+	//
+	// There is deliberately no require_replica_acks counterpart: a chunked write
+	// is by definition a multi-megabyte value, where the async path is the only
+	// one that makes sense. PutChunked therefore always replicates in the
+	// background, and the Go SDK's PutWithAck refuses an oversized value loudly
+	// rather than silently downgrading it to fire-and-forget.
+	FromReplication bool `protobuf:"varint,6,opt,name=from_replication,json=fromReplication,proto3" json:"from_replication,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *PutChunk) Reset() {
@@ -485,6 +541,13 @@ func (x *PutChunk) GetData() []byte {
 		return x.Data
 	}
 	return nil
+}
+
+func (x *PutChunk) GetFromReplication() bool {
+	if x != nil {
+		return x.FromReplication
+	}
+	return false
 }
 
 // One frame of a GetChunked stream. total_chunks and total_length are repeated
@@ -791,21 +854,25 @@ const file_node_proto_rawDesc = "" +
 	"\x03key\x18\x01 \x01(\fR\x03key\"9\n" +
 	"\vGetResponse\x12\x14\n" +
 	"\x05found\x18\x01 \x01(\bR\x05found\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\fR\x05value\"4\n" +
+	"\x05value\x18\x02 \x01(\fR\x05value\"\x91\x01\n" +
 	"\n" +
 	"PutRequest\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\fR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\fR\x05value\"3\n" +
+	"\x05value\x18\x02 \x01(\fR\x05value\x12)\n" +
+	"\x10from_replication\x18\x03 \x01(\bR\x0ffromReplication\x120\n" +
+	"\x14require_replica_acks\x18\x04 \x01(\rR\x12requireReplicaAcks\"Z\n" +
 	"\vPutResponse\x12\x0e\n" +
 	"\x02ok\x18\x01 \x01(\bR\x02ok\x12\x14\n" +
-	"\x05error\x18\x02 \x01(\tR\x05error\"\x97\x01\n" +
+	"\x05error\x18\x02 \x01(\tR\x05error\x12%\n" +
+	"\x0ereplicas_acked\x18\x03 \x01(\rR\rreplicasAcked\"\xc2\x01\n" +
 	"\bPutChunk\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\fR\x03key\x12\x1f\n" +
 	"\vchunk_index\x18\x02 \x01(\rR\n" +
 	"chunkIndex\x12!\n" +
 	"\ftotal_chunks\x18\x03 \x01(\rR\vtotalChunks\x12!\n" +
 	"\ftotal_length\x18\x04 \x01(\x04R\vtotalLength\x12\x12\n" +
-	"\x04data\x18\x05 \x01(\fR\x04data\"\x85\x01\n" +
+	"\x04data\x18\x05 \x01(\fR\x04data\x12)\n" +
+	"\x10from_replication\x18\x06 \x01(\bR\x0ffromReplication\"\x85\x01\n" +
 	"\bGetChunk\x12\x1f\n" +
 	"\vchunk_index\x18\x01 \x01(\rR\n" +
 	"chunkIndex\x12!\n" +

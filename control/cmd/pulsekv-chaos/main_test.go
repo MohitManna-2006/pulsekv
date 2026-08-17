@@ -14,17 +14,27 @@ import (
 )
 
 func testSnapshot(generation uint64, ids ...string) clustertopology.Snapshot {
+	return testReplicatedSnapshot(generation, 0, ids...)
+}
+
+func testReplicatedSnapshot(generation uint64, replicationFactor int,
+	ids ...string) clustertopology.Snapshot {
 	nodes := make(map[string]string, len(ids))
 	for _, id := range ids {
 		nodes[id] = "address-for-" + id
 	}
 	const shards = uint32(256)
-	return clustertopology.Snapshot{
+	snapshot := clustertopology.Snapshot{
 		Generation: generation,
 		ShardCount: shards,
 		ShardMap:   router.AssignShards(ids, shards),
 		Nodes:      nodes,
 	}
+	if replicationFactor > 0 {
+		snapshot.ReplicationFactor = uint32(replicationFactor)
+		snapshot.Owners = router.AssignShardOwners(ids, shards, replicationFactor)
+	}
+	return snapshot
 }
 
 func TestValidateRemovalMovesExactlyTargetShards(t *testing.T) {
@@ -212,15 +222,150 @@ func TestProgressAndReportWritesAreAtomicAndReplaceExistingFiles(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Phase 4: promotion proof selection
+// ---------------------------------------------------------------------------
+
+// The promotion set must sit on shards the target PRIMARIES -- the exact
+// complement of the survivor-stable set, which deliberately avoids them. A key
+// on a survivor-owned shard would survive the kill for reasons that have
+// nothing to do with replication and would prove nothing.
+func TestPromotionEntriesLandOnTargetPrimariedShards(t *testing.T) {
+	ids := []string{"node-0", "node-1", "node-2", "node-3"}
+	snapshot := testReplicatedSnapshot(9, 1, ids...)
+	const target = "node-2"
+	targetShards := shardsOwnedBy(snapshot, target)
+
+	entries, skip := buildPromotionEntries(snapshot, target, targetShards, "ns", 5)
+	if skip != "" {
+		t.Fatalf("promotion unexpectedly skipped: %s", skip)
+	}
+	if len(entries) != 5 {
+		t.Fatalf("built %d entries, want 5", len(entries))
+	}
+
+	seen := map[uint32]bool{}
+	for _, entry := range entries {
+		if snapshot.ShardMap[entry.shard] != target {
+			t.Fatalf("shard %d is primaried by %q, not the target %q",
+				entry.shard, snapshot.ShardMap[entry.shard], target)
+		}
+		if got := router.ShardForKey(entry.key, snapshot.ShardCount); got != entry.shard {
+			t.Fatalf("key %q hashes to shard %d, not its declared shard %d",
+				entry.key, got, entry.shard)
+		}
+		if len(entry.replicas) == 0 {
+			t.Fatalf("shard %d has no replica, so it cannot prove a promotion", entry.shard)
+		}
+		if seen[entry.shard] {
+			t.Fatalf("shard %d appears twice", entry.shard)
+		}
+		seen[entry.shard] = true
+	}
+}
+
+// Every reason the proof cannot run must be reported as a reason, never as a
+// silent empty set. A report that says "0 promotion keys" with no explanation
+// is indistinguishable from a report that passed without testing anything.
+func TestPromotionEntriesExplainEverySkip(t *testing.T) {
+	ids := []string{"node-0", "node-1", "node-2", "node-3"}
+	const target = "node-2"
+
+	replicated := testReplicatedSnapshot(9, 1, ids...)
+	unreplicated := testReplicatedSnapshot(9, 0, ids...)
+
+	cases := []struct {
+		name      string
+		snapshot  clustertopology.Snapshot
+		requested int
+		wantSub   string
+	}{
+		{"replication factor zero", unreplicated, 4, "replication factor is 0"},
+		{"promotion keys disabled", replicated, 0, "--promotion-keys is 0"},
+		{"no owner map published", clustertopology.Snapshot{
+			ShardCount: replicated.ShardCount, ShardMap: replicated.ShardMap,
+			Nodes: replicated.Nodes, ReplicationFactor: 1,
+		}, 4, "predates Phase 4"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			entries, skip := buildPromotionEntries(tc.snapshot, target,
+				shardsOwnedBy(tc.snapshot, target), "ns", tc.requested)
+			if len(entries) != 0 {
+				t.Fatalf("built %d entries, want none", len(entries))
+			}
+			if !strings.Contains(skip, tc.wantSub) {
+				t.Fatalf("skip reason = %q, want it to mention %q", skip, tc.wantSub)
+			}
+		})
+	}
+}
+
+// Asking for more shards than the target primaries with a live replica takes
+// what is available rather than failing. The proof is weaker, not broken.
+func TestPromotionEntriesCapToAvailableShards(t *testing.T) {
+	ids := []string{"node-0", "node-1"}
+	snapshot := testReplicatedSnapshot(3, 1, ids...)
+	const target = "node-1"
+	targetShards := shardsOwnedBy(snapshot, target)
+
+	entries, skip := buildPromotionEntries(snapshot, target, targetShards, "ns", len(targetShards)+50)
+	if skip != "" {
+		t.Fatalf("promotion unexpectedly skipped: %s", skip)
+	}
+	if len(entries) != len(targetShards) {
+		t.Fatalf("built %d entries, want the %d available", len(entries), len(targetShards))
+	}
+}
+
+// Every cycle must write distinct bytes, or a stale copy left on some node
+// could satisfy the next round's assertion for free.
+func TestRefreshPromotionValuesChangesEveryValue(t *testing.T) {
+	ids := []string{"node-0", "node-1", "node-2", "node-3"}
+	snapshot := testReplicatedSnapshot(9, 1, ids...)
+	entries, skip := buildPromotionEntries(snapshot, "node-2",
+		shardsOwnedBy(snapshot, "node-2"), "ns", 3)
+	if skip != "" {
+		t.Fatalf("promotion unexpectedly skipped: %s", skip)
+	}
+
+	seen := map[string]bool{}
+	for round := 0; round < 4; round++ {
+		if round > 0 {
+			refreshPromotionValues(entries, round)
+		}
+		for _, entry := range entries {
+			if seen[string(entry.value)] {
+				t.Fatalf("round %d reused the value %q", round, entry.value)
+			}
+			seen[string(entry.value)] = true
+			// The suffix must be replaced, not accumulated.
+			if strings.Count(string(entry.value), ":round") != 1 {
+				t.Fatalf("value %q accumulated round suffixes", entry.value)
+			}
+		}
+	}
+}
+
 func TestSettingsRequireDynamicVerifierInputs(t *testing.T) {
 	valid := settings{
 		controlPlane: "127.0.0.1:7000", target: "node-c", cycles: 1, seed: 0,
 		readyFile: "ready", reportPath: "report.json", transitionTimeout: time.Second,
 		pollInterval: time.Millisecond, refreshInterval: time.Millisecond,
 		rpcTimeout: time.Second, workers: 1,
+		promotionKeys: 4, catchUpTimeout: time.Second,
 	}
 	if err := valid.validate(); err != nil {
 		t.Fatalf("valid settings: %v", err)
+	}
+
+	// 0 promotion keys is a legal setting, not a missing one: it is how a run
+	// against a replication-factor-0 cluster is expressed.
+	disabled := valid
+	disabled.promotionKeys = 0
+	if err := disabled.validate(); err != nil {
+		t.Fatalf("--promotion-keys=0 must be accepted: %v", err)
 	}
 
 	cases := []struct {
@@ -234,6 +379,8 @@ func TestSettingsRequireDynamicVerifierInputs(t *testing.T) {
 		{"zero poll", func(c *settings) { c.pollInterval = 0 }},
 		{"zero refresh", func(c *settings) { c.refreshInterval = 0 }},
 		{"zero workers", func(c *settings) { c.workers = 0 }},
+		{"negative promotion keys", func(c *settings) { c.promotionKeys = -1 }},
+		{"zero catch-up timeout", func(c *settings) { c.catchUpTimeout = 0 }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

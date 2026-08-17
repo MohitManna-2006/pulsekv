@@ -188,6 +188,10 @@ measured, bounded impact; chaos test suite passes reproducibly.
 
 ## 7. Phase 4 — Replication (Go control + C data plane)
 
+**Status: complete (2026-08-17).** Implementation details, verification
+evidence, and the exact Phase 5 handoff are recorded in
+`pulsekv-v2-phase4-summary.md`.
+
 **Goal:** tolerate node loss without losing cached data beyond acceptable staleness, using the
 tunable model from the design doc — no consensus on the write path.
 

@@ -409,6 +409,380 @@ func TestOwnerForKey(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Primary + replica placement (Phase 4)
+// ---------------------------------------------------------------------------
+
+// replicaFactors covers the design doc's whole stated range (0, 1, 2) plus one
+// value above it, because "more replicas than the doc contemplates" must still
+// produce a valid map rather than a panic or a truncated one.
+var replicaFactors = []int{0, 1, 2, 3}
+
+// nodeCounts mirrors every cluster size the tests above already exercise, so
+// the seam below is checked at exactly the shapes the rest of this file uses.
+var nodeCounts = []int{1, 2, 4, 5, 6, 7, 8, 9, 12, 16, 17, 32, 33}
+
+// TestShardOwnersPrimaryMatchesAssignShards is THE compatibility seam for
+// Phase 4. Every Phase 2/3 caller -- the SDK, the smoke test, the chaos
+// watcher, GetShardMapResponse.shard_to_node_id -- still reads a plain
+// shard-to-one-node map. If the primary AssignShardOwners picks ever disagreed
+// with the owner AssignShards picks, all of them would silently route to a node
+// that does not hold the data.
+func TestShardOwnersPrimaryMatchesAssignShards(t *testing.T) {
+	for _, n := range nodeCounts {
+		ids := nodes(n)
+		want := AssignShards(ids, testShards)
+		for _, factor := range replicaFactors {
+			t.Run(fmt.Sprintf("%d-nodes/rf%d", n, factor), func(t *testing.T) {
+				owners := AssignShardOwners(ids, testShards, factor)
+				if len(owners) != testShards {
+					t.Fatalf("assigned %d shards, want %d", len(owners), testShards)
+				}
+				for shard := uint32(0); shard < testShards; shard++ {
+					if owners[shard].Primary != want[shard] {
+						t.Fatalf("shard %d primary=%q, AssignShards owner=%q",
+							shard, owners[shard].Primary, want[shard])
+					}
+				}
+			})
+		}
+	}
+}
+
+// Input order must not matter here either -- the same argmax argument as
+// TestAssignShardsIsDeterministic, extended to ranks 2..N.
+func TestAssignShardOwnersIsDeterministic(t *testing.T) {
+	forward := nodes(8)
+	reversed := make([]string, len(forward))
+	for i, id := range forward {
+		reversed[len(forward)-1-i] = id
+	}
+
+	for _, factor := range replicaFactors {
+		a := AssignShardOwners(forward, testShards, factor)
+		b := AssignShardOwners(reversed, testShards, factor)
+		c := AssignShardOwners(forward, testShards, factor)
+		for shard := uint32(0); shard < testShards; shard++ {
+			if !ownersEqual(a[shard], b[shard]) {
+				t.Fatalf("rf=%d shard %d: %v in file order, %v reversed",
+					factor, shard, a[shard], b[shard])
+			}
+			if !ownersEqual(a[shard], c[shard]) {
+				t.Fatalf("rf=%d shard %d differs between two identical calls", factor, shard)
+			}
+		}
+	}
+}
+
+// Structural rules that must hold for every shard: the right number of
+// replicas, no duplicates, no node replicating for itself, and every entry a
+// real member of the node set.
+func TestAssignShardOwnersShape(t *testing.T) {
+	for _, n := range nodeCounts {
+		ids := nodes(n)
+		member := setOf(ids)
+		for _, factor := range replicaFactors {
+			t.Run(fmt.Sprintf("%d-nodes/rf%d", n, factor), func(t *testing.T) {
+				owners := AssignShardOwners(ids, testShards, factor)
+
+				// Fewer live nodes than 1+factor is not an error; the shard just
+				// gets fewer copies. That cap is what this asserts.
+				wantReplicas := factor
+				if wantReplicas > n-1 {
+					wantReplicas = n - 1
+				}
+
+				for shard := uint32(0); shard < testShards; shard++ {
+					got := owners[shard]
+					if got.Primary == "" {
+						t.Fatalf("shard %d has no primary", shard)
+					}
+					if !member[got.Primary] {
+						t.Fatalf("shard %d primary %q is not in the node set", shard, got.Primary)
+					}
+					if len(got.Replicas) != wantReplicas {
+						t.Fatalf("shard %d has %d replica(s), want %d (%d nodes, rf=%d)",
+							shard, len(got.Replicas), wantReplicas, n, factor)
+					}
+					seen := map[string]bool{got.Primary: true}
+					for i, replica := range got.Replicas {
+						if !member[replica] {
+							t.Fatalf("shard %d replica[%d] %q is not in the node set", shard, i, replica)
+						}
+						if seen[replica] {
+							t.Fatalf("shard %d lists %q more than once (a node cannot replicate for itself)",
+								shard, replica)
+						}
+						seen[replica] = true
+					}
+				}
+			})
+		}
+	}
+}
+
+// The replica list is a strict ranking, so it must be sorted by descending
+// weight with the same lexicographic tie-break AssignShards uses. This is what
+// makes "most-preferred-promotion first" a real ordering rather than a comment.
+func TestReplicaOrderIsStrictlyDescendingWeight(t *testing.T) {
+	ids := nodes(16)
+	owners := AssignShardOwners(ids, testShards, 3)
+
+	for shard := uint32(0); shard < testShards; shard++ {
+		ranked := append([]string{owners[shard].Primary}, owners[shard].Replicas...)
+		for i := 1; i < len(ranked); i++ {
+			previous := rankedNode{id: ranked[i-1], weight: weight(shard, ranked[i-1])}
+			current := rankedNode{id: ranked[i], weight: weight(shard, ranked[i])}
+			if !ranksBefore(previous, current) {
+				t.Fatalf("shard %d rank %d (%s, w=%d) does not outrank rank %d (%s, w=%d)",
+					shard, i-1, previous.id, previous.weight, i, current.id, current.weight)
+			}
+		}
+
+		// And the selection really is the TOP k: no excluded node may outrank
+		// the last one that made the cut.
+		included := setOf(ranked)
+		last := rankedNode{id: ranked[len(ranked)-1], weight: weight(shard, ranked[len(ranked)-1])}
+		for _, id := range ids {
+			if included[id] {
+				continue
+			}
+			excluded := rankedNode{id: id, weight: weight(shard, id)}
+			if ranksBefore(excluded, last) {
+				t.Fatalf("shard %d excluded %s (w=%d) but kept %s (w=%d)",
+					shard, excluded.id, excluded.weight, last.id, last.weight)
+			}
+		}
+	}
+}
+
+// The promotion promise: when the primary dies, the top-ranked replica is
+// exactly who AssignShards hands the shard to for the remaining node set. This
+// is the property the chaos harness's promotion assertion depends on, so it is
+// asserted here directly rather than inferred from a live run.
+func TestTopReplicaIsTheNextPrimaryAfterRemoval(t *testing.T) {
+	for _, n := range []int{4, 8, 16} {
+		for _, factor := range []int{1, 2} {
+			t.Run(fmt.Sprintf("%d-nodes/rf%d", n, factor), func(t *testing.T) {
+				ids := nodes(n)
+				before := AssignShardOwners(ids, testShards, factor)
+
+				for _, departed := range ids {
+					after := AssignShards(without(ids, departed), testShards)
+					checked := 0
+					for shard := uint32(0); shard < testShards; shard++ {
+						if before[shard].Primary != departed {
+							continue
+						}
+						checked++
+						want := before[shard].Replicas[0]
+						if after[shard] != want {
+							t.Fatalf("shard %d: %s died, promoted %q, but its top replica was %q",
+								shard, departed, after[shard], want)
+						}
+					}
+					if checked == 0 {
+						t.Fatalf("%s primaried no shards; the test proves nothing", departed)
+					}
+				}
+			})
+		}
+	}
+}
+
+// The movement discipline of TestNoShardMovesBetweenSurvivingNodes, restated
+// for the full owner set: a membership change may only rearrange shards where
+// the changed node was itself an owner (primary or replica). A shard whose
+// entire owner set survives untouched must not be reshuffled.
+func TestRemovalOnlyDisturbsShardsTheDepartedNodeOwned(t *testing.T) {
+	for _, factor := range []int{1, 2} {
+		t.Run(fmt.Sprintf("rf%d", factor), func(t *testing.T) {
+			all := nodes(8)
+			const departed = "node-3"
+			before := AssignShardOwners(all, testShards, factor)
+			after := AssignShardOwners(without(all, departed), testShards, factor)
+
+			disturbed := 0
+			for shard := uint32(0); shard < testShards; shard++ {
+				wasOwner := before[shard].Primary == departed
+				for _, replica := range before[shard].Replicas {
+					wasOwner = wasOwner || replica == departed
+				}
+				if wasOwner {
+					disturbed++
+					for _, replica := range after[shard].Replicas {
+						if replica == departed {
+							t.Fatalf("shard %d still lists the removed node %s as a replica", shard, departed)
+						}
+					}
+					if after[shard].Primary == departed {
+						t.Fatalf("shard %d is still primaried by the removed node %s", shard, departed)
+					}
+					continue
+				}
+				if !ownersEqual(before[shard], after[shard]) {
+					t.Fatalf("shard %d was not owned by %s but changed from %v to %v",
+						shard, departed, before[shard], after[shard])
+				}
+			}
+			if disturbed == 0 {
+				t.Fatal("the removed node owned no shards; the test proves nothing")
+			}
+			t.Logf("removing %s disturbed exactly its %d owned shards of %d",
+				departed, disturbed, testShards)
+		})
+	}
+}
+
+// The join half of the same rule: a new node may only insert itself into an
+// owner list. No shard may reorder two pre-existing nodes as a side effect.
+func TestAdditionOnlyInsertsTheNewNode(t *testing.T) {
+	for _, factor := range []int{1, 2} {
+		t.Run(fmt.Sprintf("rf%d", factor), func(t *testing.T) {
+			before := AssignShardOwners(nodes(8), testShards, factor)
+			after := AssignShardOwners(nodes(9), testShards, factor)
+			const joined = "node-8"
+
+			taken := 0
+			for shard := uint32(0); shard < testShards; shard++ {
+				oldRanked := append([]string{before[shard].Primary}, before[shard].Replicas...)
+				newRanked := append([]string{after[shard].Primary}, after[shard].Replicas...)
+
+				joins := false
+				for _, id := range newRanked {
+					joins = joins || id == joined
+				}
+				if !joins {
+					if !ownersEqual(before[shard], after[shard]) {
+						t.Fatalf("shard %d changed from %v to %v without involving %s",
+							shard, before[shard], after[shard], joined)
+					}
+					continue
+				}
+				taken++
+
+				// Deleting the new node from the new ranking must leave the old
+				// ranking's prefix: the pre-existing nodes kept their relative
+				// order and only the tail was pushed off the end.
+				var remaining []string
+				for _, id := range newRanked {
+					if id != joined {
+						remaining = append(remaining, id)
+					}
+				}
+				for i, id := range remaining {
+					if oldRanked[i] != id {
+						t.Fatalf("shard %d reordered pre-existing owners: was %v, now %v (minus %s)",
+							shard, oldRanked, newRanked, joined)
+					}
+				}
+			}
+			if taken == 0 {
+				t.Fatal("the new node entered no owner list; the test proves nothing")
+			}
+			t.Logf("%s joined %d of %d owner lists and reordered nothing", joined, taken, testShards)
+		})
+	}
+}
+
+// Replica load must spread the same way primary load does. A replica set that
+// always lands on the same one or two nodes would turn a single failure into a
+// hot spot, and no other test here would notice.
+func TestReplicaDistributionIsReasonable(t *testing.T) {
+	for _, n := range []int{4, 8, 16, 32} {
+		t.Run(fmt.Sprintf("%d-nodes", n), func(t *testing.T) {
+			ids := nodes(n)
+			owners := AssignShardOwners(ids, testShards, 2)
+
+			held := map[string]int{}
+			for shard := uint32(0); shard < testShards; shard++ {
+				for _, replica := range owners[shard].Replicas {
+					held[replica]++
+				}
+			}
+			expected := 2 * testShards / n
+			for _, id := range ids {
+				if held[id] == 0 {
+					t.Errorf("%s replicates nothing", id)
+				}
+				if held[id] > 3*expected {
+					t.Errorf("%s replicates %d shards, expected ~%d", id, held[id], expected)
+				}
+			}
+		})
+	}
+}
+
+func TestAssignShardOwnersEdgeCases(t *testing.T) {
+	if m := AssignShardOwners(nil, testShards, 1); len(m) != 0 {
+		t.Errorf("no nodes should own nothing, got %d entries", len(m))
+	}
+	if AssignShardOwners(nil, 0, 1) == nil {
+		t.Error("AssignShardOwners returned a nil map; callers expect an empty one")
+	}
+	if m := AssignShardOwners(nodes(4), 0, 1); len(m) != 0 {
+		t.Errorf("zero shards should produce an empty map, got %d entries", len(m))
+	}
+
+	// A single node cannot replicate to itself, whatever the factor says.
+	single := AssignShardOwners([]string{"only"}, testShards, 2)
+	for shard := uint32(0); shard < testShards; shard++ {
+		if single[shard].Primary != "only" || len(single[shard].Replicas) != 0 {
+			t.Fatalf("with one node, shard %d got %v", shard, single[shard])
+		}
+	}
+
+	// A negative factor degrades to "no replication" rather than panicking a
+	// control plane that mis-parsed its config.
+	negative := AssignShardOwners(nodes(4), testShards, -3)
+	zero := AssignShardOwners(nodes(4), testShards, 0)
+	for shard := uint32(0); shard < testShards; shard++ {
+		if !ownersEqual(negative[shard], zero[shard]) {
+			t.Fatalf("shard %d: negative factor gave %v, factor 0 gave %v",
+				shard, negative[shard], zero[shard])
+		}
+	}
+}
+
+func TestPrimaryMap(t *testing.T) {
+	ids := nodes(6)
+	owners := AssignShardOwners(ids, testShards, 2)
+	primaries := PrimaryMap(owners)
+	want := AssignShards(ids, testShards)
+
+	if len(primaries) != len(want) {
+		t.Fatalf("PrimaryMap has %d entries, AssignShards has %d", len(primaries), len(want))
+	}
+	for shard, owner := range want {
+		if primaries[shard] != owner {
+			t.Fatalf("shard %d: PrimaryMap=%q AssignShards=%q", shard, primaries[shard], owner)
+		}
+	}
+	if len(PrimaryMap(nil)) != 0 {
+		t.Error("PrimaryMap(nil) must be an empty map, not a nil one")
+	}
+}
+
+func ownersEqual(a, b ShardOwners) bool {
+	if a.Primary != b.Primary || len(a.Replicas) != len(b.Replicas) {
+		return false
+	}
+	for i := range a.Replicas {
+		if a.Replicas[i] != b.Replicas[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func BenchmarkAssignShardOwners256x32rf2(b *testing.B) {
+	ids := nodes(32)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		AssignShardOwners(ids, testShards, 2)
+	}
+}
+
 func BenchmarkAssignShards256x32(b *testing.B) {
 	ids := nodes(32)
 	b.ResetTimer()

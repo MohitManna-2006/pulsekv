@@ -96,8 +96,20 @@ hardcodes it — they all read the config through the control plane's own parser
 so the scripts and server cannot disagree about what the file says.
 
 Default is 4 nodes (fast loop). `cluster.chaos.config.yaml` provides the
-eight-node Phase 3 fixture; the broader design target for gossip and Phase 5
-Raft chaos testing is 8–32 nodes on one machine.
+eight-node membership/replication fixture; the broader design target for gossip
+and Phase 5 Raft chaos testing is 8–32 nodes on one machine.
+
+## Replication factor
+
+`replication_factor` in the config sets how many replicas each shard gets beyond
+its primary (design doc range: 0, 1, or 2; default 1). `0` is a legal, exercised
+setting and is distinct from omitting the key.
+
+`run-local-cluster.sh --replication-factor N` overrides it for one boot, which is
+how the same fixture is run at 0, 1, and 2 without three config files. The
+override goes to the control plane, which decides placement; data nodes are
+handed `--metadata-addr` and read their replica peers from that decision. A node
+started without `--metadata-addr` does not replicate at all.
 
 ## What each script guarantees
 
@@ -105,8 +117,8 @@ Raft chaos testing is 8–32 nodes on one machine.
 |---|---|
 | `run-local-cluster.sh` | Every service answers `HealthCheck`, every sidecar is running, and metadata publishes the exact live node set and HRW map before the ready banner. On timeout it dumps logs, stops the partial cluster, and exits non-zero. |
 | `local-node.sh` | Operates on one configured data/sidecar pair. Graceful leave is published before data shutdown; crash paths exercise either SWIM detection or the local-service watchdog; start waits for data health before advertising it. |
-| `chaos-test.sh` | Runs one sustained correctness watcher while a target repeatedly leaves/fails and rejoins. It verifies every topology generation, exact minimal HRW movement, stable-key operations, and physical placement, then writes a JSON report. |
-| `smoke-test.sh` | Three legs — Go contract and routing assertions, the Python adapters client, and an optional grpcurl reflection check. The Go leg independently reproduces the HRW shard map and proves SDK writes hit the predicted owner and miss a different node. Non-zero on any failure. |
+| `chaos-test.sh` | Runs one sustained correctness watcher while a target repeatedly leaves/fails and rejoins. It verifies every topology generation, exact minimal HRW movement, stable-key operations, and physical placement, then writes a JSON report. At replication factor >= 1 it also strong-ack seeds keys on shards the target primaries and proves the promoted replica — and, after the rejoin, the restarted target's freshly backfilled engine — serves them byte-for-byte. At factor 0 it records why that proof was skipped. |
+| `smoke-test.sh` | Three legs — Go contract and routing assertions, the Python adapters client, and an optional grpcurl reflection check. The Go leg independently reproduces the HRW shard map and proves SDK writes hit the predicted owner and miss a node holding no copy of that shard. It also reproduces the primary+replica owner map, then proves a strong-ack write is byte-identical on every replica via direct `NodeService.Get`. Non-zero on any failure. |
 | `stop-local-cluster.sh` | Stops watcher → sidecars → data nodes → control plane, with bounded SIGTERM grace, SIGKILL fallback, PID-identity guards, and an orphan sweep. |
 | `test-engine.sh` | Builds and runs the pure-C engine suite. No cluster, no gRPC, no network. |
 | `bench-node.sh` | Boots a dedicated node with a small RAM budget and benchmarks it twice — inside and well outside that budget. Fails the run on any unverified read. |

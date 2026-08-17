@@ -1,17 +1,30 @@
 #!/usr/bin/env bash
 #
-# Deterministic Phase 3 kill/restart harness.
+# Deterministic Phase 3/4 kill/restart harness.
 #
 #   deploy/chaos-test.sh [--config PATH] [--target NODE_ID]
 #                        [--cycles N] [--seed N]
 #                        [--failure-mode alternating|crash|node-crash|leave]
 #                        [--transition-timeout SECONDS]
+#                        [--promotion-keys N]
 #                        [--ready-file PATH] [--report PATH]
 #
 # pulsekv-chaos owns the correctness workload and topology-transition checks.
 # This wrapper owns only local process mutation. It starts one watcher for the
 # whole run, waits for its readiness file, executes exactly one remove/rejoin
 # pair per cycle, and waits for the watcher to verify all 2*N transitions.
+#
+# PHASE 4: the watcher additionally seeds keys on shards the TARGET primaries,
+# using require_replica_acks so they are provably on every replica before the
+# kill, and then asserts the promoted replica serves them byte-for-byte. That
+# proof is skipped, and said to be skipped, when the running cluster's
+# replication factor is 0 -- which is a legal configuration the suite is
+# expected to be run at. Boot such a cluster with:
+#
+#   deploy/run-local-cluster.sh --config deploy/cluster.chaos.config.yaml \
+#       --replication-factor 0
+#
+# Every Phase 3 assertion is unchanged and still runs in both cases.
 
 set -euo pipefail
 
@@ -23,6 +36,7 @@ CYCLES=3
 SEED=7
 FAILURE_MODE=alternating
 TRANSITION_TIMEOUT=15
+PROMOTION_KEYS=8
 READY_FILE=""
 REPORT=""
 
@@ -44,6 +58,8 @@ while [ $# -gt 0 ]; do
         --failure-mode=*) FAILURE_MODE="${1#*=}"; shift ;;
         --transition-timeout) [ $# -ge 2 ] || pk_die "--transition-timeout requires seconds"; TRANSITION_TIMEOUT="$2"; shift 2 ;;
         --transition-timeout=*) TRANSITION_TIMEOUT="${1#*=}"; shift ;;
+        --promotion-keys) [ $# -ge 2 ] || pk_die "--promotion-keys requires a number"; PROMOTION_KEYS="$2"; shift 2 ;;
+        --promotion-keys=*) PROMOTION_KEYS="${1#*=}"; shift ;;
         --ready-file) [ $# -ge 2 ] || pk_die "--ready-file requires a path"; READY_FILE="$2"; shift 2 ;;
         --ready-file=*) READY_FILE="${1#*=}"; shift ;;
         --report) [ $# -ge 2 ] || pk_die "--report requires a path"; REPORT="$2"; shift 2 ;;
@@ -58,9 +74,14 @@ case "$SEED" in ''|*[!0-9]*) pk_die "--seed must be a non-negative integer, got:
 case "$TRANSITION_TIMEOUT" in
     ''|*[!0-9]*) pk_die "--transition-timeout must be a positive integer, got: $TRANSITION_TIMEOUT" ;;
 esac
+# 0 is legal: it turns the promotion proof off explicitly.
+case "$PROMOTION_KEYS" in
+    ''|*[!0-9]*) pk_die "--promotion-keys must be a non-negative integer, got: $PROMOTION_KEYS" ;;
+esac
 CYCLES=$((10#$CYCLES))
 SEED=$((10#$SEED))
 TRANSITION_TIMEOUT=$((10#$TRANSITION_TIMEOUT))
+PROMOTION_KEYS=$((10#$PROMOTION_KEYS))
 [ "$CYCLES" -gt 0 ] || pk_die "--cycles must be a positive integer, got: $CYCLES"
 [ "$TRANSITION_TIMEOUT" -gt 0 ] || \
     pk_die "--transition-timeout must be a positive integer, got: $TRANSITION_TIMEOUT"
@@ -172,9 +193,14 @@ pk_start_managed chaos "$CONTROL_PLANE" "$CHAOS_LOG" \
         --seed "$SEED" \
         --ready-file "$READY_FILE" \
         --report "$REPORT" \
+        --promotion-keys "$PROMOTION_KEYS" \
         --transition-timeout "${TRANSITION_TIMEOUT}s"
 WATCHER_PID="$PK_LAST_PID"
 pk_info "watcher pid $WATCHER_PID; waiting for seeded stable-key workload"
+# Reported from the config for context only. The watcher reads the factor from
+# the LIVE topology and decides there whether promotion applies, so a config the
+# running cluster was not actually booted with cannot mislead the assertions.
+pk_dim "configured replication factor: $(pk_replication_factor 2>/dev/null || echo '?'); promotion keys: $PROMOTION_KEYS"
 
 read_transition_count() {
     PK_TRANSITION_COUNT=""
@@ -258,4 +284,24 @@ fi
 [ -s "$REPORT" ] || pk_die "pulsekv-chaos succeeded but wrote no report to $REPORT"
 
 pk_ok "chaos test passed; report: $(pk_relpath "$REPORT")"
+# Surface the promotion outcome rather than leaving it buried in JSON: a run
+# that skipped the Phase 4 proof and a run that passed it both exit 0, and the
+# difference is exactly what an operator needs to see.
+if command -v python3 >/dev/null 2>&1; then
+    python3 - "$REPORT" <<'PY' || true
+import json, sys
+with open(sys.argv[1]) as handle:
+    report = json.load(handle)
+skipped = report.get("promotion_skipped", "")
+if skipped:
+    print(f"    replication factor {report.get('replication_factor', '?')}: "
+          f"promotion proof SKIPPED ({skipped})")
+else:
+    proofs = [t["promotion_proof"] for t in report.get("transitions", []) if t.get("promotion_proof")]
+    keys = sum(p["keys_verified"] for p in proofs)
+    kinds = sorted({p["kind"] for p in proofs})
+    print(f"    replication factor {report.get('replication_factor', '?')}: "
+          f"{len(proofs)} promotion proof(s) over {keys} key(s) [{', '.join(kinds)}]")
+PY
+fi
 pk_dim "watcher log: $(pk_relpath "$CHAOS_LOG")"

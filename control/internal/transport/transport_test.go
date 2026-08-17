@@ -228,6 +228,93 @@ func TestGetChunkedRejectsMalformedStreams(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Phase 4: replica acks
+// ---------------------------------------------------------------------------
+
+// Plain Put must keep sending require_replica_acks = 0. It is the default
+// write path for every existing caller, and quietly making it block on
+// replication would be a latency regression nobody asked for.
+func TestPutRequestsNoAcksByDefault(t *testing.T) {
+	var seen *nodev1.PutRequest
+	client := &fakeNodeClient{
+		put: func(_ context.Context, req *nodev1.PutRequest) (*nodev1.PutResponse, error) {
+			seen = req
+			return &nodev1.PutResponse{Ok: true, ReplicasAcked: 2}, nil
+		},
+	}
+
+	if err := Put(context.Background(), client, []byte("key"), []byte("value")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if seen.GetRequireReplicaAcks() != 0 {
+		t.Fatalf("require_replica_acks = %d, want 0", seen.GetRequireReplicaAcks())
+	}
+	if seen.GetFromReplication() {
+		t.Fatal("a client write must never set from_replication")
+	}
+}
+
+func TestPutWithAckPassesTheRequestedCountThrough(t *testing.T) {
+	var seen *nodev1.PutRequest
+	client := &fakeNodeClient{
+		put: func(_ context.Context, req *nodev1.PutRequest) (*nodev1.PutResponse, error) {
+			seen = req
+			return &nodev1.PutResponse{Ok: true, ReplicasAcked: 2}, nil
+		},
+	}
+
+	acked, err := PutWithAck(context.Background(), client, []byte("key"), []byte("value"), 2)
+	if err != nil {
+		t.Fatalf("PutWithAck: %v", err)
+	}
+	if seen.GetRequireReplicaAcks() != 2 {
+		t.Fatalf("require_replica_acks = %d, want 2", seen.GetRequireReplicaAcks())
+	}
+	if acked != 2 {
+		t.Fatalf("replicas acked = %d, want 2", acked)
+	}
+}
+
+// A caller who asked for acks on an oversized value must be told, not silently
+// given a fire-and-forget write. PutChunk carries no ack field, so accepting
+// this would hand back a durability guarantee that was never provided.
+func TestPutWithAckRefusesOversizedValues(t *testing.T) {
+	value := make([]byte, UnaryValueLimit+1)
+	client := &fakeNodeClient{
+		putChunked: func(context.Context) (grpc.ClientStreamingClient[nodev1.PutChunk, nodev1.PutResponse], error) {
+			t.Fatal("an oversized strong-ack write must not reach the chunked path")
+			return nil, nil
+		},
+	}
+
+	if _, err := PutWithAck(context.Background(), client, []byte("key"), value, 1); !errors.Is(err, ErrChunkedAcksUnsupported) {
+		t.Fatalf("PutWithAck error = %v, want ErrChunkedAcksUnsupported", err)
+	}
+
+	// The same value with acks = 0 still goes through, chunked, as before.
+	stream := &fakePutStream{}
+	client.putChunked = func(context.Context) (grpc.ClientStreamingClient[nodev1.PutChunk, nodev1.PutResponse], error) {
+		return stream, nil
+	}
+	acked, err := PutWithAck(context.Background(), client, []byte("key"), value, 0)
+	if err != nil {
+		t.Fatalf("PutWithAck(acks=0): %v", err)
+	}
+	if acked != 0 {
+		t.Fatalf("chunked write reported %d ack(s); it waits for none", acked)
+	}
+	if !stream.closed {
+		t.Fatal("chunked write did not complete")
+	}
+	// from_replication is the server's flag to set, never the SDK's.
+	for i, chunk := range stream.sent {
+		if chunk.GetFromReplication() {
+			t.Fatalf("chunk %d set from_replication on a client write", i)
+		}
+	}
+}
+
 type fakeNodeClient struct {
 	nodev1.NodeServiceClient
 	get        func(context.Context, *nodev1.GetRequest) (*nodev1.GetResponse, error)
@@ -274,6 +361,8 @@ func (f *fakePutStream) Send(chunk *nodev1.PutChunk) error {
 		TotalChunks: chunk.GetTotalChunks(),
 		TotalLength: chunk.GetTotalLength(),
 		Data:        bytes.Clone(chunk.GetData()),
+		// Copied so an assertion about it is testing the sender, not this fake.
+		FromReplication: chunk.GetFromReplication(),
 	}
 	f.sent = append(f.sent, copyChunk)
 	return nil

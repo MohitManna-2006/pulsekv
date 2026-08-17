@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"fmt"
 	"maps"
 	"sync"
 	"testing"
@@ -39,7 +40,16 @@ func (s *mutableSource) set(snapshot membership.Snapshot) {
 
 func newTestService(t *testing.T, shardCount uint32, source membership.Source) *Service {
 	t.Helper()
-	svc, err := New(&config.Config{ShardCount: shardCount}, source)
+	return newTestServiceWithReplicas(t, shardCount, 0, source)
+}
+
+func newTestServiceWithReplicas(t *testing.T, shardCount uint32, replicationFactor int,
+	source membership.Source) *Service {
+	t.Helper()
+	svc, err := New(&config.Config{
+		ShardCount:        shardCount,
+		ReplicationFactor: replicationFactor,
+	}, source)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -239,5 +249,167 @@ func TestNewRejectsMissingInputs(t *testing.T) {
 	}
 	if _, err := New(&config.Config{}, validSource); err == nil {
 		t.Fatal("New(zero shards) succeeded")
+	}
+	if _, err := New(&config.Config{ShardCount: 8, ReplicationFactor: -1}, validSource); err == nil {
+		t.Fatal("New(negative replication factor) succeeded")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4: primary + replica placement
+// ---------------------------------------------------------------------------
+
+func fourNodeSource(generation uint64) *mutableSource {
+	return &mutableSource{snapshot: membership.Snapshot{
+		Generation: generation,
+		Nodes: []membership.Node{
+			{NodeID: "node-0", Address: "127.0.0.1:7100"},
+			{NodeID: "node-1", Address: "127.0.0.1:7101"},
+			{NodeID: "node-2", Address: "127.0.0.1:7102"},
+			{NodeID: "node-3", Address: "127.0.0.1:7103"},
+		},
+	}}
+}
+
+// The compatibility guarantee, asserted at the RPC boundary rather than only in
+// the router: whatever else shard_to_owners says, shard_to_node_id stays
+// exactly the primary column, because that is what every Phase 2/3 consumer
+// reads.
+func TestGetShardMapPublishesOwnersThatAgreeWithShardMap(t *testing.T) {
+	for _, factor := range []int{0, 1, 2} {
+		t.Run(fmt.Sprintf("rf%d", factor), func(t *testing.T) {
+			source := fourNodeSource(11)
+			svc := newTestServiceWithReplicas(t, 64, factor, source)
+
+			resp, err := svc.GetShardMap(context.Background(), &metadatav1.GetShardMapRequest{})
+			if err != nil {
+				t.Fatalf("GetShardMap: %v", err)
+			}
+			if resp.GetReplicationFactor() != uint32(factor) {
+				t.Fatalf("replication_factor = %d, want %d", resp.GetReplicationFactor(), factor)
+			}
+			if len(resp.GetShardToOwners()) != 64 {
+				t.Fatalf("owner map has %d entries, want 64", len(resp.GetShardToOwners()))
+			}
+
+			ids := []string{"node-0", "node-1", "node-2", "node-3"}
+			wantOwners := router.AssignShardOwners(ids, 64, factor)
+			wantPrimaries := router.AssignShards(ids, 64)
+
+			for shard := uint32(0); shard < 64; shard++ {
+				entry := resp.GetShardToOwners()[shard]
+				if entry == nil {
+					t.Fatalf("shard %d has no owner entry", shard)
+				}
+				if entry.GetPrimary() != resp.GetShardToNodeId()[shard] {
+					t.Fatalf("shard %d: primary %q but shard_to_node_id %q",
+						shard, entry.GetPrimary(), resp.GetShardToNodeId()[shard])
+				}
+				if entry.GetPrimary() != wantPrimaries[shard] {
+					t.Fatalf("shard %d primary %q, want HRW owner %q",
+						shard, entry.GetPrimary(), wantPrimaries[shard])
+				}
+				want := wantOwners[shard].Replicas
+				if len(entry.GetReplicas()) != len(want) {
+					t.Fatalf("shard %d has %d replica(s), want %d",
+						shard, len(entry.GetReplicas()), len(want))
+				}
+				for i := range want {
+					if entry.GetReplicas()[i] != want[i] {
+						t.Fatalf("shard %d replica[%d] = %q, want %q",
+							shard, i, entry.GetReplicas()[i], want[i])
+					}
+				}
+			}
+		})
+	}
+}
+
+// Replica placement is part of what the fingerprint identifies, so the same
+// membership at two replication factors must not look like the same topology.
+func TestTopologyFingerprintCoversReplicationFactor(t *testing.T) {
+	source := fourNodeSource(3)
+	unreplicated := newTestServiceWithReplicas(t, 32, 0, source)
+	replicated := newTestServiceWithReplicas(t, 32, 1, source)
+
+	a, err := unreplicated.GetShardMap(context.Background(), &metadatav1.GetShardMapRequest{})
+	if err != nil {
+		t.Fatalf("GetShardMap: %v", err)
+	}
+	b, err := replicated.GetShardMap(context.Background(), &metadatav1.GetShardMapRequest{})
+	if err != nil {
+		t.Fatalf("GetShardMap: %v", err)
+	}
+
+	if maps.Equal(a.GetShardToNodeId(), b.GetShardToNodeId()) == false {
+		t.Fatal("changing the replication factor must not move any primary")
+	}
+	if bytes.Equal(a.GetTopologyFingerprint(), b.GetTopologyFingerprint()) {
+		t.Fatal("two different replication factors produced the same topology fingerprint")
+	}
+
+	// GetNodeList must publish the same identity as GetShardMap, or the
+	// coherence retry in internal/topology can never converge.
+	nodesResp, err := replicated.GetNodeList(context.Background(), &metadatav1.GetNodeListRequest{})
+	if err != nil {
+		t.Fatalf("GetNodeList: %v", err)
+	}
+	if !bytes.Equal(nodesResp.GetTopologyFingerprint(), b.GetTopologyFingerprint()) {
+		t.Fatal("GetNodeList and GetShardMap disagree on the topology fingerprint")
+	}
+}
+
+// Fewer live nodes than 1 + replication_factor is a real operational state, not
+// an error. It must publish the shards it can replicate rather than refusing.
+func TestGetShardMapDegradesWhenReplicasExceedLiveNodes(t *testing.T) {
+	source := &mutableSource{snapshot: membership.Snapshot{
+		Generation: 5,
+		Nodes: []membership.Node{
+			{NodeID: "node-0", Address: "127.0.0.1:7100"},
+			{NodeID: "node-1", Address: "127.0.0.1:7101"},
+		},
+	}}
+	svc := newTestServiceWithReplicas(t, 16, 3, source)
+
+	resp, err := svc.GetShardMap(context.Background(), &metadatav1.GetShardMapRequest{})
+	if err != nil {
+		t.Fatalf("GetShardMap: %v", err)
+	}
+	if resp.GetReplicationFactor() != 3 {
+		t.Fatalf("replication_factor = %d, want the configured 3", resp.GetReplicationFactor())
+	}
+	for shard := uint32(0); shard < 16; shard++ {
+		entry := resp.GetShardToOwners()[shard]
+		if len(entry.GetReplicas()) != 1 {
+			t.Fatalf("shard %d has %d replica(s); two live nodes can only hold one",
+				shard, len(entry.GetReplicas()))
+		}
+		if entry.GetReplicas()[0] == entry.GetPrimary() {
+			t.Fatalf("shard %d replicates to its own primary %q", shard, entry.GetPrimary())
+		}
+	}
+}
+
+// An empty cluster is an authoritative topology, not a metadata failure. That
+// stays true with replication configured: it publishes no owners at all rather
+// than a map full of empty owner entries.
+func TestEmptyTopologyPublishesNoOwners(t *testing.T) {
+	svc := newTestServiceWithReplicas(t, 16, 2, &mutableSource{
+		snapshot: membership.Snapshot{Generation: 4},
+	})
+
+	resp, err := svc.GetShardMap(context.Background(), &metadatav1.GetShardMapRequest{})
+	if err != nil {
+		t.Fatalf("GetShardMap: %v", err)
+	}
+	if len(resp.GetShardToNodeId()) != 0 || len(resp.GetShardToOwners()) != 0 {
+		t.Fatalf("empty cluster published %d owner(s) and %d owner entries",
+			len(resp.GetShardToNodeId()), len(resp.GetShardToOwners()))
+	}
+	if resp.GetShardCount() != 16 {
+		t.Fatalf("shard count = %d, want 16 even with no live nodes", resp.GetShardCount())
+	}
+	if resp.GetReplicationFactor() != 2 {
+		t.Fatalf("replication_factor = %d, want 2", resp.GetReplicationFactor())
 	}
 }

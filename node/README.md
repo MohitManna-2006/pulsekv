@@ -7,8 +7,17 @@ the piece with direct lineage from v1.
 ```
 node/
 ├── engine/      pure C. The storage engine. Empty in Phase 0.
-└── grpc_shim/   thin C++. Turns NodeService RPCs into engine calls.
+└── grpc_shim/   thin C++. Turns NodeService RPCs into engine calls, and
+                 (from Phase 4) forwards writes to this shard's replicas.
 ```
+
+Phase 4 made the shim a gRPC **client** as well as a server: it polls
+`ClusterMetadataService` for the shards it primaries, keeps cached
+`NodeService` stubs to those shards' replica peers, and forwards writes to them.
+That is a network-layer concern and it changed nothing below the line described
+next — `pk_engine_put` cannot tell a client's write from a replicated copy, and
+the engine has no concept of a primary, a replica, or a peer. Replication is
+off entirely unless the node is started with `--metadata-addr`.
 
 ## Why there is C++ in an otherwise-C directory
 
@@ -31,17 +40,22 @@ So the boundary sits here instead:
   ┌───────────────────────────┐         ┌──────────────────────────┐
   │  node/grpc_shim/main.cpp  │  ────►  │  node/engine/*.c         │
   │  NodeServiceImpl          │ extern  │  sharded table, epoll,   │
-  │  ~200 lines, no logic     │   "C"   │  tiering, WAL, framing   │
+  │  + replication, no logic  │   "C"   │  tiering, WAL, framing   │
   └───────────────────────────┘         └──────────────────────────┘
 ```
 
 The rule the shim is held to: **it contains no storage logic.** It unpacks a
 protobuf, calls one `extern "C"` function, packs the result, and returns a
-status. Phase 0's `main.cpp` is ~280 lines and most of that is argument parsing
-and shutdown handling; if it grows much past that, something has leaked in. Every decision worth making — hashing, locking, eviction, tier
+status. Every decision worth making — hashing, locking, eviction, tier
 placement, framing — lives in `engine/`, in C, testable without gRPC in the
 picture at all. If the shim ever grows a branch that depends on what is *in*
 the store, that branch belongs in `engine/`.
+
+Phase 4's replication code is the one thing here that is not a straight
+unpack-call-pack, and it stays on the right side of that rule: it branches on
+*where a key belongs* — which shard, which peers hold it — never on what is
+stored under it. The engine is still the only thing that knows what is in the
+store.
 
 This split is the standard pattern for giving a C library a gRPC surface, and
 it is the same shape the rest of this ecosystem uses — TiKV, Mooncake, and
@@ -79,8 +93,8 @@ Every RPC is real as of Phase 1; nothing returns `UNIMPLEMENTED`.
 |---|---|
 | `HealthCheck` | `ok=true`, this node's ID, actual uptime |
 | `Get` | value for keys up to 4 MiB; a miss is `found=false` with status OK, never an error. A stored value above the unary limit returns `FAILED_PRECONDITION` naming `GetChunked`. |
-| `Put` | writes values up to 4 MiB; above that, `INVALID_ARGUMENT` naming `PutChunked` |
-| `PutChunked` | client-streaming write for larger values. Chunks must arrive in order from index 0; `total_length` is validated against `--max-value-bytes` before a byte is buffered. |
+| `Put` | writes values up to 4 MiB; above that, `INVALID_ARGUMENT` naming `PutChunked`. When this node primaries the key's shard it also replicates: in the background by default, or blocking for `require_replica_acks` replicas when asked. `from_replication` marks a forwarded copy, which is stored and never forwarded on. |
+| `PutChunked` | client-streaming write for larger values. Chunks must arrive in order from index 0; `total_length` is validated against `--max-value-bytes` before a byte is buffered. Replicates in the background only — there is no chunked strong-ack mode. |
 | `GetChunked` | server-streaming read, always valid. A miss is an empty stream. |
 | `PrefixMatch` | full scan of all 256 shards, O(total keys). Values above the unary limit are flagged `value_omitted` rather than inlined. |
 | `Capacity` | per-tier key and byte occupancy, straight from the engine |

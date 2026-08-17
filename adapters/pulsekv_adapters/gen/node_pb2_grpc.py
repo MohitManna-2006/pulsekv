@@ -97,6 +97,10 @@ class NodeServiceServicer:
         """Point write, for values up to UNARY_VALUE_LIMIT_BYTES. A larger value
         fails fast with INVALID_ARGUMENT pointing at PutChunked rather than being
         silently accepted.
+
+        Phase 4: a node that is the current primary for the key's shard also
+        forwards the write to that shard's replicas. See PutRequest for the two
+        modes and the loop-prevention rule.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')

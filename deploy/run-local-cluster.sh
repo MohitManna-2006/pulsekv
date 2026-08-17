@@ -3,12 +3,17 @@
 # Boot the PulseKV v2 local multi-process dev cluster.
 #
 #   deploy/run-local-cluster.sh [--config PATH] [--skip-build] [--restart]
-#                               [--timeout SECONDS]
+#                               [--timeout SECONDS] [--replication-factor N]
 #
 # Builds the Go control plane, Go gossip sidecar, and C++ grpc_shim node. It
 # starts one control-plane gossip observer plus one data process and one
 # membership sidecar per configured node. A sidecar starts only after all data
 # services pass HealthCheck, so gossip never advertises an unready endpoint.
+#
+# --replication-factor N overrides the config's replication_factor for this boot
+# only, which is how one fixture gets exercised at 0, 1, and 2. It is passed to
+# the control plane, which decides placement; data nodes are passed
+# --metadata-addr and read their replica peers from that decision.
 #
 # PROCESS LIFETIME: processes are started in the background and their PIDs are
 # written to deploy/run/cluster.pids. This script returns as soon as the
@@ -46,7 +51,12 @@ while [ $# -gt 0 ]; do
         --timeout=*)  HEALTH_TIMEOUT="${1#*=}"; shift ;;
         --skip-build) SKIP_BUILD=1; shift ;;
         --restart)    RESTART=1; shift ;;
-        -h|--help)    sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --replication-factor)
+            [ $# -ge 2 ] || pk_die "--replication-factor requires a number"
+            PULSEKV_REPLICATION_FACTOR="$2"; shift 2 ;;
+        --replication-factor=*)
+            PULSEKV_REPLICATION_FACTOR="${1#*=}"; shift ;;
+        -h|--help)    sed -n '2,35p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *)            pk_die "unknown argument: $1 (try --help)" ;;
     esac
 done
@@ -56,6 +66,16 @@ case "$HEALTH_TIMEOUT" in
 esac
 HEALTH_TIMEOUT=$((10#$HEALTH_TIMEOUT))
 [ "$HEALTH_TIMEOUT" -gt 0 ] || pk_die "--timeout must be a positive integer, got: $HEALTH_TIMEOUT"
+
+# Validated here rather than left to the control plane, so a typo fails before
+# anything is built or started. 0 is legal and must survive the check.
+if [ -n "$PULSEKV_REPLICATION_FACTOR" ]; then
+    case "$PULSEKV_REPLICATION_FACTOR" in
+        ''|*[!0-9]*) pk_die "--replication-factor must be a non-negative integer, got: $PULSEKV_REPLICATION_FACTOR" ;;
+    esac
+    PULSEKV_REPLICATION_FACTOR=$((10#$PULSEKV_REPLICATION_FACTOR))
+fi
+export PULSEKV_REPLICATION_FACTOR
 
 [ -f "$PULSEKV_CONFIG" ] || pk_die "config not found: $PULSEKV_CONFIG"
 
@@ -231,6 +251,12 @@ done
 
 pk_info "${#STARTED_PIDS[@]} process(es) launched, waiting for direct health checks"
 pk_dim "engine: ram-budget=$RAM_BUDGET max-value=$MAX_VALUE data-root=$(pk_relpath "$DATA_ROOT_ABS")"
+REPLICATION_FACTOR="$(pk_replication_factor)" || pk_die "could not read the replication factor"
+if [ -n "$PULSEKV_REPLICATION_FACTOR" ]; then
+    pk_dim "replication: factor=$REPLICATION_FACTOR (--replication-factor override) metadata-addr=$CP_ADDRESS"
+else
+    pk_dim "replication: factor=$REPLICATION_FACTOR (from $(pk_relpath "$PULSEKV_CONFIG")) metadata-addr=$CP_ADDRESS"
+fi
 
 if ! "$PULSEKV_SMOKE_BIN" --config "$PULSEKV_CONFIG" \
         --mode=wait --timeout="${HEALTH_TIMEOUT}s" 2>&1 | sed 's/^/    /'; then

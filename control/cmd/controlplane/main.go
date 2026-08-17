@@ -40,6 +40,10 @@ func main() {
 			"path to the static cluster config")
 		portOverride = flag.Int("port", 0,
 			"listen port; overrides control_plane.port from the config when non-zero")
+		replicationOverride = flag.Int("replication-factor", -1,
+			"replicas per shard beyond the primary; overrides replication_factor from the "+
+				"config when non-negative. -1 means 'use the config', which is why the "+
+				"sentinel is not 0: 0 is a real setting")
 		gossipJoin = flag.String("gossip-join", "",
 			"optional comma-separated memberlist seed addresses for an additional control-plane observer")
 		printNodes = flag.Bool("print-nodes", false,
@@ -50,6 +54,8 @@ func main() {
 			"print `ram_budget_bytes<TAB>max_value_bytes<TAB>data_root` and exit")
 		printGossip = flag.Bool("print-gossip", false,
 			"print `participant<TAB>host<TAB>gossip-port` for bootstrap inventory and exit")
+		printReplication = flag.Bool("print-replication", false,
+			"print the effective replication factor and exit")
 	)
 	flag.Parse()
 
@@ -61,6 +67,12 @@ func main() {
 		cfg.ControlPlane.Port = *portOverride
 		if err := cfg.Validate(); err != nil {
 			log.Fatalf("fatal: --port %d is not usable: %v", *portOverride, err)
+		}
+	}
+	if *replicationOverride >= 0 {
+		cfg.ReplicationFactor = *replicationOverride
+		if err := cfg.Validate(); err != nil {
+			log.Fatalf("fatal: --replication-factor %d is not usable: %v", *replicationOverride, err)
 		}
 	}
 
@@ -85,6 +97,10 @@ func main() {
 		for _, n := range cfg.Nodes {
 			fmt.Printf("%s\t%s\t%d\n", n.NodeID, n.Host, n.GossipPort)
 		}
+		return
+	}
+	if *printReplication {
+		fmt.Printf("%d\n", cfg.ReplicationFactor)
 		return
 	}
 

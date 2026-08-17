@@ -115,6 +115,12 @@ type testNode struct {
 	chunkedPuts  int
 	chunkedGets  int
 	prefixScans  int
+
+	// Phase 4: what the last Put asked for, and what this fake pretends its
+	// replicas did about it.
+	lastRequestedAcks atomic.Uint32
+	replicasAcked     uint32
+	putErr            error
 }
 
 func newTestNode() *testNode {
@@ -122,11 +128,15 @@ func newTestNode() *testNode {
 }
 
 func (n *testNode) Put(_ context.Context, req *nodev1.PutRequest) (*nodev1.PutResponse, error) {
+	n.lastRequestedAcks.Store(req.GetRequireReplicaAcks())
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	if n.putErr != nil {
+		return nil, n.putErr
+	}
 	n.values[string(req.GetKey())] = append([]byte(nil), req.GetValue()...)
 	n.puts++
-	return &nodev1.PutResponse{Ok: true}, nil
+	return &nodev1.PutResponse{Ok: true, ReplicasAcked: n.replicasAcked}, nil
 }
 
 func (n *testNode) Get(_ context.Context, req *nodev1.GetRequest) (*nodev1.GetResponse, error) {
@@ -285,6 +295,103 @@ func waitForTopologyGeneration(t *testing.T, c *Client, want uint64) {
 	got := c.topology.Generation
 	c.mu.RUnlock()
 	t.Fatalf("topology generation = %d, want %d before deadline", got, want)
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4: PutWithAck
+// ---------------------------------------------------------------------------
+
+// PutWithAck must reach the primary exactly the way Put already does -- the SDK
+// deliberately learns nothing about replicas -- while carrying the requested
+// ack count and returning what the primary reports.
+func TestPutWithAckRoutesToThePrimaryAndReportsAcks(t *testing.T) {
+	nodeA, nodeB := newTestNode(), newTestNode()
+	nodeA.replicasAcked = 2
+	nodeB.replicasAcked = 2
+	addrA := serveTestGRPC(t, func(s *grpc.Server) { nodev1.RegisterNodeServiceServer(s, nodeA) })
+	addrB := serveTestGRPC(t, func(s *grpc.Server) { nodev1.RegisterNodeServiceServer(s, nodeB) })
+
+	ids := []string{"node-a", "node-b"}
+	const shardCount = 32
+	shards := router.AssignShards(ids, shardCount)
+	md := &testMetadata{
+		nodes: []*metadatav1.NodeInfo{
+			{NodeId: "node-a", Address: addrA, Alive: true},
+			{NodeId: "node-b", Address: addrB, Alive: true},
+		},
+		shards: shards,
+	}
+	mdAddr := serveTestGRPC(t, func(s *grpc.Server) {
+		metadatav1.RegisterClusterMetadataServiceServer(s, md)
+	})
+
+	c, err := New(mdAddr, WithRefreshInterval(0))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	key := keyOwnedBy(t, "node-a", shards, shardCount, "ack")
+	acked, err := c.PutWithAck(context.Background(), key, []byte("value"), 2)
+	if err != nil {
+		t.Fatalf("PutWithAck: %v", err)
+	}
+	if acked != 2 {
+		t.Fatalf("acked = %d, want the 2 the primary reported", acked)
+	}
+	if !nodeA.has(key) {
+		t.Fatal("strong-ack write did not land on the primary")
+	}
+	if nodeB.has(key) {
+		t.Fatal("the SDK contacted a node that does not primary this key")
+	}
+	if got := nodeA.lastRequestedAcks.Load(); got != 2 {
+		t.Fatalf("primary saw require_replica_acks = %d, want 2", got)
+	}
+
+	// Plain Put is unchanged: still asks for nothing, still reports nothing.
+	if err := c.Put(context.Background(), key, []byte("value")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if got := nodeA.lastRequestedAcks.Load(); got != 0 {
+		t.Fatalf("plain Put asked for %d ack(s); it must ask for none", got)
+	}
+}
+
+// An ack shortfall is a real error the caller must see, not something the SDK
+// smooths over. It also must not be mistaken for a lost write.
+func TestPutWithAckSurfacesTheNodesError(t *testing.T) {
+	node := newTestNode()
+	node.putErr = status.Error(codes.DeadlineExceeded,
+		"replicated to 0 of the 2 requested replica(s); the local write is committed")
+	addr := serveTestGRPC(t, func(s *grpc.Server) { nodev1.RegisterNodeServiceServer(s, node) })
+
+	const shardCount = 8
+	shards := router.AssignShards([]string{"node-a"}, shardCount)
+	md := &testMetadata{
+		nodes:  []*metadatav1.NodeInfo{{NodeId: "node-a", Address: addr, Alive: true}},
+		shards: shards,
+	}
+	mdAddr := serveTestGRPC(t, func(s *grpc.Server) {
+		metadatav1.RegisterClusterMetadataServiceServer(s, md)
+	})
+
+	c, err := New(mdAddr, WithRefreshInterval(0))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	acked, err := c.PutWithAck(context.Background(), []byte("k"), []byte("v"), 2)
+	if status.Code(err) != codes.DeadlineExceeded {
+		t.Fatalf("PutWithAck error = %v, want DEADLINE_EXCEEDED to reach the caller", err)
+	}
+	if acked != 0 {
+		t.Fatalf("acked = %d, want 0 on a failed strong-ack write", acked)
+	}
+	if got := node.lastRequestedAcks.Load(); got != 2 {
+		t.Fatalf("node saw require_replica_acks = %d, want 2", got)
+	}
 }
 
 func TestClientRoutesAndScansCluster(t *testing.T) {

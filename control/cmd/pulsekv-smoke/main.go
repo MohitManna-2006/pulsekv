@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -364,6 +365,7 @@ func runSmoke(cfg *config.Config, rpcTimeout time.Duration) int {
 
 	checkControlPlane(r, cfg, cpConn, rpcTimeout)
 	checkRouting(r, cfg, cpConn, rpcTimeout)
+	checkReplication(r, cfg, cpConn, rpcTimeout)
 
 	for _, n := range cfg.Nodes {
 		conn, err := dial(n.Address())
@@ -632,10 +634,15 @@ func checkRouting(r *reporter, cfg *config.Config, conn *grpc.ClientConn, rpcTim
 				"live shard map has no owner for shard %d", router.ShardForKey(key, cfg.ShardCount)))
 			continue
 		}
-		other := differentNode(owner, nodeIDs)
+		shard := router.ShardForKey(key, cfg.ShardCount)
+		other := nonHolder(shard, topology, nodeIDs)
 		if other == "" {
-			r.fail(fmt.Sprintf("routing/key[%d]", i), fmt.Errorf(
-				"no node differs from predicted owner %q", owner))
+			// Every live node holds a copy, so no node can prove the write did
+			// not go everywhere. Legal at a replication factor of len(nodes)-1;
+			// say so rather than failing, or passing silently.
+			r.pass(fmt.Sprintf("routing/key[%d]", i), fmt.Sprintf(
+				"shard %d owner=%s; every live node holds this shard, so no "+
+					"exclusion node exists", shard, owner))
 			continue
 		}
 
@@ -676,9 +683,10 @@ func checkRouting(r *reporter, cfg *config.Config, conn *grpc.ClientConn, rpcTim
 			otherResp, directErr := directGet(directClients[other], key, rpcTimeout)
 			switch {
 			case directErr != nil:
-				problems = append(problems, fmt.Sprintf("direct Get on non-owner %s: %v", other, directErr))
+				problems = append(problems, fmt.Sprintf("direct Get on non-holder %s: %v", other, directErr))
 			case otherResp.GetFound():
-				problems = append(problems, fmt.Sprintf("non-owner %s unexpectedly returned found=true", other))
+				problems = append(problems, fmt.Sprintf(
+					"%s holds no copy of shard %d but returned found=true", other, shard))
 			}
 		}
 
@@ -688,15 +696,254 @@ func checkRouting(r *reporter, cfg *config.Config, conn *grpc.ClientConn, rpcTim
 			continue
 		}
 		r.pass(name, fmt.Sprintf(
-			"shard=%d owner=%s; SDK round-trip; direct owner hit; %s miss",
-			router.ShardForKey(key, cfg.ShardCount), owner, other))
+			"shard=%d owner=%s; SDK round-trip; direct owner hit; %s (holds no copy "+
+				"of this shard) miss", shard, owner, other))
 	}
+}
+
+// checkReplication is the Phase 4 counterpart to checkRouting, and it proves
+// the same kind of thing the same way: not "the SDK returned my value", but
+// "the value is physically on the machines the shard map says hold it".
+//
+// The write is a strong-ack Put, so by the time it returns the primary claims
+// every replica has stored it. That claim is then checked directly, against each
+// replica's own address, bypassing the SDK entirely. A replica is never routed
+// to by a client -- reads are primary-only in Phase 4 -- so a direct hit there
+// can only mean replication actually moved the bytes.
+func checkReplication(r *reporter, cfg *config.Config, conn *grpc.ClientConn, rpcTimeout time.Duration) {
+	ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
+	snapshot, err := clustertopology.Fetch(ctx, metadatav1.NewClusterMetadataServiceClient(conn))
+	cancel()
+	if err != nil {
+		r.fail("replication/live metadata", err)
+		return
+	}
+
+	if len(snapshot.Owners) == 0 {
+		r.fail("replication/live metadata",
+			errors.New("metadata published no shard_to_owners map; the control plane predates Phase 4"))
+		return
+	}
+
+	// The LIVE replication factor is what this leg checks against, not the
+	// config's. The config is launch inventory -- Phase 3 already stopped
+	// treating its node list as runtime truth for exactly this reason -- and
+	// the control plane can be started with an override. What must hold is that
+	// whatever factor the cluster is running, placement is exactly the router's
+	// computation at that factor.
+	liveFactor := int(snapshot.ReplicationFactor)
+	wantOwners := router.AssignShardOwners(cfg.NodeIDs(), cfg.ShardCount, liveFactor)
+	for shard := uint32(0); shard < cfg.ShardCount; shard++ {
+		got := snapshot.Owners[shard]
+		want := wantOwners[shard]
+		if got.Primary != want.Primary || !slices.Equal(got.Replicas, want.Replicas) {
+			r.fail("replication/live metadata", fmt.Errorf(
+				"shard %d owners = {%s %v}, router.AssignShardOwners wants {%s %v}",
+				shard, got.Primary, got.Replicas, want.Primary, want.Replicas))
+			return
+		}
+		if got.Primary != snapshot.ShardMap[shard] {
+			r.fail("replication/live metadata", fmt.Errorf(
+				"shard %d primary %q disagrees with shard_to_node_id %q",
+				shard, got.Primary, snapshot.ShardMap[shard]))
+			return
+		}
+	}
+	detail := fmt.Sprintf(
+		"replication_factor=%d; %d shard(s) carry primary+replica owners matching "+
+			"router.AssignShardOwners exactly", liveFactor, len(snapshot.Owners))
+	if liveFactor != cfg.ReplicationFactor {
+		detail += fmt.Sprintf(" (config says %d; the cluster was started with an override)",
+			cfg.ReplicationFactor)
+	}
+	r.pass("replication/live metadata", detail)
+
+	if liveFactor == 0 {
+		// 0 is a legal, supported configuration. Assert that it is genuinely
+		// unreplicated rather than skipping quietly, so a cluster that was meant
+		// to replicate and silently is not cannot pass this leg.
+		for shard := uint32(0); shard < cfg.ShardCount; shard++ {
+			if len(snapshot.Owners[shard].Replicas) != 0 {
+				r.fail("replication/factor 0", fmt.Errorf(
+					"shard %d has %d replica(s) at a live replication_factor of 0",
+					shard, len(snapshot.Owners[shard].Replicas)))
+				return
+			}
+		}
+		r.pass("replication/factor 0",
+			"no shard has a replica, and no strong-ack write is possible; nothing to prove")
+		return
+	}
+
+	routed, err := pulsekvclient.New(
+		cfg.ControlPlane.Address(),
+		pulsekvclient.WithRefreshInterval(0),
+		pulsekvclient.WithRefreshTimeout(rpcTimeout),
+	)
+	if err != nil {
+		r.fail("replication/client.New", err)
+		return
+	}
+	defer routed.Close()
+
+	// A shard with the full complement of replicas, so the strongest available
+	// ack count is exercised rather than whatever the first shard happens to have.
+	var chosen uint32
+	found := false
+	for shard := uint32(0); shard < cfg.ShardCount && !found; shard++ {
+		if len(snapshot.Owners[shard].Replicas) == liveFactor {
+			chosen, found = shard, true
+		}
+	}
+	if !found {
+		r.fail("replication/shard selection", fmt.Errorf(
+			"no shard has the live cluster's %d replica(s); it has %d live node(s)",
+			liveFactor, len(snapshot.Nodes)))
+		return
+	}
+
+	owners := snapshot.Owners[chosen]
+	prefix := fmt.Sprintf("smoke:replication:%d:%d", os.Getpid(), time.Now().UnixNano())
+	key, err := keyForShard(prefix, chosen, cfg.ShardCount)
+	if err != nil {
+		r.fail("replication/sample key", err)
+		return
+	}
+	value := deterministicValue(8192, 41)
+	acks := uint32(len(owners.Replicas))
+
+	acked, err := putWithAckConverging(routed, key, value, acks, rpcTimeout)
+	if err != nil {
+		r.fail("replication/PutWithAck", fmt.Errorf(
+			"strong-ack write to shard %d (primary %s, %d replica(s)): %w",
+			chosen, owners.Primary, acks, err))
+		return
+	}
+	if acked < acks {
+		r.fail("replication/PutWithAck", fmt.Errorf(
+			"reported %d ack(s) for %d requested; an OK response must not undercount", acked, acks))
+		return
+	}
+	r.pass("replication/PutWithAck", fmt.Sprintf(
+		"shard %d: %d of %d replica(s) acked before the write returned", chosen, acked, acks))
+
+	// The proof itself: direct NodeService.Get on each holder's own address.
+	var problems []string
+	for _, holder := range append([]string{owners.Primary}, owners.Replicas...) {
+		address := snapshot.Nodes[holder]
+		if address == "" {
+			problems = append(problems, fmt.Sprintf("%s has no address", holder))
+			continue
+		}
+		directConn, err := dial(address)
+		if err != nil {
+			problems = append(problems, fmt.Sprintf("dial %s at %s: %v", holder, address, err))
+			continue
+		}
+		resp, err := directGet(nodev1.NewNodeServiceClient(directConn), key, rpcTimeout)
+		directConn.Close()
+		switch {
+		case err != nil:
+			problems = append(problems, fmt.Sprintf("direct Get on %s: %v", holder, err))
+		case !resp.GetFound():
+			problems = append(problems, fmt.Sprintf("%s returned found=false", holder))
+		case !bytes.Equal(resp.GetValue(), value):
+			problems = append(problems, fmt.Sprintf(
+				"%s returned %d bytes with different contents", holder, len(resp.GetValue())))
+		}
+	}
+	if len(problems) > 0 {
+		r.fail("replication/direct replica reads", errors.New(strings.Join(problems, "; ")))
+		return
+	}
+	r.pass("replication/direct replica reads", fmt.Sprintf(
+		"shard %d is byte-identical on its primary %s and all %d replica(s) %v, read directly "+
+			"rather than through the SDK", chosen, owners.Primary, acks, owners.Replicas))
+
+	// Asking for more acks than exist must fail fast and specifically, not hang
+	// until the deadline and then look like a network problem.
+	overKey, err := keyForShard(prefix+":over", chosen, cfg.ShardCount)
+	if err != nil {
+		r.fail("replication/over-ack sample key", err)
+		return
+	}
+	ctx, cancel = context.WithTimeout(context.Background(), rpcTimeout)
+	_, err = routed.PutWithAck(ctx, overKey, value, acks+1)
+	cancel()
+	r.wantCode("replication/PutWithAck(too many acks)", err, codes.InvalidArgument, "replica")
+}
+
+// putWithAckConverging absorbs the one bounded window in which a primary can
+// legitimately refuse a strong-ack write: the SDK and each data node learn
+// ownership independently, so for up to one node poll interval after a
+// membership change the primary may not yet know it is the primary, or may see
+// fewer replicas than the map does. It says which, with INVALID_ARGUMENT, and
+// the write is idempotent, so retrying is the correct response.
+//
+// Only INVALID_ARGUMENT is retried. DEADLINE_EXCEEDED means the fan-out really
+// did fall short, which is a finding rather than a timing artefact.
+func putWithAckConverging(routed *pulsekvclient.Client, key, value []byte,
+	acks uint32, rpcTimeout time.Duration) (uint32, error) {
+	deadline := time.Now().Add(10 * time.Second)
+	var lastErr error
+	for attempt := 1; ; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
+		acked, err := routed.PutWithAck(ctx, key, value, acks)
+		cancel()
+		if err == nil {
+			return acked, nil
+		}
+		if status.Code(err) != codes.InvalidArgument {
+			return 0, err
+		}
+		lastErr = err
+		if time.Now().After(deadline) {
+			return 0, fmt.Errorf("primary did not converge on its replica set after %d attempt(s): %w",
+				attempt, lastErr)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// keyForShard finds a deterministic key that hashes into want.
+func keyForShard(prefix string, want, shardCount uint32) ([]byte, error) {
+	const maxCandidates = 1_000_000
+	for candidate := 0; candidate < maxCandidates; candidate++ {
+		key := []byte(fmt.Sprintf("%s:%d", prefix, candidate))
+		if router.ShardForKey(key, shardCount) == want {
+			return key, nil
+		}
+	}
+	return nil, fmt.Errorf("no key hashed into shard %d after %d candidates", want, maxCandidates)
 }
 
 type liveRoutingTopology struct {
 	generation uint64
 	nodes      map[string]string
 	shardMap   map[uint32]string
+	owners     map[uint32]router.ShardOwners
+}
+
+// nonHolder returns a node that holds no copy of shard -- neither its primary
+// nor one of its replicas -- or "" when every live node holds one.
+//
+// Phase 2's version of this only skipped the owner, because before replication
+// "not the owner" and "does not have the key" were the same statement. They are
+// not any more: a replica is supposed to have the key, so picking one and
+// asserting a miss would fail for the best possible reason. Excluding the whole
+// owner set keeps the assertion meaningful and makes it strictly stronger --
+// the claim becomes "this key is on its holders and on nothing else".
+func nonHolder(shard uint32, topology liveRoutingTopology, sortedIDs []string) string {
+	holders := map[string]bool{topology.shardMap[shard]: true}
+	for _, replica := range topology.owners[shard].Replicas {
+		holders[replica] = true
+	}
+	for _, id := range sortedIDs {
+		if !holders[id] {
+			return id
+		}
+	}
+	return ""
 }
 
 func fetchLiveRoutingTopology(md metadatav1.ClusterMetadataServiceClient,
@@ -712,6 +959,7 @@ func fetchLiveRoutingTopology(md metadatav1.ClusterMetadataServiceClient,
 		generation: snapshot.Generation,
 		nodes:      snapshot.Nodes,
 		shardMap:   snapshot.ShardMap,
+		owners:     snapshot.Owners,
 	}, nil
 }
 
@@ -771,15 +1019,6 @@ func routingSampleKeys(prefix string, count int, shardCount uint32,
 		return nil, fmt.Errorf("found only %d of %d requested routing sample keys", len(keys), count)
 	}
 	return keys, nil
-}
-
-func differentNode(owner string, sortedNodeIDs []string) string {
-	for _, id := range sortedNodeIDs {
-		if id != owner {
-			return id
-		}
-	}
-	return ""
 }
 
 func directGet(client nodev1.NodeServiceClient, key []byte,

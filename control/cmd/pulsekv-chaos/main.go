@@ -1,9 +1,19 @@
-// Command pulsekv-chaos is the passive Phase 3 correctness verifier.
+// Command pulsekv-chaos is the passive Phase 3/4 correctness verifier.
 //
 // It never starts, stops, or signals cluster processes. deploy/chaos-test.sh
 // owns lifecycle mutation; this command seeds stable data, sustains reads, and
 // proves each observed removal/rejoin topology epoch before advancing an atomic
 // progress file.
+//
+// Phase 4 added the promotion proof. Every Phase 3 assertion is unchanged and
+// still runs; what is new is a second key set, seeded on shards the TARGET
+// primaries with require_replica_acks = replication_factor, so the write is
+// provably on every replica before the kill rather than racing in-flight async
+// replication. After the removal those keys must be served byte-for-byte by the
+// promoted replica, and after the rejoin by the restarted target -- which is
+// only possible if newly-owned-shard catch-up actually refilled its empty
+// engine. At replication factor 0 there is nothing to promote and the whole
+// section is skipped, which keeps 0 a legal, exercised configuration.
 package main
 
 import (
@@ -27,7 +37,9 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 
 	metadatav1 "pulsekv/control/gen/metadata/v1"
 	nodev1 "pulsekv/control/gen/node/v1"
@@ -53,6 +65,8 @@ type settings struct {
 	refreshInterval   time.Duration
 	rpcTimeout        time.Duration
 	workers           int
+	promotionKeys     int
+	catchUpTimeout    time.Duration
 }
 
 func main() {
@@ -68,6 +82,11 @@ func main() {
 	flag.DurationVar(&cfg.refreshInterval, "refresh-interval", 50*time.Millisecond, "SDK metadata refresh interval")
 	flag.DurationVar(&cfg.rpcTimeout, "rpc-timeout", 2*time.Second, "deadline for each metadata or data RPC")
 	flag.IntVar(&cfg.workers, "workers", 4, "concurrent stable-key read workers")
+	flag.IntVar(&cfg.promotionKeys, "promotion-keys", 8,
+		"target-primaried shards to seed with strong-ack writes for the promotion proof "+
+			"(0 disables it; ignored when the cluster's replication factor is 0)")
+	flag.DurationVar(&cfg.catchUpTimeout, "catch-up-timeout", 20*time.Second,
+		"how long to wait for a rejoined target to backfill its promotion keys from a peer")
 	flag.Parse()
 
 	if err := cfg.validate(); err != nil {
@@ -126,6 +145,10 @@ func (c settings) validate() error {
 		return errors.New("--rpc-timeout must be positive")
 	case c.workers <= 0:
 		return errors.New("--workers must be positive")
+	case c.promotionKeys < 0:
+		return errors.New("--promotion-keys must not be negative")
+	case c.catchUpTimeout <= 0:
+		return errors.New("--catch-up-timeout must be positive")
 	default:
 		return nil
 	}
@@ -154,6 +177,14 @@ type runReport struct {
 	BaselineProof       epochProofReport   `json:"baseline_proof"`
 	Transitions         []transitionReport `json:"transitions"`
 	Load                loadReport         `json:"load"`
+
+	// Phase 4.
+	ReplicationFactor uint32 `json:"replication_factor"`
+	PromotionKeys     int    `json:"promotion_keys"`
+	// Skipped is the honest record of why no promotion was proven, so a passing
+	// report at replication factor 0 cannot be mistaken for a passing report
+	// that actually exercised promotion.
+	PromotionSkipped string `json:"promotion_skipped,omitempty"`
 }
 
 type transitionReport struct {
@@ -166,6 +197,35 @@ type transitionReport struct {
 	MovedShards    int              `json:"moved_shards"`
 	StableShards   int              `json:"stable_shards"`
 	Proof          epochProofReport `json:"routing_proof"`
+	Promotion      *promotionReport `json:"promotion_proof,omitempty"`
+}
+
+// promotionReport records that the keys written before a kill were still served,
+// byte for byte, by whichever node took over -- the promoted replica after a
+// removal, the restarted target after a rejoin.
+type promotionReport struct {
+	Kind          string `json:"kind"` // "replica-promotion" or "catch-up-after-rejoin"
+	Shards        int    `json:"shards"`
+	KeysVerified  int    `json:"keys_verified"`
+	ElapsedMillis int64  `json:"elapsed_millis"`
+	// A worked example, so the report shows a real placement rather than only
+	// a count that passed.
+	ExampleShard    uint32 `json:"example_shard"`
+	ExamplePrevious string `json:"example_previous_primary"`
+	ExampleNow      string `json:"example_new_primary"`
+}
+
+// promotionEntry is one key deliberately placed on a shard the target primaries,
+// written with require_replica_acks so it is provably on every replica before
+// the target is killed. Without the strong ack this proof would be racing
+// asynchronous replication, and a pass would mean nothing.
+type promotionEntry struct {
+	key   []byte
+	base  string // value stem; the round suffix makes each cycle's bytes distinct
+	value []byte
+	shard uint32
+	// replicas is the placement this key was last strong-ack seeded against.
+	replicas []string
 }
 
 type epochProofReport struct {
@@ -248,6 +308,7 @@ func run(ctx context.Context, cfg settings) (report runReport, runErr error) {
 	report.BaselineFingerprint = hex.EncodeToString(baseline.Fingerprint)
 	report.BaselineNodes = sortedNodeIDs(baseline.Nodes)
 	report.ShardCount = baseline.ShardCount
+	report.ReplicationFactor = baseline.ReplicationFactor
 
 	targetShards := shardsOwnedBy(baseline, cfg.target)
 	report.TargetOwnedShards = len(targetShards)
@@ -274,10 +335,21 @@ func run(ctx context.Context, cfg settings) (report runReport, runErr error) {
 		}
 	}()
 
-	fmt.Println("=== PulseKV Phase 3 chaos verifier ===")
+	promotion, skipReason := buildPromotionEntries(baseline, cfg.target, targetShards,
+		namespace, cfg.promotionKeys)
+	report.PromotionKeys = len(promotion)
+	report.PromotionSkipped = skipReason
+
+	fmt.Println("=== PulseKV Phase 3/4 chaos verifier ===")
 	fmt.Printf("baseline      generation %d; %d nodes; %d shards; target %s owns %d\n",
 		baseline.Generation, len(baseline.Nodes), baseline.ShardCount, cfg.target, len(targetShards))
 	fmt.Printf("stable set    %d immutable survivor-owned keys; %d workers\n", len(stable), cfg.workers)
+	if skipReason != "" {
+		fmt.Printf("promotion     SKIPPED: %s\n", skipReason)
+	} else {
+		fmt.Printf("promotion     %d target-primaried shard(s), replication factor %d, "+
+			"strong-ack seeded\n", len(promotion), baseline.ReplicationFactor)
+	}
 
 	if err := seedStableKeys(ctx, cluster, stable, cfg.rpcTimeout); err != nil {
 		return report, err
@@ -294,6 +366,13 @@ func run(ctx context.Context, cfg settings) (report runReport, runErr error) {
 		stopLoad()
 		loadWG.Wait()
 	}()
+
+	// Seeded BEFORE readiness is published, and re-seeded before every later
+	// removal, because the shell mutates the cluster the moment it sees the
+	// progress count. A key written after that signal would be racing the kill.
+	if err := seedPromotionKeys(ctx, cluster, promotion, baseline, cfg); err != nil {
+		return report, err
+	}
 	if err := writeProgress(cfg.readyFile, 0); err != nil {
 		return report, fmt.Errorf("publish readiness: %w", err)
 	}
@@ -323,20 +402,30 @@ func run(ctx context.Context, cfg settings) (report runReport, runErr error) {
 		if err != nil {
 			return report, fmt.Errorf("cycle %d removal routing proof: %w", cycle, err)
 		}
+		// The Phase 4 headline: the keys that were on the target are still
+		// there, byte for byte, on whichever replica was promoted. Asserted
+		// against the physical node the new map names, not through the SDK.
+		promotionProof, err := verifyPromotion(ctx, previous, removed, promotion,
+			"replica-promotion", cfg.rpcTimeout, cfg.catchUpTimeout)
+		if err != nil {
+			return report, fmt.Errorf("cycle %d promotion proof: %w", cycle, err)
+		}
+
 		elapsed := time.Since(transitionStarted)
 		report.Transitions = append(report.Transitions, transitionReport{
 			Index: transitionIndex, Cycle: cycle, Kind: "removal",
 			FromGeneration: previous.Generation, ToGeneration: removed.Generation,
 			ElapsedMillis: elapsed.Milliseconds(), MovedShards: movement.moved,
-			StableShards: movement.stable, Proof: proof,
+			StableShards: movement.stable, Proof: proof, Promotion: promotionProof,
 		})
 		report.TransitionsVerified = transitionIndex
 		if err := writeProgress(cfg.readyFile, transitionIndex); err != nil {
 			return report, fmt.Errorf("publish removal progress: %w", err)
 		}
-		fmt.Printf("transition %d/%d removal gen %d->%d in %s: moved=%d stable=%d\n",
+		fmt.Printf("transition %d/%d removal gen %d->%d in %s: moved=%d stable=%d%s\n",
 			transitionIndex, report.TransitionsExpected, previous.Generation, removed.Generation,
-			elapsed.Round(time.Millisecond), movement.moved, movement.stable)
+			elapsed.Round(time.Millisecond), movement.moved, movement.stable,
+			describePromotion(promotionProof))
 		previous = removed
 
 		transitionIndex++
@@ -359,21 +448,41 @@ func run(ctx context.Context, cfg settings) (report runReport, runErr error) {
 		if err != nil {
 			return report, fmt.Errorf("cycle %d rejoin routing proof: %w", cycle, err)
 		}
+		// The restarted target primaries these shards again, and its engine
+		// came up EMPTY -- the spill tier is purged at start, and there is no
+		// WAL. If it answers these keys, the only way it can have them is
+		// newly-owned-shard catch-up, which is the Phase 3 gap Phase 4 owns.
+		catchUpProof, err := verifyPromotion(ctx, previous, rejoined, promotion,
+			"catch-up-after-rejoin", cfg.rpcTimeout, cfg.catchUpTimeout)
+		if err != nil {
+			return report, fmt.Errorf("cycle %d catch-up proof: %w", cycle, err)
+		}
+
 		elapsed = time.Since(transitionStarted)
 		report.Transitions = append(report.Transitions, transitionReport{
 			Index: transitionIndex, Cycle: cycle, Kind: "rejoin",
 			FromGeneration: previous.Generation, ToGeneration: rejoined.Generation,
 			ElapsedMillis: elapsed.Milliseconds(), MovedShards: movement.moved,
-			StableShards: movement.stable, Proof: proof,
+			StableShards: movement.stable, Proof: proof, Promotion: catchUpProof,
 		})
 		report.TransitionsVerified = transitionIndex
 		if err := writeProgress(cfg.readyFile, transitionIndex); err != nil {
 			return report, fmt.Errorf("publish rejoin progress: %w", err)
 		}
-		fmt.Printf("transition %d/%d rejoin  gen %d->%d in %s: moved=%d stable=%d\n",
+		fmt.Printf("transition %d/%d rejoin  gen %d->%d in %s: moved=%d stable=%d%s\n",
 			transitionIndex, report.TransitionsExpected, previous.Generation, rejoined.Generation,
-			elapsed.Round(time.Millisecond), movement.moved, movement.stable)
+			elapsed.Round(time.Millisecond), movement.moved, movement.stable,
+			describePromotion(catchUpProof))
 		previous = rejoined
+
+		// Re-seed for the next cycle's kill. Fresh values on the same keys, so
+		// a stale copy left on some node cannot make the next proof pass.
+		if cycle < cfg.cycles {
+			refreshPromotionValues(promotion, cycle)
+			if err := seedPromotionKeys(ctx, cluster, promotion, rejoined, cfg); err != nil {
+				return report, fmt.Errorf("cycle %d re-seed: %w", cycle+1, err)
+			}
+		}
 	}
 
 	stopLoad()
@@ -537,6 +646,259 @@ func seedStableKeys(ctx context.Context, cluster *sdk.Client, entries []stableEn
 		}
 	}
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4: promotion and catch-up proof
+// ---------------------------------------------------------------------------
+
+// buildPromotionEntries picks deterministic keys on shards the target is the
+// PRIMARY for -- the mirror image of the stable set, which deliberately avoids
+// them. Returns a human-readable reason instead of entries when the proof does
+// not apply, so a skipped run says so rather than silently passing.
+func buildPromotionEntries(snapshot clustertopology.Snapshot, target string,
+	targetShards []uint32, namespace string, want int) ([]promotionEntry, string) {
+	if want == 0 {
+		return nil, "--promotion-keys is 0"
+	}
+	if snapshot.ReplicationFactor == 0 {
+		return nil, "cluster replication factor is 0, so no shard has a replica to promote"
+	}
+	if len(snapshot.Owners) == 0 {
+		return nil, "metadata published no shard owner map; the control plane predates Phase 4"
+	}
+
+	// Only shards that actually have a live replica can prove a promotion. At a
+	// factor above the cluster size some may have none.
+	usable := make([]uint32, 0, len(targetShards))
+	for _, shard := range targetShards {
+		if len(snapshot.Owners[shard].Replicas) > 0 {
+			usable = append(usable, shard)
+		}
+	}
+	if len(usable) == 0 {
+		return nil, fmt.Sprintf("target %q primaries %d shard(s), none with a live replica",
+			target, len(targetShards))
+	}
+	if want > len(usable) {
+		want = len(usable)
+	}
+
+	entries := make([]promotionEntry, 0, want)
+	for i := 0; i < want; i++ {
+		shard := usable[i]
+		key, err := keyForShard(fmt.Sprintf("%s:promotion:%d", namespace, shard),
+			shard, snapshot.ShardCount)
+		if err != nil {
+			return nil, fmt.Sprintf("could not build a key for target-primaried shard %d", shard)
+		}
+		base := fmt.Sprintf("promotion-value:%s:shard%d", namespace, shard)
+		entries = append(entries, promotionEntry{
+			key:      key,
+			base:     base,
+			value:    promotionValue(base, 0),
+			shard:    shard,
+			replicas: append([]string(nil), snapshot.Owners[shard].Replicas...),
+		})
+	}
+	return entries, ""
+}
+
+func promotionValue(base string, round int) []byte {
+	return []byte(fmt.Sprintf("%s:round%d", base, round))
+}
+
+// refreshPromotionValues gives every key fresh bytes between cycles. Reusing
+// the same value would let a stale copy left behind on some node satisfy the
+// next round's assertion without replication or catch-up having done anything.
+func refreshPromotionValues(entries []promotionEntry, round int) {
+	for i := range entries {
+		entries[i].value = promotionValue(entries[i].base, round)
+	}
+}
+
+// seedPromotionKeys writes each promotion key through the SDK with
+// require_replica_acks set to the shard's live replica count.
+//
+// The strong ack is the entire point. With a fire-and-forget write the
+// post-kill assertion would be racing asynchronous replication, and a pass
+// would prove only that the race happened to be won. Requiring every replica to
+// ack first makes the assertion deterministic: the data provably existed on the
+// promoted node before the primary died.
+func seedPromotionKeys(ctx context.Context, cluster *sdk.Client, entries []promotionEntry,
+	snapshot clustertopology.Snapshot, cfg settings) error {
+	for i := range entries {
+		entry := &entries[i]
+		// Re-read from the current snapshot: replica placement can have moved
+		// since the entries were built, and asking for a stale count would fail
+		// with INVALID_ARGUMENT rather than tell us anything useful.
+		replicas := snapshot.Owners[entry.shard].Replicas
+		if len(replicas) == 0 {
+			return fmt.Errorf("promotion shard %d has no live replica to ack", entry.shard)
+		}
+		entry.replicas = append([]string(nil), replicas...)
+
+		acked, err := putWithAckConverging(ctx, cluster, entry.key, entry.value,
+			uint32(len(replicas)), cfg)
+		if err != nil {
+			return fmt.Errorf("strong-ack seed of shard %d (%d replica(s)): %w",
+				entry.shard, len(replicas), err)
+		}
+		if int(acked) < len(replicas) {
+			return fmt.Errorf("strong-ack seed of shard %d reported %d of %d acks",
+				entry.shard, acked, len(replicas))
+		}
+
+		// The ack says the replicas stored it. Verify that directly, against
+		// each replica's own address, rather than believing the count.
+		for _, replica := range replicas {
+			address := snapshot.Nodes[replica]
+			if address == "" {
+				return fmt.Errorf("replica %q of shard %d has no address", replica, entry.shard)
+			}
+			value, found, err := directGet(ctx, address, entry.key, cfg.rpcTimeout)
+			if err != nil {
+				return fmt.Errorf("direct read of shard %d on replica %s: %w", entry.shard, replica, err)
+			}
+			if !found || !bytes.Equal(value, entry.value) {
+				return fmt.Errorf("replica %s acked shard %d but does not hold the value "+
+					"(found=%v, match=%v)", replica, entry.shard, found, bytes.Equal(value, entry.value))
+			}
+		}
+	}
+	return nil
+}
+
+// putWithAckConverging retries a strong-ack write that the primary refuses
+// because it has not yet caught up with the topology.
+//
+// This is not papering over a race; it is the documented shape of the contract.
+// The SDK and each data node learn ownership independently and asynchronously,
+// so for up to one node poll interval after a membership change the primary can
+// legitimately answer "I am not the primary for that shard yet" or "I only see
+// N replicas". The node refuses rather than hanging, and says which case it is;
+// the caller's correct response is to retry, since the write is idempotent.
+//
+// A NON-INVALID_ARGUMENT failure is returned immediately. DEADLINE_EXCEEDED in
+// particular means the fan-out really did fall short, which is a result, not a
+// timing artefact, and retrying past it would hide exactly what this harness
+// exists to catch.
+func putWithAckConverging(ctx context.Context, cluster *sdk.Client, key, value []byte,
+	acks uint32, cfg settings) (uint32, error) {
+	deadline := time.Now().Add(cfg.transitionTimeout)
+	var lastErr error
+	for attempt := 1; ; attempt++ {
+		rpcCtx, cancel := context.WithTimeout(ctx, cfg.rpcTimeout)
+		acked, err := cluster.PutWithAck(rpcCtx, key, value, acks)
+		cancel()
+		if err == nil {
+			return acked, nil
+		}
+		if status.Code(err) != codes.InvalidArgument {
+			return 0, err
+		}
+		lastErr = err
+		if time.Now().After(deadline) {
+			return 0, fmt.Errorf("primary did not converge on its replica set within %s "+
+				"(%d attempt(s)): %w", cfg.transitionTimeout, attempt, lastErr)
+		}
+		if err := waitInterval(ctx, cfg.pollInterval); err != nil {
+			return 0, err
+		}
+	}
+}
+
+// verifyPromotion asserts that every promotion key is served, byte for byte, by
+// whichever node now primaries its shard -- read directly from that node's own
+// address, never through the SDK, so this cannot pass on routing alone.
+//
+// A bounded retry is deliberate and means different things on each path. After
+// a removal the promoted replica already holds the data (the strong ack proved
+// it) and the retry only absorbs the moment between the map changing and the
+// node's own view catching up. After a rejoin the restarted target starts with
+// an empty engine and has to backfill from a peer, so the retry is genuinely
+// waiting on catch-up.
+func verifyPromotion(ctx context.Context, before, after clustertopology.Snapshot,
+	entries []promotionEntry, kind string, rpcTimeout, budget time.Duration) (*promotionReport, error) {
+	if len(entries) == 0 {
+		return nil, nil
+	}
+
+	started := time.Now()
+	deadline := time.Now().Add(budget)
+	report := &promotionReport{Kind: kind, Shards: len(entries)}
+
+	for _, entry := range entries {
+		owner := after.ShardMap[entry.shard]
+		if owner == "" {
+			return nil, fmt.Errorf("shard %d has no owner after the transition", entry.shard)
+		}
+		address := after.Nodes[owner]
+		if address == "" {
+			return nil, fmt.Errorf("new owner %q of shard %d has no address", owner, entry.shard)
+		}
+
+		// Promotion means the shard went to the node the PREVIOUS map ranked
+		// first among its replicas -- not merely to some node that answers.
+		if kind == "replica-promotion" {
+			replicas := before.Owners[entry.shard].Replicas
+			if len(replicas) == 0 {
+				return nil, fmt.Errorf("shard %d had no replica to promote", entry.shard)
+			}
+			if owner != replicas[0] {
+				return nil, fmt.Errorf(
+					"shard %d was promoted to %q, but its top-ranked replica was %q",
+					entry.shard, owner, replicas[0])
+			}
+		}
+
+		var lastErr error
+		verified := false
+		for !verified {
+			value, found, err := directGet(ctx, address, entry.key, rpcTimeout)
+			switch {
+			case err != nil:
+				lastErr = fmt.Errorf("direct read on %s: %w", owner, err)
+			case !found:
+				lastErr = fmt.Errorf("new owner %s does not hold the key", owner)
+			case !bytes.Equal(value, entry.value):
+				// Wrong bytes is never a timing artefact. Fail immediately
+				// rather than retrying until the budget runs out.
+				return nil, fmt.Errorf("shard %d: new owner %s returned %d bytes that "+
+					"differ from the acked value", entry.shard, owner, len(value))
+			default:
+				verified = true
+			}
+			if verified {
+				break
+			}
+			if time.Now().After(deadline) {
+				return nil, fmt.Errorf("shard %d (%s): %w", entry.shard, kind, lastErr)
+			}
+			if err := waitInterval(ctx, 100*time.Millisecond); err != nil {
+				return nil, err
+			}
+		}
+
+		report.KeysVerified++
+		if report.ExamplePrevious == "" {
+			report.ExampleShard = entry.shard
+			report.ExamplePrevious = before.ShardMap[entry.shard]
+			report.ExampleNow = owner
+		}
+	}
+
+	report.ElapsedMillis = time.Since(started).Milliseconds()
+	return report, nil
+}
+
+func describePromotion(report *promotionReport) string {
+	if report == nil {
+		return ""
+	}
+	return fmt.Sprintf(" %s=%d/%d key(s) (shard %d: %s -> %s, %dms)",
+		report.Kind, report.KeysVerified, report.Shards,
+		report.ExampleShard, report.ExamplePrevious, report.ExampleNow, report.ElapsedMillis)
 }
 
 func startStableLoad(ctx context.Context, cluster *sdk.Client, entries []stableEntry,
@@ -797,7 +1159,7 @@ func verifyEpoch(ctx context.Context, cluster *sdk.Client, snapshot,
 		}
 
 		nonOwner, outcome, err := verifyNonOwner(deadlineCtx, snapshot, baseline,
-			target, owner, key, cfg.rpcTimeout)
+			target, owner, key, shard, cfg.rpcTimeout)
 		if err != nil {
 			lastErr = err
 			_ = waitInterval(deadlineCtx, cfg.pollInterval)
@@ -821,10 +1183,20 @@ func keyForShard(prefix string, want, shardCount uint32) ([]byte, error) {
 }
 
 func verifyNonOwner(ctx context.Context, snapshot, baseline clustertopology.Snapshot,
-	target, owner string, key []byte, timeout time.Duration) (string, string, error) {
+	target, owner string, key []byte, shard uint32, timeout time.Duration) (string, string, error) {
+	// Skip every node that HOLDS this shard, not just its primary. Before
+	// Phase 4 those were the same set; now a replica is supposed to have the
+	// key, so probing one would turn working replication into a failed
+	// exclusion proof -- intermittently, depending on which shard the epoch's
+	// key landed on.
+	holders := map[string]bool{owner: true}
+	for _, replica := range snapshot.Owners[shard].Replicas {
+		holders[replica] = true
+	}
+
 	ids := sortedNodeIDs(snapshot.Nodes)
 	for _, id := range ids {
-		if id == owner {
+		if holders[id] {
 			continue
 		}
 		_, found, err := directGet(ctx, snapshot.Nodes[id], key, timeout)
@@ -837,13 +1209,14 @@ func verifyNonOwner(ctx context.Context, snapshot, baseline clustertopology.Snap
 		return id, "miss", nil
 	}
 
-	// A two-node baseline leaves one live node while the target is removed, so
-	// there is no live non-owner to query. Probe the removed endpoint instead:
-	// an explicit miss is preferred, while connection refusal is an equally
-	// strong exclusion proof for an endpoint that membership has removed.
+	// A two-node baseline leaves one live node while the target is removed, and
+	// a fully-replicated shard leaves no live node without a copy. Either way
+	// there is no live non-holder to query, so probe the removed endpoint
+	// instead: an explicit miss is preferred, while connection refusal is an
+	// equally strong exclusion proof for an endpoint membership has removed.
 	address := baseline.Nodes[target]
-	if address == "" || target == owner {
-		return "", "", errors.New("topology has no non-owner endpoint for routing proof")
+	if address == "" || holders[target] {
+		return "", "", errors.New("topology has no non-holder endpoint for routing proof")
 	}
 	_, found, err := directGet(ctx, address, key, timeout)
 	if err != nil {

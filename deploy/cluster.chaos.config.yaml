@@ -1,6 +1,11 @@
-# Eight-node local fixture for Phase 3 membership/elasticity chaos runs.
-# It uses the same service and gossip ranges as the four-node fast-loop config,
-# extended contiguously. Run only one fixture at a time.
+# Eight-node local fixture for Phase 3 membership/elasticity and Phase 4
+# replication/promotion chaos runs. It uses the same service and gossip ranges
+# as the four-node fast-loop config, extended contiguously. Run only one fixture
+# at a time.
+#
+# replication_factor here is the default the fixture ships with; the chaos runs
+# override it per boot with run-local-cluster.sh --replication-factor, which is
+# how the same fixture is exercised at 0, 1, and 2 without three config files.
 
 control_plane:
   host: 127.0.0.1
@@ -11,6 +16,8 @@ membership:
   cluster_name: pulsekv-v2-chaos
 
 shard_count: 256
+
+replication_factor: 1
 
 engine:
   ram_budget_bytes: 268435456

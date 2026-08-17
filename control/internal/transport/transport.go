@@ -8,6 +8,7 @@ package transport
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 
@@ -48,23 +49,63 @@ func ReadModeForSize(size int) ReadMode {
 	return ReadUnary
 }
 
+// ErrChunkedAcksUnsupported is returned when a caller asks for replica acks on
+// a value too large for the unary path.
+//
+// PutChunk carries no require_replica_acks field: a chunked write is a
+// multi-megabyte value, where blocking the client on replica fan-out is the
+// wrong trade in every case Phase 4 contemplates. Refusing loudly is better
+// than accepting the call and quietly downgrading it to fire-and-forget, which
+// would hand the caller a durability guarantee that was never provided.
+var ErrChunkedAcksUnsupported = errors.New(
+	"transport: require_replica_acks is not supported for values above the unary limit; " +
+		"PutChunked always replicates asynchronously")
+
 // Put writes value with Put when it fits under the unary wire limit and with
-// PutChunked otherwise.
+// PutChunked otherwise. Replication, if the receiving node is a primary, is
+// asynchronous — see PutWithAck for the blocking variant.
 func Put(ctx context.Context, client nodev1.NodeServiceClient, key, value []byte, opts ...grpc.CallOption) error {
+	_, err := PutWithAck(ctx, client, key, value, 0, opts...)
+	return err
+}
+
+// PutWithAck writes value and, when acks > 0 and the receiving node is the
+// primary for the key's shard, blocks until that many replicas have stored it.
+// It returns how many replicas acked before the node responded, which is always
+// 0 for acks == 0 because nothing was waited for.
+//
+// acks greater than the primary's live replica count fails with
+// INVALID_ARGUMENT; an ack shortfall or timeout fails with DEADLINE_EXCEEDED.
+// Both mean "less replicated than you asked for" rather than "not written":
+// the primary committed locally before it forwarded anything, and does not roll
+// that back.
+func PutWithAck(ctx context.Context, client nodev1.NodeServiceClient, key, value []byte,
+	acks uint32, opts ...grpc.CallOption) (replicasAcked uint32, err error) {
 	if len(value) <= UnaryValueLimit {
-		_, err := client.Put(ctx, &nodev1.PutRequest{Key: key, Value: value}, opts...)
-		return err
+		resp, err := client.Put(ctx, &nodev1.PutRequest{
+			Key:                key,
+			Value:              value,
+			RequireReplicaAcks: acks,
+		}, opts...)
+		if err != nil {
+			return 0, err
+		}
+		return resp.GetReplicasAcked(), nil
+	}
+	if acks > 0 {
+		return 0, fmt.Errorf("%w (value is %d bytes, limit is %d)",
+			ErrChunkedAcksUnsupported, len(value), UnaryValueLimit)
 	}
 
 	// This form avoids overflowing len(value)+ChunkSize-1 for an extremely
 	// large input on a 64-bit client.
 	totalChunks := 1 + (len(value)-1)/ChunkSize
 	if uint64(totalChunks) > uint64(^uint32(0)) {
-		return fmt.Errorf("transport: value requires %d chunks, protocol limit is %d", totalChunks, uint64(^uint32(0)))
+		return 0, fmt.Errorf("transport: value requires %d chunks, protocol limit is %d", totalChunks, uint64(^uint32(0)))
 	}
 	stream, err := client.PutChunked(ctx, opts...)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	for i := 0; i < totalChunks; i++ {
@@ -80,12 +121,16 @@ func Put(ctx context.Context, client nodev1.NodeServiceClient, key, value []byte
 			chunk.Key = key
 		}
 		if err := stream.Send(chunk); err != nil {
-			return err
+			return 0, err
 		}
 	}
 
-	_, err = stream.CloseAndRecv()
-	return err
+	// Always 0: PutChunked replicates in the background, so there is nothing to
+	// report having waited for.
+	if _, err := stream.CloseAndRecv(); err != nil {
+		return 0, err
+	}
+	return 0, nil
 }
 
 // Get reads key using the automatic unary-then-chunked strategy. A miss is

@@ -196,15 +196,51 @@ func (c *Client) Get(ctx context.Context, key []byte) (value []byte, found bool,
 
 // Put writes key and value to the key's owning node. Values above the unary
 // limit use the chunked transport transparently.
+//
+// The owning node commits locally and answers immediately; if it is the primary
+// for the key's shard it then replicates in the background. Callers who need
+// the write to be on replicas before Put returns should use PutWithAck.
 func (c *Client) Put(ctx context.Context, key, value []byte) error {
+	_, err := c.putWithAck(ctx, key, value, 0)
+	return err
+}
+
+// PutWithAck writes key and value and blocks until acks replicas have stored
+// it, returning how many actually acked.
+//
+// This is the design doc's "optional stronger mode": ordinary cache writes
+// should not pay replication latency, but a caller storing something a
+// recompute cannot replace can choose to. Concretely:
+//
+//   - acks == 0 behaves exactly like Put and returns 0. Nothing was waited for,
+//     so nothing is claimed.
+//   - acks > 0 returns only once that many replicas have the value. The count
+//     returned can exceed acks when replicas ack faster than the primary can
+//     stop counting.
+//   - acks above the shard's live replica count fails with INVALID_ARGUMENT
+//     rather than blocking until the deadline.
+//
+// An error from a strong-ack write does NOT mean the write was lost. The
+// primary commits locally before forwarding anything and never rolls that back,
+// so a failure here means "stored, but less replicated than you asked for".
+// Retrying is safe; the write is idempotent.
+//
+// Replica addresses are deliberately not the SDK's concern. It routes to the
+// primary exactly as it always has, and the primary owns the fan-out.
+func (c *Client) PutWithAck(ctx context.Context, key, value []byte, acks uint32) (uint32, error) {
+	return c.putWithAck(ctx, key, value, acks)
+}
+
+func (c *Client) putWithAck(ctx context.Context, key, value []byte, acks uint32) (uint32, error) {
 	node, err := c.clientForKey(key)
 	if err != nil {
-		return err
+		return 0, err
 	}
-	if err := transport.Put(ctx, node, key, value); err != nil {
-		return fmt.Errorf("put key: %w", err)
+	acked, err := transport.PutWithAck(ctx, node, key, value, acks)
+	if err != nil {
+		return 0, fmt.Errorf("put key: %w", err)
 	}
-	return nil
+	return acked, nil
 }
 
 // PrefixMatch returns the current values of keys matching prefix across every

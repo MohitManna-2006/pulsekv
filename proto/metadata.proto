@@ -1,10 +1,11 @@
 // ClusterMetadataService — the interface clients and adapters use to discover
 // cluster shape.
 //
-// Phase 3 status: implemented by the Go control plane in control/ and served
+// Phase 4 status: implemented by the Go control plane in control/ and served
 // from a live SWIM gossip membership snapshot. Phase 5 replaces the derived
 // shard map with a Raft-backed state machine. Existing RPC methods remain
-// stable; topology_generation was added compatibly for coherent multi-RPC reads.
+// stable; topology_generation was added compatibly for coherent multi-RPC reads,
+// and Phase 4 added shard_to_owners/replication_factor the same way.
 
 syntax = "proto3";
 
@@ -57,9 +58,29 @@ message GetNodeListResponse {
 
 message GetShardMapRequest {}
 
+// Every node that holds a copy of one shard, in promotion order.
+//
+// Added in Phase 4. `primary` is the node that serves reads and accepts client
+// writes; `replicas` are the nodes the primary forwards those writes to. The
+// list is ordered most-preferred-promotion first, which is simply rendezvous
+// rank 2..N — so when the primary dies, every participant independently derives
+// the same successor from the same live node set, with nothing to coordinate.
+//
+// Fewer than the configured replication_factor entries is NOT an error: it
+// means the cluster currently has fewer live nodes than 1 + replication_factor.
+message ShardOwners {
+  string primary = 1;
+  repeated string replicas = 2;  // ordered, most-preferred-promotion first
+}
+
 message GetShardMapResponse {
   // Phase 3: derived from the live gossip data-node set.
   // Phase 5 replaces the source with Raft-backed authoritative metadata.
+  //
+  // Phase 4 kept this EXACTLY the primary for every shard, so every pre-Phase-4
+  // consumer (the router, the SDK, the smoke test, the chaos watcher) keeps
+  // working with no change at all. The server asserts
+  // shard_to_node_id[s] == shard_to_owners[s].primary before responding.
   map<uint32, string> shard_to_node_id = 1;
 
   // The membership generation used to compute shard_to_node_id. See
@@ -75,4 +96,18 @@ message GetShardMapResponse {
   // cluster shape; clients install that state and fail routing locally instead
   // of retaining stale owners.
   uint32 shard_count = 4;
+
+  // Primary plus ordered replicas for every shard, computed from the same
+  // membership snapshot as shard_to_node_id above. Added in Phase 4; a data
+  // node reads this to learn which peers it must forward its writes to.
+  //
+  // Empty means a pre-Phase-4 server. Present-but-with-no-replicas means
+  // replication_factor is 0, which is a legal configuration: the design doc's
+  // range is 0, 1, or 2.
+  map<uint32, ShardOwners> shard_to_owners = 5;
+
+  // Replicas per shard beyond the primary, as configured. The number actually
+  // present in shard_to_owners can be lower when the cluster has fewer live
+  // nodes than 1 + replication_factor.
+  uint32 replication_factor = 6;
 }

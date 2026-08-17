@@ -42,11 +42,11 @@
 # sidecar must join the gossip ring before ClusterMetadataService publishes it,
 # and a terminal leave/death removes it without changing this file.
 #
-# There is no replication factor or explicit shard assignment here:
-#   Phase 4  adds replication factor
-#   Phase 5  a Raft state machine replaces this file as the source of the shard map
-# The ClusterMetadataService methods remain stable; a content-derived topology
-# fingerprint prevents clients from combining epochs across its two calls.
+# Phase 4 added replication_factor below. There is still no explicit shard
+# assignment here: Phase 5's Raft state machine replaces this file as the source
+# of the shard map. The ClusterMetadataService methods remain stable; a
+# content-derived topology fingerprint prevents clients from combining epochs
+# across its two calls.
 
 control_plane:
   # host is optional and defaults to 127.0.0.1.
@@ -73,6 +73,29 @@ membership:
 # Unrelated to v1's 256 intra-process hashtable shards, which exist for lock
 # striping inside one process.
 shard_count: 256
+
+# ---------------------------------------------------------------------------
+# Replication (Phase 4)
+# ---------------------------------------------------------------------------
+# Replicas per shard BEYOND the primary. The design doc's range is 0, 1, or 2.
+#
+#   0  no replication at all; a node's data dies with it, exactly as in Phase 3
+#   1  one extra copy; survives one node loss (the default)
+#   2  two extra copies; survives two
+#
+# The control plane derives the replica set from the same rendezvous ranking
+# that picks the primary -- ranks 2..N of the same argmax -- so when a primary
+# dies, every participant independently derives the same successor with nothing
+# to coordinate. shard_to_node_id stays exactly the primary, so this setting is
+# invisible to anything that only routes reads and writes.
+#
+# Nodes learn their replica peers by polling ClusterMetadataService; that is what
+# run-local-cluster.sh's --metadata-addr wiring is for. A node started without
+# it does not replicate, whatever this says.
+#
+# 0 IS A LEGAL, EXERCISED SETTING, and it is distinct from omitting the key
+# (which defaults to 1). deploy/chaos-test.sh is run at 0 as well as at 1 and 2.
+replication_factor: 1
 
 # ---------------------------------------------------------------------------
 # Data-plane engine settings (Phase 1)

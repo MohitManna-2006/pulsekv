@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# End-to-end smoke test for the running Phase 3 dev cluster.
+# End-to-end smoke test for the running Phase 3/4 dev cluster.
 #
 #   deploy/run-local-cluster.sh
 #   deploy/smoke-test.sh [--config PATH] [--no-install] [--skip-build]
@@ -11,6 +11,12 @@
 #              generated stubs, independently reproduces the HRW shard map,
 #              writes through the public SDK, and directly proves each sample
 #              key hit its predicted owner and missed a different node.
+#              Phase 4 adds the replication leg: a strong-ack Put, then a
+#              DIRECT NodeService.Get against each replica's own address --
+#              never through the SDK, which only ever talks to primaries -- so
+#              a hit there can only mean the bytes were really replicated.
+#              At replication_factor 0 it instead asserts that no shard has a
+#              replica, so an unreplicated cluster cannot pass by omission.
 #   2. Python -- the adapters package health-checks the Go control plane and a
 #              C++ node, proving both cross-language boundaries.
 #   3. grpcurl -- optional; only runs if grpcurl is on PATH. Verifies server

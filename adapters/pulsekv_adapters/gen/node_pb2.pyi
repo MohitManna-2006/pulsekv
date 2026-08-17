@@ -41,34 +41,42 @@ class GetResponse(_message.Message):
     def __init__(self, found: _Optional[bool] = ..., value: _Optional[bytes] = ...) -> None: ...
 
 class PutRequest(_message.Message):
-    __slots__ = ("key", "value")
+    __slots__ = ("key", "value", "from_replication", "require_replica_acks")
     KEY_FIELD_NUMBER: _ClassVar[int]
     VALUE_FIELD_NUMBER: _ClassVar[int]
+    FROM_REPLICATION_FIELD_NUMBER: _ClassVar[int]
+    REQUIRE_REPLICA_ACKS_FIELD_NUMBER: _ClassVar[int]
     key: bytes
     value: bytes
-    def __init__(self, key: _Optional[bytes] = ..., value: _Optional[bytes] = ...) -> None: ...
+    from_replication: bool
+    require_replica_acks: int
+    def __init__(self, key: _Optional[bytes] = ..., value: _Optional[bytes] = ..., from_replication: _Optional[bool] = ..., require_replica_acks: _Optional[int] = ...) -> None: ...
 
 class PutResponse(_message.Message):
-    __slots__ = ("ok", "error")
+    __slots__ = ("ok", "error", "replicas_acked")
     OK_FIELD_NUMBER: _ClassVar[int]
     ERROR_FIELD_NUMBER: _ClassVar[int]
+    REPLICAS_ACKED_FIELD_NUMBER: _ClassVar[int]
     ok: bool
     error: str
-    def __init__(self, ok: _Optional[bool] = ..., error: _Optional[str] = ...) -> None: ...
+    replicas_acked: int
+    def __init__(self, ok: _Optional[bool] = ..., error: _Optional[str] = ..., replicas_acked: _Optional[int] = ...) -> None: ...
 
 class PutChunk(_message.Message):
-    __slots__ = ("key", "chunk_index", "total_chunks", "total_length", "data")
+    __slots__ = ("key", "chunk_index", "total_chunks", "total_length", "data", "from_replication")
     KEY_FIELD_NUMBER: _ClassVar[int]
     CHUNK_INDEX_FIELD_NUMBER: _ClassVar[int]
     TOTAL_CHUNKS_FIELD_NUMBER: _ClassVar[int]
     TOTAL_LENGTH_FIELD_NUMBER: _ClassVar[int]
     DATA_FIELD_NUMBER: _ClassVar[int]
+    FROM_REPLICATION_FIELD_NUMBER: _ClassVar[int]
     key: bytes
     chunk_index: int
     total_chunks: int
     total_length: int
     data: bytes
-    def __init__(self, key: _Optional[bytes] = ..., chunk_index: _Optional[int] = ..., total_chunks: _Optional[int] = ..., total_length: _Optional[int] = ..., data: _Optional[bytes] = ...) -> None: ...
+    from_replication: bool
+    def __init__(self, key: _Optional[bytes] = ..., chunk_index: _Optional[int] = ..., total_chunks: _Optional[int] = ..., total_length: _Optional[int] = ..., data: _Optional[bytes] = ..., from_replication: _Optional[bool] = ...) -> None: ...
 
 class GetChunk(_message.Message):
     __slots__ = ("chunk_index", "total_chunks", "total_length", "data")

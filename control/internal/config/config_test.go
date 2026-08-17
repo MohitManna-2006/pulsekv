@@ -167,6 +167,86 @@ func TestLoadRejectsBadConfigs(t *testing.T) {
 	}
 }
 
+// The whole reason replication_factor is parsed through a pointer: 0 is a
+// setting, not an absence. A config that says 0 must get 0, and a config that
+// says nothing must get the default -- and the two must be distinguishable.
+func TestReplicationFactorDistinguishesZeroFromUnset(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want int
+	}{
+		{"unset defaults", goodConfig, DefaultReplicationFactor},
+		{"explicit zero", goodConfig + "\nreplication_factor: 0\n", 0},
+		{"explicit one", goodConfig + "\nreplication_factor: 1\n", 1},
+		{"explicit two", goodConfig + "\nreplication_factor: 2\n", 2},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := Load(write(t, tc.body))
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.ReplicationFactor != tc.want {
+				t.Fatalf("replication factor = %d, want %d", cfg.ReplicationFactor, tc.want)
+			}
+		})
+	}
+}
+
+func TestReplicationFactorRejectsOutOfRangeValues(t *testing.T) {
+	cases := []struct {
+		name    string
+		value   string
+		wantSub string
+	}{
+		{"negative", "-1", "must not be negative"},
+		{"far above the maximum", "1000", "exceeds the supported maximum"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Load(write(t, goodConfig+"\nreplication_factor: "+tc.value+"\n"))
+			if err == nil || !strings.Contains(err.Error(), tc.wantSub) {
+				t.Fatalf("Load error = %v, want it to mention %q", err, tc.wantSub)
+			}
+		})
+	}
+}
+
+// More replicas than there are other nodes is legal and starts. It just means
+// every shard holds fewer copies than the number implies, which is exactly the
+// kind of thing that looks fine until a node dies.
+func TestReplicationFactorAboveClusterSizeWarnsButLoads(t *testing.T) {
+	cfg, err := Load(write(t, goodConfig+"\nreplication_factor: 5\n"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.ReplicationFactor != 5 {
+		t.Fatalf("replication factor = %d, want 5", cfg.ReplicationFactor)
+	}
+
+	var found bool
+	for _, warning := range cfg.Warnings() {
+		found = found || strings.Contains(warning, "replication_factor")
+	}
+	if !found {
+		t.Fatalf("warnings = %v, want one naming replication_factor", cfg.Warnings())
+	}
+
+	// And the achievable factor must not warn.
+	quiet, err := Load(write(t, goodConfig+"\nreplication_factor: 1\n"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	for _, warning := range quiet.Warnings() {
+		if strings.Contains(warning, "replication_factor") {
+			t.Fatalf("unexpected replication warning at an achievable factor: %s", warning)
+		}
+	}
+}
+
 func TestLoadMissingFile(t *testing.T) {
 	if _, err := Load(filepath.Join(t.TempDir(), "nope.yaml")); err == nil {
 		t.Fatal("Load on a missing file succeeded; want an error")

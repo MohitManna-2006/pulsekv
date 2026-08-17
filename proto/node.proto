@@ -7,7 +7,8 @@
 //
 // This contract is frozen as of Phase 0. Phases 1-8 are written against this
 // shape; add fields and RPCs rather than renaming or removing them. Phase 1
-// added PutChunked/GetChunked and their messages; nothing existing changed.
+// added PutChunked/GetChunked and their messages; Phase 4 added the three
+// replication fields below. Nothing existing changed in either phase.
 //
 // ERROR CHANNEL: gRPC status codes are the sole error channel for every RPC
 // here. A handler either returns OK with a valid response, or a non-OK status
@@ -36,6 +37,10 @@ service NodeService {
   // Point write, for values up to UNARY_VALUE_LIMIT_BYTES. A larger value
   // fails fast with INVALID_ARGUMENT pointing at PutChunked rather than being
   // silently accepted.
+  //
+  // Phase 4: a node that is the current primary for the key's shard also
+  // forwards the write to that shard's replicas. See PutRequest for the two
+  // modes and the loop-prevention rule.
   rpc Put(PutRequest) returns (PutResponse);
 
   // Chunked write for values above the unary limit. Chunks must arrive in
@@ -88,6 +93,28 @@ message GetResponse {
 message PutRequest {
   bytes key = 1;
   bytes value = 2;
+
+  // Set by a primary forwarding this write to one of its replicas; NEVER set
+  // by a client. A node that receives it stores the value and returns, without
+  // forwarding anything itself — that single rule is the whole of the
+  // replication loop prevention.
+  //
+  // This is a cooperation flag, not an authorisation one: a client that sets it
+  // suppresses its own write's replication. Authenticated peer identity is a
+  // production-hardening concern, not a Phase 4 one.
+  bool from_replication = 3;
+
+  // 0 (the default) means the primary commits locally, answers immediately, and
+  // replicates in the background — cache writes should not pay replication
+  // latency. N > 0 means the primary answers only after N replicas have acked,
+  // for callers who would rather pay that latency than lose the write.
+  //
+  // N greater than the primary's current live replica count is INVALID_ARGUMENT
+  // rather than a call that hangs until its deadline. On a timeout or an ack
+  // shortfall the call fails with DEADLINE_EXCEEDED — but note the local write
+  // already happened and is NOT rolled back, so that error means "your write is
+  // less replicated than you asked for", not "your write was lost".
+  uint32 require_replica_acks = 4;
 }
 
 message PutResponse {
@@ -95,11 +122,17 @@ message PutResponse {
   // gRPC status instead — see the ERROR CHANNEL note at the top of this file.
   bool ok = 1;
 
-  // Unused in Phase 1, and deliberately kept rather than removed: the contract
-  // is frozen, and this is the natural place for a future partial-success
-  // report — Phase 4's replication needs to say "committed locally, replica
-  // lagging", which is an OK status with a caveat, not an error.
+  // Still unused, and deliberately kept rather than removed: the contract is
+  // frozen. Phase 4 reported its partial-success information in the dedicated
+  // replicas_acked field below instead, because a machine-readable count is
+  // what a caller can actually act on.
   string error = 2;
+
+  // How many replicas acked before this response was sent. Always 0 for a
+  // require_replica_acks = 0 write: nothing was waited for, so nothing is
+  // claimed. Exactly require_replica_acks (or more) for an OK response to a
+  // strong-ack write.
+  uint32 replicas_acked = 3;
 }
 
 // One frame of a PutChunked stream.
@@ -119,12 +152,22 @@ message PutResponse {
 //                    long; a lie in either direction aborts the stream.
 //   * data         — may be empty only for a zero-length value (one chunk,
 //                    total_length = 0).
+//   * from_replication — chunk 0 only; ignored on later chunks.
 message PutChunk {
   bytes key = 1;
   uint32 chunk_index = 2;
   uint32 total_chunks = 3;
   uint64 total_length = 4;
   bytes data = 5;
+
+  // Same meaning as PutRequest.from_replication, read from chunk 0 only.
+  //
+  // There is deliberately no require_replica_acks counterpart: a chunked write
+  // is by definition a multi-megabyte value, where the async path is the only
+  // one that makes sense. PutChunked therefore always replicates in the
+  // background, and the Go SDK's PutWithAck refuses an oversized value loudly
+  // rather than silently downgrading it to fire-and-forget.
+  bool from_replication = 6;
 }
 
 // One frame of a GetChunked stream. total_chunks and total_length are repeated
