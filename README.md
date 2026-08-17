@@ -311,7 +311,7 @@ pulsekv/
 └── build/              # gitignored — binaries + build/tsan/
 ```
 
-~6K lines total (C + headers + tests + docs).
+~7K lines total (C + headers + tests + docs).
 
 ---
 
@@ -351,7 +351,7 @@ pulsekv/
 | Threading | Up to 16 thread-per-core workers, each with its own epoll and `SO_REUSEPORT` listener | Predictable scaling without cross-thread epoll contention; worker count can match constrained CPU allocations |
 | Store lock | 256 striped mutex shards over 1,024 buckets | Removes unrelated-key contention while keeping bucket capacity and lock granularity independently tunable |
 | Durability | Group-commit over per-write fsync | Throughput target requires batching; same trade-off as Kafka/Postgres |
-| WAL execution | Dedicated writer + per-worker completion eventfds over blocking epoll workers | Keeps filesystem latency off all 16 networking loops while retaining deterministic append order |
+| WAL execution | Dedicated writer + per-worker completion eventfds instead of filesystem calls in epoll workers | Keeps filesystem latency off every networking loop while retaining deterministic append order |
 | Recovery I/O | 256 KiB sequential reads over record-at-a-time reads | Rebuilds the same state with dramatically fewer syscalls and repairs the physical tail before append resumes |
 | Load generation | One epoll loop over 500 sockets | Measures server latency without adding 500 co-located client threads and their scheduler noise |
 | Protocol | Binary fixed-layout, views not copies | No allocation on parse; table copies only after validation |

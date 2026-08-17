@@ -41,6 +41,7 @@
 #define VALUE_CAP                96u
 #define REQUEST_CAP              256u
 #define RESPONSE_CAP             (PK_RESP_HEADER_LEN + VALUE_CAP)
+#define STALL_TIMEOUT_NS          (UINT64_C(30) * UINT64_C(1000000000))
 
 #define TARGET_REQUESTS_PER_SEC  25000.0
 #define TARGET_P99_NS            5000000u
@@ -114,6 +115,7 @@ struct benchmark {
     size_t    completed;
     uint64_t  start_ns;
     uint64_t  finish_ns;
+    uint64_t  last_progress_ns;
     bool      failed;
 };
 
@@ -399,7 +401,9 @@ static bool finish_response(client_t *client)
     const uint8_t *value = value_len > 0
                          ? client->response_buf + PK_RESP_HEADER_LEN : NULL;
 
-    uint64_t finish = client->stage == STAGE_MEASURED ? monotonic_ns() : 0;
+    uint64_t observed = monotonic_ns();
+    benchmark->last_progress_ns = observed;
+    uint64_t finish = client->stage == STAGE_MEASURED ? observed : 0;
     if (!verify_response(client, status, value, value_len))
         return false;
     apply_completed_operation(client);
@@ -646,12 +650,19 @@ int main(int argc, char **argv)
 
     int event_capacity = (int)(config.clients < MAX_EVENTS
                              ? config.clients : MAX_EVENTS);
+    benchmark.last_progress_ns = monotonic_ns();
     while (!benchmark.failed && benchmark.done < config.clients) {
-        int ready = epoll_wait(benchmark.epfd, events, event_capacity, -1);
+        int ready = epoll_wait(benchmark.epfd, events, event_capacity, 1000);
         if (ready < 0) {
             if (errno == EINTR)
                 continue;
             perror("epoll_wait");
+            benchmark.failed = true;
+            break;
+        }
+        if (ready == 0
+            && monotonic_ns() - benchmark.last_progress_ns > STALL_TIMEOUT_NS) {
+            fprintf(stderr, "benchmark made no progress for 30 seconds\n");
             benchmark.failed = true;
             break;
         }

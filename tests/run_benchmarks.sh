@@ -37,7 +37,7 @@ server_pid=$!
 
 ready=false
 for _ in $(seq 1 200); do
-    if exec 3<>/dev/tcp/127.0.0.1/9999; then
+    if { exec 3<>/dev/tcp/127.0.0.1/9999; } 2>/dev/null; then
         exec 3>&-
         exec 3<&-
         ready=true

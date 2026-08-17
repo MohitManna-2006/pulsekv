@@ -104,8 +104,8 @@ prints WAL batch statistics. This also prevents the writer callback from targeti
 **Recovery:** before opening listeners or starting the WAL writer, startup requires a regular WAL
 file, opens it read/write, and scans it with 256 KiB reads. An incomplete record is retained across
 chunk boundaries, so a record split between reads is decoded only after enough bytes arrive. Every
-record must pass magic,
-version, length, opcode, CRC32, and contiguous-sequence validation before its SET/DEL is applied to
+record must pass magic, version, length, opcode, CRC32, and contiguous-sequence validation before
+its SET/DEL is applied to
 the table. The writer then starts at `last_sequence + 1`.
 
 The first invalid or incomplete record is the crash boundary. Recovery truncates the physical file
@@ -139,6 +139,7 @@ approximately 192K/178K/113K requests per second. The 25K throughput goal was ex
 The `<5 ms p99` result is printed as a scorecard rather than asserted: it was met in some read runs,
 while mixed and durable-write tails remained above it because real `fdatasync` latency is included.
 Production numbers require dedicated client CPUs and the intended server core count.
+
 ## 4. Scale & Reliability
 
 Load check: 25K req/sec ÷ 16 threads ≈ 1,560 req/sec/thread. With uniform keys, 16 workers spread

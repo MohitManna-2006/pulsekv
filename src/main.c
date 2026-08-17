@@ -20,7 +20,7 @@
  * Shutdown is a real mechanism rather than signal timing. A signal handler can
  * set a flag, but a thread parked in epoll_wait(-1) will not look at it, so the
  * handler also writes to an eventfd that is registered in every worker's epoll
- * set. That is what actually wakes all sixteen.
+ * set. That is what actually wakes every configured worker.
  *
  * The trigger mode from step 2 is still a compile-time choice, edge-triggered
  * by default:
@@ -1233,10 +1233,11 @@ int main(void)
     }
 
     if (!failed && !stopping())
-        printf("pulsekv listening on 0.0.0.0:%d (%d threads, thread-per-core via "
+        printf("pulsekv listening on 0.0.0.0:%d (%d thread%s, thread-per-core via "
                "SO_REUSEPORT, %s, %u lock shards / %u buckets, async WAL "
                "%s: batch %zu or %zuus)\n",
-               PULSEKV_PORT, (int)worker_count, TRIGGER_NAME,
+               PULSEKV_PORT, (int)worker_count, worker_count == 1 ? "" : "s",
+               TRIGGER_NAME,
                PK_TABLE_SHARDS, PK_TABLE_BUCKETS, wal_path,
                wal_batch, wal_delay_us);
 
