@@ -48,6 +48,7 @@ help:
 	@printf "  $(GREEN)make demo-vllm$(RESET)           Run vLLM KVConnector cross-replica multi-layer cache hit demo\n"
 	@printf "  $(GREEN)make bench$(RESET)               Run bulk transport and cluster benchmarks\n"
 	@printf "  $(GREEN)make chaos$(RESET)               Run node crash/restart fault injection chaos tests\n"
+	@printf "  $(GREEN)make soak$(RESET)                Run Phase 9.4 sustained soak and fault injection harness\n"
 	@printf "\n$(CYAN)Development Environment:$(RESET)\n"
 	@printf "  $(GREEN)make shell$(RESET)               Open an interactive bash shell in the dev container\n"
 	@printf "  $(GREEN)make dev-image$(RESET)           Build or update the pulsekv-v2-dev Docker image\n"
@@ -165,6 +166,10 @@ chaos:
 		deploy/chaos-test.sh --target node-1 --cycles 3 --seed 7 && \
 		deploy/stop-local-cluster.sh \
 	"
+
+.PHONY: soak
+soak:
+	$(RUN_CMD) "deploy/soak-test.sh"
 
 # ---------------------------------------------------------------------------
 # Clean

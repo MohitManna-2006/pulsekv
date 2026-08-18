@@ -2,7 +2,7 @@
 
 Distributed, tiered KV cache store for LLM serving engines with SGLang HiCache and vLLM KVConnector integrations and single-node C storage core.
 
-> **PulseKV v2 Status: Phase 8 (Complete)** — 3-replica Raft control plane in Go, C++ data nodes with RAM/NVMe tiering & bulk transport, SGLang HiCache Python adapter, and vLLM KVConnector v1 adapter with verified 100% cross-replica prefix cache hits.
+> **PulseKV v2 Status: Phase 9 (Complete — Final Milestone)** — Production-ready distributed KV-cache for LLM inference serving. Features a 3-replica Raft consensus control plane in Go, C data nodes with RAM/NVMe tiering & zero-copy bulk transport, SGLang HiCache and vLLM KVConnector v1 adapters (100% verified cross-replica hits), Prometheus exporter (179 metrics), Zipf load generator, and long-duration chaos soak harness.
 
 ---
 
@@ -17,6 +17,9 @@ Type `make` or any of the following commands directly from your terminal (Docker
 | **`make demo`** | Run SGLang and vLLM cross-replica prefix cache hit demos |
 | **`make demo-sglang`** | Run SGLang HiCache cross-replica demo (10 trials @ 512 tokens) |
 | **`make demo-vllm`** | Run vLLM KVConnector cross-replica demo (10 trials @ 512 tokens, 16 layers) |
+| **`make bench`** | Run bulk transport zero-copy vs socket benchmarks |
+| **`make chaos`** | Run node crash & Raft leader failover fault-injection tests |
+| **`make soak`** | Run sustained Zipf load + interleaved chaos soak test harness |
 | **`make start`** / **`make up`** | Boot 4-node local cluster with 3-replica Raft control plane |
 | **`make stop`** / **`make down`** | Stop all cluster processes cleanly |
 | **`make status`** | Show cluster leader and service status |

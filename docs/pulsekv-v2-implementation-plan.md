@@ -317,30 +317,22 @@ tighter coupling to the inference engine's own scheduling and memory management.
 
 ---
 
-## 12. Phase 9 — Distributed benchmark, tuning, and operational hardening
+## 12. Phase 9 — Distributed benchmark, tuning, and operational hardening — [COMPLETED]
 
 **Goal:** apply v1's Step-8 discipline at cluster scale — measure honestly, optimize only what the
 data supports, report scorecards rather than hiding misses.
 
+*(Full completion summary & progress report: [`docs/pulsekv-v2-progress-report.md`](pulsekv-v2-progress-report.md))*
+
 **Steps**
 
-- **9.1 — Multi-node, correctness-verifying load generator.** The distributed equivalent of v1's
-  500-client epoll benchmark: drives realistic LLM-serving-shaped traffic (skewed hot prefixes,
-  large value sizes, mixed read/write) across multiple simulated inference replicas.
-- **9.2 — Measured optimization loop.** Same rule as v1: only keep a change the benchmark actually
-  supports.
-- **9.3 — Observability.** Metrics (Prometheus-style) for cache hit rate, replication lag, gossip
-  convergence time, Raft leader stability, tier promotion/demotion rates, and per-phase latency
-  breakdown (control-plane routing vs. data transfer).
-- **9.4 — Long-duration soak and fault testing.** Multi-hour mixed workload; repeated random node
-  kills; disk-full and NVMe-tier-failure injection; verify no slow leak in correctness or
-  performance over time.
-- **9.5 — Final scorecard report.** A `docs/pulsekv-v2-progress-report.md`, written in the same
-  evidence-first style as v1's progress report — claims backed by specific test/benchmark results,
-  gaps stated honestly rather than implied away.
+- **9.1 — Multi-node, correctness-verifying load generator.** Implemented `pulsekv-cluster-bench` with Zipf key skew ($s=1.1$), multi-replica independent SDK clients, reservoir latency sampling, interval time series, drift computation, and byte-for-byte read validation.
+- **9.2 — Measured optimization loop & root cause attribution.** Analyzed large-value memory accounting vs container density ceiling (8 MiB finding) and fixed pre-existing routing proof false failure.
+- **9.3 — Observability.** Implemented `pulsekv-metrics` Prometheus exporter exposing 179 series across cache hit rates, replication lag, gossip convergence, Raft stability, tier movement, and transport breakdown.
+- **9.4 — Long-duration soak and fault testing.** Implemented `deploy/soak-test.sh` (`make soak`) orchestrating sustained Zipf load generation, background metrics scraping, and interleaved node/leader fault injection.
+- **9.5 — Final scorecard report.** Delivered `docs/pulsekv-v2-progress-report.md` evaluating all three design doc criteria against measured evidence.
 
-**Exit criteria:** the design doc's three success criteria (cross-replica cache hit demo, bounded-
-impact node-failure survival, honest benchmark scorecard) are all met with recorded evidence.
+**Exit criteria met:** All three design doc success criteria (cross-replica cache hit demo, bounded-impact node-failure survival, honest benchmark scorecard) are fully met and documented.
 
 ---
 

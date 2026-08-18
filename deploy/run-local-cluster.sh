@@ -122,7 +122,7 @@ if [ "$SKIP_BUILD" -eq 1 ]; then
     pk_step "Skipping build (--skip-build)"
     for bin in "$PULSEKV_CONTROLPLANE_BIN" "$PULSEKV_MEMBER_BIN" "$PULSEKV_SMOKE_BIN" \
                "$PULSEKV_BENCH_BIN" "$PULSEKV_CLUSTER_BENCH_BIN" \
-               "$PULSEKV_CHAOS_BIN" "$PULSEKV_EXAMPLE_BIN" "$PULSEKV_NODE_BIN"; do
+               "$PULSEKV_CHAOS_BIN" "$PULSEKV_METRICS_BIN" "$PULSEKV_EXAMPLE_BIN" "$PULSEKV_NODE_BIN"; do
         [ -x "$bin" ] || pk_die "$(pk_relpath "$bin") is missing; run without --skip-build"
     done
 else
@@ -143,6 +143,8 @@ else
             go build -o "$PULSEKV_CLUSTER_BENCH_BIN" ./cmd/pulsekv-cluster-bench
         run_logged "$(build_log go-build-chaos.log)" "go build (pulsekv-chaos)" \
             go build -o "$PULSEKV_CHAOS_BIN" ./cmd/pulsekv-chaos
+        run_logged "$(build_log go-build-metrics.log)" "go build (pulsekv-metrics)" \
+            go build -o "$PULSEKV_METRICS_BIN" ./cmd/pulsekv-metrics
         run_logged "$(build_log go-build-example.log)" "go build (pulsekv-example)" \
             go build -o "$PULSEKV_EXAMPLE_BIN" ./cmd/pulsekv-example
     )
@@ -152,6 +154,7 @@ else
     pk_ok "$(pk_relpath "$PULSEKV_BENCH_BIN")"
     pk_ok "$(pk_relpath "$PULSEKV_CLUSTER_BENCH_BIN")"
     pk_ok "$(pk_relpath "$PULSEKV_CHAOS_BIN")"
+    pk_ok "$(pk_relpath "$PULSEKV_METRICS_BIN")"
     pk_ok "$(pk_relpath "$PULSEKV_EXAMPLE_BIN")"
 
     # Validate the config before paying for the C++ build.

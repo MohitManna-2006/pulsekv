@@ -1689,6 +1689,29 @@ class NodeServiceImpl final : public nodev1::NodeService::Service {
     response->set_resident_keys(cap.resident_keys);
     response->set_bytes_in_ram_tier(cap.bytes_in_ram_tier);
     response->set_bytes_in_nvme_tier(cap.bytes_in_nvme_tier);
+
+    // Phase 9 observability. Every value below was already being computed --
+    // pk_engine_capacity has reported the tier counters since Phase 1, and the
+    // bulk transport has counted its own traffic since Phase 6 -- and until now
+    // reached nothing but one log line at shutdown. Forwarding them costs a
+    // struct copy on a diagnostic RPC nothing calls in a request path.
+    response->set_keys_in_ram_tier(cap.keys_in_ram_tier);
+    response->set_keys_in_nvme_tier(cap.keys_in_nvme_tier);
+    response->set_spills(cap.spills);
+    response->set_promotions(cap.promotions);
+    response->set_spill_errors(cap.spill_errors);
+    response->set_evict_drops(cap.evict_drops);
+
+    // Null when this node was started without --metadata-addr: it then does no
+    // replication and owns no bulk transport, so reporting zeros is the honest
+    // answer rather than an omission.
+    if (replication_) {
+      const auto bulk = replication_->bulk_stats();
+      response->set_bulk_writes(bulk.writes);
+      response->set_bulk_reads(bulk.reads);
+      response->set_bulk_shared_memory_reads(bulk.shared_memory_reads);
+      response->set_bulk_fallbacks(bulk.fallbacks);
+    }
     return grpc::Status::OK;
   }
 

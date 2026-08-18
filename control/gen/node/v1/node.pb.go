@@ -783,8 +783,34 @@ type CapacityResponse struct {
 	// silently approximated — see docs/pulsekv-v2-phase1-summary.md.
 	BytesInRamTier  uint64 `protobuf:"varint,2,opt,name=bytes_in_ram_tier,json=bytesInRamTier,proto3" json:"bytes_in_ram_tier,omitempty"`
 	BytesInNvmeTier uint64 `protobuf:"varint,3,opt,name=bytes_in_nvme_tier,json=bytesInNvmeTier,proto3" json:"bytes_in_nvme_tier,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// Per-tier key counts, the companion to the byte counts above. A tier can
+	// hold few large values or many small ones, and the two answer different
+	// questions.
+	KeysInRamTier  uint64 `protobuf:"varint,4,opt,name=keys_in_ram_tier,json=keysInRamTier,proto3" json:"keys_in_ram_tier,omitempty"`
+	KeysInNvmeTier uint64 `protobuf:"varint,5,opt,name=keys_in_nvme_tier,json=keysInNvmeTier,proto3" json:"keys_in_nvme_tier,omitempty"`
+	// Lifetime tier-movement counters, monotonic since node start.
+	//
+	// These are COUNTERS, not rates: a scraper differentiates them. Sampling
+	// bytes_in_nvme_tier instead would only ever show net movement, which
+	// reports a value spilled and promoted back as though nothing happened.
+	Spills     uint64 `protobuf:"varint,6,opt,name=spills,proto3" json:"spills,omitempty"`         // values moved RAM -> NVMe
+	Promotions uint64 `protobuf:"varint,7,opt,name=promotions,proto3" json:"promotions,omitempty"` // values moved NVMe -> RAM
+	// Spill writes that failed, and entries dropped rather than spilled. Both
+	// are the NVMe tier degrading rather than the node failing: the engine drops
+	// the entry and keeps serving. Phase 9's fault injection makes these move on
+	// purpose, so they must be visible.
+	SpillErrors uint64 `protobuf:"varint,8,opt,name=spill_errors,json=spillErrors,proto3" json:"spill_errors,omitempty"`
+	EvictDrops  uint64 `protobuf:"varint,9,opt,name=evict_drops,json=evictDrops,proto3" json:"evict_drops,omitempty"`
+	// Phase 6's transport split, counted at this node. bulk_* are the raw framed
+	// socket path; a fallback is one request that could not use it and went back
+	// to gRPC. The bulk transport is never required (Phase 6's seventh contract),
+	// so a nonzero fallback count is normal operation, not an error.
+	BulkWrites            uint64 `protobuf:"varint,10,opt,name=bulk_writes,json=bulkWrites,proto3" json:"bulk_writes,omitempty"`
+	BulkReads             uint64 `protobuf:"varint,11,opt,name=bulk_reads,json=bulkReads,proto3" json:"bulk_reads,omitempty"`
+	BulkSharedMemoryReads uint64 `protobuf:"varint,12,opt,name=bulk_shared_memory_reads,json=bulkSharedMemoryReads,proto3" json:"bulk_shared_memory_reads,omitempty"` // reads served by the sealed-memfd handoff
+	BulkFallbacks         uint64 `protobuf:"varint,13,opt,name=bulk_fallbacks,json=bulkFallbacks,proto3" json:"bulk_fallbacks,omitempty"`
+	unknownFields         protoimpl.UnknownFields
+	sizeCache             protoimpl.SizeCache
 }
 
 func (x *CapacityResponse) Reset() {
@@ -838,6 +864,76 @@ func (x *CapacityResponse) GetBytesInNvmeTier() uint64 {
 	return 0
 }
 
+func (x *CapacityResponse) GetKeysInRamTier() uint64 {
+	if x != nil {
+		return x.KeysInRamTier
+	}
+	return 0
+}
+
+func (x *CapacityResponse) GetKeysInNvmeTier() uint64 {
+	if x != nil {
+		return x.KeysInNvmeTier
+	}
+	return 0
+}
+
+func (x *CapacityResponse) GetSpills() uint64 {
+	if x != nil {
+		return x.Spills
+	}
+	return 0
+}
+
+func (x *CapacityResponse) GetPromotions() uint64 {
+	if x != nil {
+		return x.Promotions
+	}
+	return 0
+}
+
+func (x *CapacityResponse) GetSpillErrors() uint64 {
+	if x != nil {
+		return x.SpillErrors
+	}
+	return 0
+}
+
+func (x *CapacityResponse) GetEvictDrops() uint64 {
+	if x != nil {
+		return x.EvictDrops
+	}
+	return 0
+}
+
+func (x *CapacityResponse) GetBulkWrites() uint64 {
+	if x != nil {
+		return x.BulkWrites
+	}
+	return 0
+}
+
+func (x *CapacityResponse) GetBulkReads() uint64 {
+	if x != nil {
+		return x.BulkReads
+	}
+	return 0
+}
+
+func (x *CapacityResponse) GetBulkSharedMemoryReads() uint64 {
+	if x != nil {
+		return x.BulkSharedMemoryReads
+	}
+	return 0
+}
+
+func (x *CapacityResponse) GetBulkFallbacks() uint64 {
+	if x != nil {
+		return x.BulkFallbacks
+	}
+	return 0
+}
+
 var File_node_proto protoreflect.FileDescriptor
 
 const file_node_proto_rawDesc = "" +
@@ -885,11 +981,27 @@ const file_node_proto_rawDesc = "" +
 	"\x03key\x18\x01 \x01(\fR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\fR\x05value\x12#\n" +
 	"\rvalue_omitted\x18\x03 \x01(\bR\fvalueOmitted\"\x11\n" +
-	"\x0fCapacityRequest\"\x8f\x01\n" +
+	"\x0fCapacityRequest\"\xff\x03\n" +
 	"\x10CapacityResponse\x12#\n" +
 	"\rresident_keys\x18\x01 \x01(\x04R\fresidentKeys\x12)\n" +
 	"\x11bytes_in_ram_tier\x18\x02 \x01(\x04R\x0ebytesInRamTier\x12+\n" +
-	"\x12bytes_in_nvme_tier\x18\x03 \x01(\x04R\x0fbytesInNvmeTier*I\n" +
+	"\x12bytes_in_nvme_tier\x18\x03 \x01(\x04R\x0fbytesInNvmeTier\x12'\n" +
+	"\x10keys_in_ram_tier\x18\x04 \x01(\x04R\rkeysInRamTier\x12)\n" +
+	"\x11keys_in_nvme_tier\x18\x05 \x01(\x04R\x0ekeysInNvmeTier\x12\x16\n" +
+	"\x06spills\x18\x06 \x01(\x04R\x06spills\x12\x1e\n" +
+	"\n" +
+	"promotions\x18\a \x01(\x04R\n" +
+	"promotions\x12!\n" +
+	"\fspill_errors\x18\b \x01(\x04R\vspillErrors\x12\x1f\n" +
+	"\vevict_drops\x18\t \x01(\x04R\n" +
+	"evictDrops\x12\x1f\n" +
+	"\vbulk_writes\x18\n" +
+	" \x01(\x04R\n" +
+	"bulkWrites\x12\x1d\n" +
+	"\n" +
+	"bulk_reads\x18\v \x01(\x04R\tbulkReads\x127\n" +
+	"\x18bulk_shared_memory_reads\x18\f \x01(\x04R\x15bulkSharedMemoryReads\x12%\n" +
+	"\x0ebulk_fallbacks\x18\r \x01(\x04R\rbulkFallbacks*I\n" +
 	"\n" +
 	"UnaryLimit\x12\x1b\n" +
 	"\x17UNARY_LIMIT_UNSPECIFIED\x10\x00\x12\x1e\n" +

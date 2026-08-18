@@ -111,11 +111,31 @@ class CapacityRequest(_message.Message):
     def __init__(self) -> None: ...
 
 class CapacityResponse(_message.Message):
-    __slots__ = ("resident_keys", "bytes_in_ram_tier", "bytes_in_nvme_tier")
+    __slots__ = ("resident_keys", "bytes_in_ram_tier", "bytes_in_nvme_tier", "keys_in_ram_tier", "keys_in_nvme_tier", "spills", "promotions", "spill_errors", "evict_drops", "bulk_writes", "bulk_reads", "bulk_shared_memory_reads", "bulk_fallbacks")
     RESIDENT_KEYS_FIELD_NUMBER: _ClassVar[int]
     BYTES_IN_RAM_TIER_FIELD_NUMBER: _ClassVar[int]
     BYTES_IN_NVME_TIER_FIELD_NUMBER: _ClassVar[int]
+    KEYS_IN_RAM_TIER_FIELD_NUMBER: _ClassVar[int]
+    KEYS_IN_NVME_TIER_FIELD_NUMBER: _ClassVar[int]
+    SPILLS_FIELD_NUMBER: _ClassVar[int]
+    PROMOTIONS_FIELD_NUMBER: _ClassVar[int]
+    SPILL_ERRORS_FIELD_NUMBER: _ClassVar[int]
+    EVICT_DROPS_FIELD_NUMBER: _ClassVar[int]
+    BULK_WRITES_FIELD_NUMBER: _ClassVar[int]
+    BULK_READS_FIELD_NUMBER: _ClassVar[int]
+    BULK_SHARED_MEMORY_READS_FIELD_NUMBER: _ClassVar[int]
+    BULK_FALLBACKS_FIELD_NUMBER: _ClassVar[int]
     resident_keys: int
     bytes_in_ram_tier: int
     bytes_in_nvme_tier: int
-    def __init__(self, resident_keys: _Optional[int] = ..., bytes_in_ram_tier: _Optional[int] = ..., bytes_in_nvme_tier: _Optional[int] = ...) -> None: ...
+    keys_in_ram_tier: int
+    keys_in_nvme_tier: int
+    spills: int
+    promotions: int
+    spill_errors: int
+    evict_drops: int
+    bulk_writes: int
+    bulk_reads: int
+    bulk_shared_memory_reads: int
+    bulk_fallbacks: int
+    def __init__(self, resident_keys: _Optional[int] = ..., bytes_in_ram_tier: _Optional[int] = ..., bytes_in_nvme_tier: _Optional[int] = ..., keys_in_ram_tier: _Optional[int] = ..., keys_in_nvme_tier: _Optional[int] = ..., spills: _Optional[int] = ..., promotions: _Optional[int] = ..., spill_errors: _Optional[int] = ..., evict_drops: _Optional[int] = ..., bulk_writes: _Optional[int] = ..., bulk_reads: _Optional[int] = ..., bulk_shared_memory_reads: _Optional[int] = ..., bulk_fallbacks: _Optional[int] = ...) -> None: ...

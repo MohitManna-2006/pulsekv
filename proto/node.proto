@@ -213,4 +213,45 @@ message CapacityResponse {
   // silently approximated — see docs/pulsekv-v2-phase1-summary.md.
   uint64 bytes_in_ram_tier = 2;
   uint64 bytes_in_nvme_tier = 3;
+
+  // ---------------------------------------------------------------------
+  // Phase 9 observability. Additive, diagnostic, and never an input to
+  // placement — the control plane's decisions must stay a pure function of
+  // membership, which is why these are read only by the metrics exporter.
+  //
+  // Every field below was ALREADY computed by the engine (pk_engine_capacity)
+  // or the node's bulk transport, and previously reached nothing but a log
+  // line at shutdown. Phase 9 exposes them rather than deriving weaker proxies
+  // by sampling the tier byte counts above.
+  // ---------------------------------------------------------------------
+
+  // Per-tier key counts, the companion to the byte counts above. A tier can
+  // hold few large values or many small ones, and the two answer different
+  // questions.
+  uint64 keys_in_ram_tier = 4;
+  uint64 keys_in_nvme_tier = 5;
+
+  // Lifetime tier-movement counters, monotonic since node start.
+  //
+  // These are COUNTERS, not rates: a scraper differentiates them. Sampling
+  // bytes_in_nvme_tier instead would only ever show net movement, which
+  // reports a value spilled and promoted back as though nothing happened.
+  uint64 spills = 6;      // values moved RAM -> NVMe
+  uint64 promotions = 7;  // values moved NVMe -> RAM
+
+  // Spill writes that failed, and entries dropped rather than spilled. Both
+  // are the NVMe tier degrading rather than the node failing: the engine drops
+  // the entry and keeps serving. Phase 9's fault injection makes these move on
+  // purpose, so they must be visible.
+  uint64 spill_errors = 8;
+  uint64 evict_drops = 9;
+
+  // Phase 6's transport split, counted at this node. bulk_* are the raw framed
+  // socket path; a fallback is one request that could not use it and went back
+  // to gRPC. The bulk transport is never required (Phase 6's seventh contract),
+  // so a nonzero fallback count is normal operation, not an error.
+  uint64 bulk_writes = 10;
+  uint64 bulk_reads = 11;
+  uint64 bulk_shared_memory_reads = 12;  // reads served by the sealed-memfd handoff
+  uint64 bulk_fallbacks = 13;
 }
