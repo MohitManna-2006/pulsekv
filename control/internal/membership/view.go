@@ -51,6 +51,30 @@ type Source interface {
 	Snapshot() Snapshot
 }
 
+// Readiness is an OPTIONAL second capability of a Source: the ability to say
+// "do not publish my Snapshot yet, I have not caught up".
+//
+// It exists because an empty Snapshot is ambiguous in exactly one situation. A
+// gossip Source is never ambiguous -- it observes what it observes, and an
+// empty view is a real view. A Raft-backed Source is: a replica that has just
+// started holds a zero-valued applied state that looks exactly like a
+// genuinely empty cluster, and answering from it publishes "there are no data
+// nodes" on the authority of a replica that has not yet looked.
+//
+// This is the read-serving half of the rule metastore.Bridge's proposeAllowed
+// already enforces on the propose side: "I have not looked yet" must never be
+// served as "there is nothing there". The two are complementary, not
+// redundant -- one stops a new leader committing an empty membership, this one
+// stops any replica publishing an uncaught-up one.
+//
+// A Source that does not implement this is treated as always ready, which is
+// what keeps a Phase 3/4 gossip-backed control plane behaving byte-identically.
+type Readiness interface {
+	// ServeReady returns nil when Snapshot() may be published as an
+	// authoritative answer, and a descriptive error while it may not.
+	ServeReady() error
+}
+
 type memberRecord struct {
 	meta NodeMeta
 	raw  []byte

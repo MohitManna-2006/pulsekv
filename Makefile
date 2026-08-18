@@ -39,11 +39,13 @@ help:
 	@printf "  $(GREEN)make status$(RESET)              Show cluster leader and live service status\n"
 	@printf "\n$(CYAN)Testing & Verification:$(RESET)\n"
 	@printf "  $(GREEN)make test$(RESET)                Run complete test suite (smoke + engine + adapters)\n"
-	@printf "  $(GREEN)make test-adapter$(RESET)        Run Python Client SDK & SGLang HiCache tests\n"
+	@printf "  $(GREEN)make test-adapter$(RESET)        Run Python Client SDK, SGLang, and vLLM adapter tests\n"
 	@printf "  $(GREEN)make test-engine$(RESET)         Run pure-C storage engine tiering & stress tests\n"
 	@printf "  $(GREEN)make test-smoke$(RESET)          Run Go control plane + gRPC contract smoke test\n"
 	@printf "\n$(CYAN)Demos & Benchmarks:$(RESET)\n"
-	@printf "  $(GREEN)make demo$(RESET)                Run SGLang cross-replica prefix cache hit demo\n"
+	@printf "  $(GREEN)make demo$(RESET)                Run SGLang and vLLM cross-replica cache hit demos\n"
+	@printf "  $(GREEN)make demo-sglang$(RESET)         Run SGLang HiCache cross-replica prefix cache hit demo\n"
+	@printf "  $(GREEN)make demo-vllm$(RESET)           Run vLLM KVConnector cross-replica multi-layer cache hit demo\n"
 	@printf "  $(GREEN)make bench$(RESET)               Run bulk transport and cluster benchmarks\n"
 	@printf "  $(GREEN)make chaos$(RESET)               Run node crash/restart fault injection chaos tests\n"
 	@printf "\n$(CYAN)Development Environment:$(RESET)\n"
@@ -118,13 +120,31 @@ test-smoke:
 # ---------------------------------------------------------------------------
 # Demos, Benchmarks & Chaos
 # ---------------------------------------------------------------------------
-.PHONY: demo demo-sglang
-demo demo-sglang:
+.PHONY: demo
+demo:
+	$(RUN_CMD) "\
+		deploy/run-local-cluster.sh && \
+		deploy/demo-cross-replica-sglang.sh --trials 10 --prefix-tokens 512 && \
+		deploy/demo-cross-replica-vllm.sh --trials 10 --prefix-tokens 512 --layers 16 && \
+		deploy/stop-local-cluster.sh \
+	"
+
+.PHONY: demo-sglang
+demo-sglang:
 	$(RUN_CMD) "\
 		deploy/run-local-cluster.sh && \
 		deploy/demo-cross-replica-sglang.sh --trials 10 --prefix-tokens 512 && \
 		deploy/stop-local-cluster.sh \
 	"
+
+.PHONY: demo-vllm
+demo-vllm:
+	$(RUN_CMD) "\
+		deploy/run-local-cluster.sh && \
+		deploy/demo-cross-replica-vllm.sh --trials 10 --prefix-tokens 512 --layers 16 && \
+		deploy/stop-local-cluster.sh \
+	"
+
 
 .PHONY: bench
 bench:

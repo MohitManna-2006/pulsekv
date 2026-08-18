@@ -1,8 +1,8 @@
 # PulseKV
 
-Distributed, tiered KV cache store for LLM serving engines with SGLang HiCache integration and single-node C storage core.
+Distributed, tiered KV cache store for LLM serving engines with SGLang HiCache and vLLM KVConnector integrations and single-node C storage core.
 
-> **PulseKV v2 Status: Phase 7 (MVP Complete)** — 3-replica Raft control plane in Go, C++ data nodes with RAM/NVMe tiering & bulk transport, and SGLang HiCache Python adapter with verified 100% cross-replica prefix cache hits.
+> **PulseKV v2 Status: Phase 8 (Complete)** — 3-replica Raft control plane in Go, C++ data nodes with RAM/NVMe tiering & bulk transport, SGLang HiCache Python adapter, and vLLM KVConnector v1 adapter with verified 100% cross-replica prefix cache hits.
 
 ---
 
@@ -13,13 +13,16 @@ Type `make` or any of the following commands directly from your terminal (Docker
 | Command | Action |
 | :--- | :--- |
 | **`make test`** | Run full test suite (smoke test + engine tests + Python adapter tests) |
-| **`make test-adapter`** | Run Python client and SGLang HiCache adapter tests |
-| **`make demo`** | Run SGLang cross-replica prefix cache hit demo (10 trials @ 512 tokens) |
+| **`make test-adapter`** | Run Python client SDK, SGLang HiCache, and vLLM adapter tests |
+| **`make demo`** | Run SGLang and vLLM cross-replica prefix cache hit demos |
+| **`make demo-sglang`** | Run SGLang HiCache cross-replica demo (10 trials @ 512 tokens) |
+| **`make demo-vllm`** | Run vLLM KVConnector cross-replica demo (10 trials @ 512 tokens, 16 layers) |
 | **`make start`** / **`make up`** | Boot 4-node local cluster with 3-replica Raft control plane |
 | **`make stop`** / **`make down`** | Stop all cluster processes cleanly |
 | **`make status`** | Show cluster leader and service status |
 | **`make shell`** | Open interactive bash shell inside dev container |
 | **`make help`** | Show all available commands |
+
 
 ---
 

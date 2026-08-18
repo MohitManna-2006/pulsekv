@@ -314,9 +314,14 @@ func dialAnyReplica(addresses []string, rpcTimeout time.Duration) (string, *grpc
 			}
 			continue
 		}
+		// GetNodeList rather than HealthCheck: this connection is about to be
+		// used for topology reads, and HealthCheck answers for a replica that
+		// is alive but has not caught up since restarting -- which now declines
+		// to publish a topology. Selecting on the call we actually need means
+		// this picks a replica that can serve it.
 		ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
-		_, err = metadatav1.NewClusterMetadataServiceClient(conn).HealthCheck(
-			ctx, &metadatav1.HealthCheckRequest{})
+		_, err = metadatav1.NewClusterMetadataServiceClient(conn).GetNodeList(
+			ctx, &metadatav1.GetNodeListRequest{})
 		cancel()
 		if err == nil {
 			return address, conn, nil

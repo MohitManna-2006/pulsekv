@@ -35,9 +35,13 @@ type Service struct {
 	shardCount        uint32
 	replicationFactor int
 	source            membership.Source
-	configPath        string
-	started           time.Time
-	leaderInfo        func() (string, uint64)
+	// readiness is set when source can report that it has not caught up yet.
+	// Nil for a gossip-backed source, which is never ambiguous about an empty
+	// view -- see membership.Readiness.
+	readiness  membership.Readiness
+	configPath string
+	started    time.Time
+	leaderInfo func() (string, uint64)
 }
 
 // Option customises a Service.
@@ -87,6 +91,12 @@ func New(cfg *config.Config, source membership.Source, opts ...Option) (*Service
 		source:            source,
 		configPath:        cfg.Path,
 		started:           time.Now(),
+	}
+	// Discovered rather than injected: a source either can answer the readiness
+	// question or it cannot, and every call site that already builds a Service
+	// keeps working unchanged.
+	if readiness, ok := source.(membership.Readiness); ok {
+		s.readiness = readiness
 	}
 	for _, o := range opts {
 		o(s)
@@ -262,6 +272,22 @@ func (s *Service) placement(snapshot membership.Snapshot) (placement, error) {
 }
 
 func (s *Service) snapshot() (membership.Snapshot, error) {
+	// The readiness gate, checked before anything is read. Both published RPCs
+	// come through here, which is the point: GetNodeList and GetShardMap must
+	// never disagree about whether this replica is entitled to answer.
+	//
+	// Unavailable, not Internal or a silent zero value. It is the code whose
+	// published meaning is "retry, possibly elsewhere" -- which is exactly what
+	// a caller holding the full replica list should do, and what both the Go
+	// SDK and the C++ topology poller already do on any error.
+	if s.readiness != nil {
+		if err := s.readiness.ServeReady(); err != nil {
+			return membership.Snapshot{}, status.Errorf(codes.Unavailable,
+				"this control-plane replica is still catching up and will not publish a "+
+					"topology yet: %v", err)
+		}
+	}
+
 	snapshot := s.source.Snapshot()
 	seenIDs := make(map[string]bool, len(snapshot.Nodes))
 	seenAddresses := make(map[string]bool, len(snapshot.Nodes))

@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"time"
 
 	"github.com/hashicorp/go-hclog"
@@ -78,14 +79,36 @@ type Store struct {
 	raft      *raft.Raft
 	transport *raft.NetworkTransport
 	boltStore *raftboltdb.BoltStore
+
+	// logStore is retained so ServeReady can distinguish "the FSM has applied
+	// everything committed" from "there is nothing committed to apply".
+	logStore raft.LogStore
+
+	// startupIndex is the last index this replica already had on disk when the
+	// process started -- log or snapshot, whichever is further along. It is the
+	// floor ServeReady catches up to, because a replica must never answer from
+	// a state older than its own persisted log.
+	startupIndex uint64
+
+	// caughtUp latches the readiness decision. See ServeReady for why it
+	// latches rather than tracking liveness.
+	caughtUp atomic.Bool
 }
 
-var _ membership.Source = (*Store)(nil)
+var (
+	_ membership.Source    = (*Store)(nil)
+	_ membership.Readiness = (*Store)(nil)
+)
 
 // ErrNotLeader is returned by Propose on a replica that does not currently hold
 // leadership. It is a normal outcome, not a failure: exactly one replica may
 // propose, and every other one is expected to see this.
 var ErrNotLeader = errors.New("metastore: this replica is not the Raft leader")
+
+// ErrCatchingUp is returned by ServeReady while this replica's applied state is
+// not yet trustworthy. Like ErrNotLeader it is a normal startup outcome rather
+// than a failure: every replica reports it for a moment after it starts.
+var ErrCatchingUp = errors.New("metastore: this replica has not caught up with the metadata group")
 
 // New starts this replica's Raft instance and, if the group has no existing
 // state, bootstraps it from Config.Peers.
@@ -145,6 +168,11 @@ func New(cfg Config) (*Store, error) {
 		raft:      node,
 		transport: transport,
 		boltStore: boltStore,
+		logStore:  logStore,
+		// Read BEFORE BootstrapCluster, so a fresh replica records 0 rather
+		// than the configuration entry bootstrap is about to write. What is on
+		// disk now is exactly what this process inherited from its last life.
+		startupIndex: node.LastIndex(),
 	}
 
 	existing, err := raft.HasExistingState(logStore, stableStore, snapshotStore)
@@ -270,6 +298,135 @@ func (s *Store) Snapshot() membership.Snapshot {
 // State returns the raw committed state, for the bridge's comparison and for
 // diagnostics.
 func (s *Store) State() State { return s.fsm.State() }
+
+// ServeReady reports whether this replica's applied state may be published as
+// an authoritative answer yet.
+//
+// This is proposeAllowed's reasoning applied to the read-serving side. A
+// process that has just started holds a zero-valued FSM: no nodes, generation
+// 0. That is byte-identical to a genuinely empty cluster, which Phase 3
+// established as an authoritative state clients install and act on. Serving it
+// before the replica has caught up is not the stale-but-consistent answer
+// Phase 5 promises -- an applied log that is a prefix of the leader's committed
+// one -- it is a claim about a cluster this replica has not looked at. A client
+// that installs it stops routing and reports ErrNoLiveNodes for the duration.
+//
+// Four conditions, all of them real convergence signals rather than timers --
+// the settle window in bridge.go already establishes that a fixed timer is the
+// wrong tool for this job:
+//
+//  1. This replica has heard from a leader since it started. Without it the
+//     rest is vacuous -- a fresh process has commit index 0 and applied index
+//     0, which trivially satisfies "I have applied everything committed".
+//  2. What the group says is committed covers at least the log this replica
+//     already had on disk when it started. A replica must never answer from a
+//     state older than its own persisted log, which is exactly the case a
+//     rejoining follower with an intact raft.db hits.
+//  3. Everything committed has been handed to the state machine.
+//  4. The state machine has actually consumed it. That is a different claim
+//     from (3), and skipping it leaked an empty topology in 2 real-cluster
+//     restarts out of 5 -- see unappliedCommandIndex.
+//
+// The floor in (2) is capped at the current last index so an uncommitted tail
+// that a new leader truncates cannot strand this replica short of a bar it can
+// never reach.
+//
+// It LATCHES. Once caught up, a replica that later loses contact with the
+// leader keeps serving: its state is then stale, which is the documented and
+// safe Phase 5 behaviour (see docs/pulsekv-v2-phase5-summary.md §4). Reverting
+// to "not ready" on every partition would turn a documented staleness bound
+// into an outage, and would make this guard strictly worse than the thing it
+// replaces.
+//
+// One residual, narrow and named rather than left to be discovered. A replica
+// whose local state was wiped entirely, catching up from a leader whose log
+// exceeds one MaxAppendEntries batch, can have its commit index land on a
+// prefix that contains no command entry, which opens the gate on an empty
+// state. Reaching it takes 60-odd elections before the group ever agreed a node
+// set. Closing it would need the LEADER's commit index, which a follower has no
+// way to observe.
+func (s *Store) ServeReady() error {
+	if s.caughtUp.Load() {
+		return nil
+	}
+
+	_, leaderID := s.raft.LeaderWithID()
+	if leaderID == "" {
+		return fmt.Errorf("%w: no leader has been seen since this replica started", ErrCatchingUp)
+	}
+
+	floor := s.startupIndex
+	if last := s.raft.LastIndex(); last < floor {
+		floor = last
+	}
+	if floor < 1 {
+		// Even a replica that started with nothing must wait for the group's
+		// first committed entry: until then "committed through 0" carries no
+		// information about anyone else's state.
+		floor = 1
+	}
+
+	commit := s.raft.CommitIndex()
+	if commit < floor {
+		return fmt.Errorf("%w: committed through index %d, needs %d (leader %s)",
+			ErrCatchingUp, commit, floor, leaderID)
+	}
+	if applied := s.raft.AppliedIndex(); applied < commit {
+		return fmt.Errorf("%w: applied index %d of %d committed (leader %s)",
+			ErrCatchingUp, applied, commit, leaderID)
+	}
+
+	// And the FSM must have CONSUMED what Raft handed it, which is not the same
+	// claim. See fsm.applied and unappliedCommandIndex.
+	consumed := s.fsm.AppliedIndex()
+	if pending, ok := s.unappliedCommandIndex(consumed, commit); ok {
+		return fmt.Errorf("%w: committed command at index %d is not in the state machine yet "+
+			"(consumed through %d, leader %s)", ErrCatchingUp, pending, consumed, leaderID)
+	}
+
+	s.caughtUp.Store(true)
+	return nil
+}
+
+// unappliedCommandIndex reports the newest committed command entry this
+// replica's state machine has not consumed, if there is one.
+//
+// This is the condition raft.AppliedIndex cannot express. That index advances
+// when a batch of entries is queued on the FSM's channel, not when the FSM has
+// run them -- hashicorp/raft's own documentation says so -- and a readiness
+// check that trusted it would open the gate one goroutine handoff before the
+// state machine held anything. Measured on the dev fixture, that handoff was
+// enough to leak an empty topology in 2 restarts out of 5.
+//
+// The FSM's own mark cannot simply be compared against the commit index
+// instead, because a Raft FSM never sees every entry: no-op entries (one per
+// election) and configuration entries are not dispatched to it at all, so its
+// mark legitimately trails the commit index forever. What the FSM must have
+// consumed is every COMMAND entry, and that is what this looks for.
+//
+// The scan walks back from the commit index and stops at the FSM's mark, so its
+// length is the number of trailing non-command entries -- normally zero, and
+// bounded by the number of elections since the last membership change. Once
+// this replica is caught up the range is empty and the whole check is free;
+// once it is ready the check is not reached at all.
+func (s *Store) unappliedCommandIndex(consumed, commit uint64) (uint64, bool) {
+	if s.logStore == nil || commit <= consumed {
+		return 0, false
+	}
+	var entry raft.Log
+	for index := commit; index > consumed; index-- {
+		if err := s.logStore.GetLog(index, &entry); err != nil {
+			// Below a snapshot this replica already restored, or otherwise not
+			// readable. Either way there is nothing further this check can
+			// establish, and the snapshot restore accounted for the state.
+			return 0, false
+		}
+		if entry.Type == raft.LogCommand {
+			return index, true
+		}
+	}
+	return 0, false
+}
 
 // Leader reports the current leader's server ID and term as this replica
 // understands them. Both are diagnostic: they are deliberately not part of the

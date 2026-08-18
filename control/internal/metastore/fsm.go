@@ -18,6 +18,15 @@ import (
 type fsm struct {
 	mu    sync.RWMutex
 	state State
+
+	// applied is the highest log index this FSM has actually CONSUMED, as
+	// opposed to the index Raft has handed to the FSM goroutine. The two are
+	// not the same, and the difference is exactly the gap Store.ServeReady
+	// exists to close: raft.AppliedIndex advances when a batch is queued on the
+	// FSM's channel, which can be one goroutine handoff before Apply runs.
+	// Guarded by mu, so a reader that takes state and applied together sees a
+	// consistent pair.
+	applied uint64
 }
 
 var _ raft.FSM = (*fsm)(nil)
@@ -29,6 +38,15 @@ func (f *fsm) State() State {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	return f.state.Clone()
+}
+
+// AppliedIndex is the highest log index this FSM has consumed. Zero means it
+// has neither applied an entry nor restored a snapshot since the process
+// started, which is precisely the state that must not be published.
+func (f *fsm) AppliedIndex() uint64 {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.applied
 }
 
 // Apply installs one committed command.
@@ -45,6 +63,10 @@ func (f *fsm) State() State {
 func (f *fsm) Apply(entry *raft.Log) any {
 	cmd, err := decodeCommand(entry.Data)
 	if err != nil {
+		// The entry is still consumed, and every replica consumes it the same
+		// way. Recording it keeps a malformed entry from stalling readiness
+		// forever on a state machine that is in fact perfectly up to date.
+		f.noteApplied(entry.Index)
 		return fmt.Errorf("apply log index %d: %w", entry.Index, err)
 	}
 
@@ -55,6 +77,12 @@ func (f *fsm) Apply(entry *raft.Log) any {
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// Recorded for EVERY entry, including one whose content matches. "I have
+	// consumed through here" and "the cluster changed here" are different
+	// facts: the generation deliberately only tracks the second.
+	if entry.Index > f.applied {
+		f.applied = entry.Index
+	}
 	if f.state.SameContent(next) {
 		return f.state.Clone()
 	}
@@ -63,11 +91,21 @@ func (f *fsm) Apply(entry *raft.Log) any {
 	return next.Clone()
 }
 
+func (f *fsm) noteApplied(index uint64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if index > f.applied {
+		f.applied = index
+	}
+}
+
 // Snapshot captures the state for log compaction. It is taken under the read
 // lock and then serialised outside it, because Persist can be slow and Apply
 // must not be blocked on disk.
 func (f *fsm) Snapshot() (raft.FSMSnapshot, error) {
-	return &fsmSnapshot{state: f.State()}, nil
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return &fsmSnapshot{state: f.state.Clone(), applied: f.applied}, nil
 }
 
 // Restore replaces the state wholesale from a snapshot. Raft calls it during
@@ -101,6 +139,15 @@ func (f *fsm) Restore(reader io.ReadCloser) error {
 		ReplicationFactor: persisted.ReplicationFactor,
 		Generation:        persisted.Generation,
 	}
+	// A restore is a consumption too. Without this a replica that recovered
+	// from a snapshot would report having applied nothing, and ServeReady would
+	// go looking for entries the snapshot already covers.
+	f.applied = persisted.AppliedIndex
+	if f.applied < persisted.Generation {
+		// Tolerates a snapshot written before this field existed: the
+		// generation is itself an index this FSM demonstrably consumed.
+		f.applied = persisted.Generation
+	}
 	return nil
 }
 
@@ -113,10 +160,17 @@ type persistedState struct {
 	Nodes             []membership.Node `json:"nodes"`
 	ReplicationFactor int               `json:"replication_factor"`
 	Generation        uint64            `json:"generation"`
+
+	// AppliedIndex is the highest log index the FSM had consumed when this
+	// snapshot was taken. It rides along because a restored replica has to know
+	// how far its own state reaches, not just what the state says. Absent from
+	// a snapshot written before this field existed, which Restore tolerates.
+	AppliedIndex uint64 `json:"applied_index,omitempty"`
 }
 
 type fsmSnapshot struct {
-	state State
+	state   State
+	applied uint64
 }
 
 func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) error {
@@ -125,6 +179,7 @@ func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) error {
 		Nodes:             s.state.Nodes,
 		ReplicationFactor: s.state.ReplicationFactor,
 		Generation:        s.state.Generation,
+		AppliedIndex:      s.applied,
 	})
 	if err != nil {
 		_ = sink.Cancel()

@@ -395,11 +395,17 @@ func run(ctx context.Context, cfg settings) (report runReport, runErr error) {
 			_ = replica.conn.Close()
 		}
 	}()
-	// The data-node half reads through the first replica, exactly as before.
-	// Any replica serves the same committed state.
-	metadata := replicas[0].metadata
+	// The data-node half reads through the full replica list, the same way the
+	// SDK and the C++ node do. It used to pin replicas[0], which is how a
+	// Phase 6 run caught a restarted replica publishing an empty topology --
+	// a real bug, since fixed, but pinning also means this harness fails
+	// whenever the one replica it reads is the one being restarted. Reading the
+	// way a real caller reads keeps the data-node assertions about data-node
+	// behaviour. The leader scenario below still reads each replica separately
+	// on purpose: that IS its assertion.
+	metadata := &topologyReader{replicas: replicas}
 
-	baseline, err := fetchTopology(ctx, metadata, cfg.rpcTimeout)
+	baseline, err := metadata.fetch(ctx, cfg.rpcTimeout)
 	if err != nil {
 		return report, fmt.Errorf("fetch baseline topology: %w", err)
 	}
@@ -679,11 +685,45 @@ func newGRPCConn(address string) (*grpc.ClientConn, error) {
 		))
 }
 
-func fetchTopology(ctx context.Context, metadata metadatav1.ClusterMetadataServiceClient,
-	timeout time.Duration) (clustertopology.Snapshot, error) {
-	rpcCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	return clustertopology.Fetch(rpcCtx, metadata)
+// topologyReader reads a coherent topology through every control-plane replica,
+// preferring whichever one answered last.
+//
+// It is the harness's copy of the fallback the SDK and the C++ topology poller
+// already implement, and it exists for the same reason they do: a replica can
+// be down, mid-election, or still catching up after a restart while the group
+// is perfectly healthy. Reading through one pinned replica turns any of those
+// into a failed chaos run.
+//
+// One fetch stays on ONE replica, exactly as in the SDK. The two RPCs must
+// observe the same publisher, or a fingerprint mismatch between a leader and a
+// slightly-behind follower looks like membership churn.
+//
+// Used only from the data-node scenario's single goroutine, so preferred needs
+// no synchronisation.
+type topologyReader struct {
+	replicas  []replicaClient
+	preferred int
+}
+
+func (r *topologyReader) fetch(ctx context.Context, timeout time.Duration) (clustertopology.Snapshot, error) {
+	var firstErr error
+	for attempt := 0; attempt < len(r.replicas); attempt++ {
+		index := (r.preferred + attempt) % len(r.replicas)
+		rpcCtx, cancel := context.WithTimeout(ctx, timeout)
+		snapshot, err := clustertopology.Fetch(rpcCtx, r.replicas[index].metadata)
+		cancel()
+		if err == nil {
+			r.preferred = index
+			return snapshot, nil
+		}
+		if firstErr == nil {
+			firstErr = fmt.Errorf("control plane %s: %w", r.replicas[index].address, err)
+		}
+	}
+	if firstErr == nil {
+		firstErr = errors.New("chaos harness was given no control-plane replicas")
+	}
+	return clustertopology.Snapshot{}, firstErr
 }
 
 func validateBaseline(snapshot clustertopology.Snapshot, target string) error {
@@ -1200,7 +1240,7 @@ func validateRejoin(baseline, before, after clustertopology.Snapshot,
 	return stats, nil
 }
 
-func waitForTransition(ctx context.Context, metadata metadatav1.ClusterMetadataServiceClient,
+func waitForTransition(ctx context.Context, metadata *topologyReader,
 	loadErrors <-chan error, previous, baseline clustertopology.Snapshot,
 	target, kind string, cfg settings) (clustertopology.Snapshot, movementStats, time.Duration, error) {
 	started := time.Now()
@@ -1222,7 +1262,7 @@ func waitForTransition(ctx context.Context, metadata metadatav1.ClusterMetadataS
 		default:
 		}
 
-		current, err := fetchTopology(waitCtx, metadata, cfg.rpcTimeout)
+		current, err := metadata.fetch(waitCtx, cfg.rpcTimeout)
 		if err != nil {
 			lastErr = err
 		} else if sameTopology(previous, current) {
