@@ -1,21 +1,22 @@
 """PulseKV v2 LLM serving adapters.
 
-Phase 0 scope: this package is a skeleton plus one health-check gRPC client.
-There is deliberately no cache logic here yet.
+Phase 7 scope: SGLang HiCache external storage backend and generic PulseKV
+Client SDK.
 
-What lands later:
-
-* Phase 7 — ``pulsekv_adapters.sglang``: an SGLang HiCache external storage
-  backend implementing ``get`` / ``exist`` / ``set`` as a thin pass-through
-  over :mod:`pulsekv_adapters.gen.adapter_pb2_grpc`.
-* Phase 8 — ``pulsekv_adapters.vllm``: a vLLM KVConnector v1 implementation,
-  scheduler-side and worker-side.
-
-Both are thin by design. The routing lives in the Go control plane and the
-storage lives in the C data plane; an adapter that starts making its own
-decisions about either is a bug.
+Exported classes and utilities:
+* :class:`PulseKVClient`: Generic cluster client for routing and transport.
+* :class:`PulseKVHiCacheStorage`: SGLang HiCache L3 external storage backend.
+* :func:`derive_block_hashes`, :func:`derive_prefix_keys`, :func:`get_hash_str`: SGLang key derivation.
 """
 
+from .client import (
+    PulseKVClient,
+    PulseKVClientError,
+    TopologySnapshot,
+    fnv1a_64,
+    mix64,
+    shard_for_key,
+)
 from .health_client import (
     HealthCheckError,
     HealthResult,
@@ -23,14 +24,38 @@ from .health_client import (
     check_cluster_metadata,
     check_node,
 )
+from .key import (
+    derive_block_hashes,
+    derive_prefix_keys,
+    format_cache_key,
+    get_hash_str,
+    get_token_bytes,
+)
+from .sglang import (
+    PulseKVHiCacheStorage,
+    register_sglang_backend,
+)
 
 __version__ = "0.0.1"
 
 __all__ = [
+    "PulseKVClient",
+    "PulseKVClientError",
+    "TopologySnapshot",
+    "PulseKVHiCacheStorage",
+    "derive_block_hashes",
+    "derive_prefix_keys",
+    "format_cache_key",
+    "get_hash_str",
+    "get_token_bytes",
+    "register_sglang_backend",
     "HealthCheckError",
     "HealthResult",
     "check_adapter_service",
     "check_cluster_metadata",
     "check_node",
+    "fnv1a_64",
+    "mix64",
+    "shard_for_key",
     "__version__",
 ]
