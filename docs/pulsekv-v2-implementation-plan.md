@@ -247,6 +247,10 @@ leader election.
 
 ## 9. Phase 6 — Large-blob transport optimization (C)
 
+**Status: complete (2026-08-18).** Implementation details, measured benchmark
+evidence, and the exact Phase 7 handoff are recorded in
+`pulsekv-v2-phase6-summary.md`.
+
 **Goal:** move multi-megabyte KV-cache blocks between nodes efficiently — this is the phase that
 actually matters for LLM-serving latency, since Phase 1's chunked framing proves correctness but
 not performance.

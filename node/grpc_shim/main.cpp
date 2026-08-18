@@ -18,6 +18,12 @@
 // exports include/ as PUBLIC and src/ as PRIVATE, so hashtable.h and tiering.h
 // are not on this file's include path at all.
 //
+// PHASE 6 ADDED A SECOND, NON-gRPC DATA PATH. node/grpc_shim/bulk.{h,cc} is a
+// raw framed socket protocol with a shared-memory handoff, used for values too
+// large to want protobuf in the middle of. It is strictly an optimisation: every
+// use of it here falls back to the gRPC chunked path on any failure, and a node
+// started without it behaves exactly as it did in Phase 5.
+//
 // PHASE 4 MADE THIS PROCESS A gRPC CLIENT AS WELL AS A SERVER. Replication is a
 // network-layer concern and lives entirely on this side of the engine boundary:
 // pk_engine_put has no idea whether it is storing a client's write or a copy
@@ -30,6 +36,8 @@
 
 #include <errno.h>
 #include <signal.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -59,12 +67,14 @@
 #include <grpcpp/ext/proto_server_reflection_plugin.h>
 #endif
 
+#include "bulk.h"
 #include "metadata.grpc.pb.h"
 #include "node.grpc.pb.h"
 #include "pulsekv_engine.h"
 
 namespace nodev1 = pulsekv::node::v1;
 namespace metadatav1 = pulsekv::metadata::v1;
+namespace bulk = pulsekv::bulk;
 
 namespace {
 
@@ -218,28 +228,10 @@ std::chrono::system_clock::time_point DeadlineFromNow(int64_t millis) {
   return std::chrono::system_clock::now() + std::chrono::milliseconds(millis);
 }
 
-// ShardForKey must agree, bit for bit, with router.ShardForKey in
-// control/internal/router/router.go. A disagreement would not fail loudly: this
-// node would replicate a key to the peers of some *other* shard, and the
-// catch-up scan would copy the wrong subset of a peer's keyspace. Both look
-// like data quietly going missing.
-//
-// FNV-1a over the raw key bytes, 64-bit, modulo the shard count -- exactly what
-// Go's hash/fnv.New64a computes, with the same offset basis and prime.
-uint32_t ShardForKey(const uint8_t* key, size_t key_len, uint32_t shard_count) {
-  if (shard_count == 0)
-    return 0;
-  uint64_t hash = 14695981039346656037ULL;  // FNV-1a 64-bit offset basis
-  for (size_t i = 0; i < key_len; i++) {
-    hash ^= static_cast<uint64_t>(key[i]);
-    hash *= 1099511628211ULL;  // FNV-1a 64-bit prime
-  }
-  return static_cast<uint32_t>(hash % static_cast<uint64_t>(shard_count));
-}
-
-uint32_t ShardForKey(const std::string& key, uint32_t shard_count) {
-  return ShardForKey(Bytes(key), key.size(), shard_count);
-}
+// ShardForKey now lives in bulk.h so the node and the benchmark share exactly
+// one implementation of the hash that must match the Go router. Brought into
+// this namespace unqualified because every call site below predates the move.
+using bulk::ShardForKey;
 
 // One published, immutable ownership snapshot, already projected down to the
 // three questions this node actually asks of it. Everything else in the cluster
@@ -265,6 +257,10 @@ struct TopologyView {
 
   // Every live NodeService address, used to retire stubs for departed peers.
   std::unordered_set<std::string> live_addresses;
+
+  // Address -> node ID, so a bulk connection can verify it reached the peer the
+  // topology names rather than trusting a convention-derived socket path.
+  std::unordered_map<std::string, std::string> node_id_of_address;
 
   bool Serves(uint32_t shard) const { return peer_sources.count(shard) != 0; }
 };
@@ -335,6 +331,80 @@ class PeerClients {
   std::mutex mu_;
   std::unordered_map<std::string, std::shared_ptr<grpc::Channel>> channels_;
   std::unordered_map<std::string, std::shared_ptr<nodev1::NodeService::Stub>> stubs_;
+};
+
+// Lazily-created, address-keyed bulk transport connections.
+//
+// Deliberately a separate cache from PeerClients rather than a field on it: a
+// bulk connection is optional and can legitimately fail to exist for a peer
+// whose gRPC stub is perfectly healthy (different host, no memfd, listener
+// disabled). Keeping them apart means a missing bulk connection can never look
+// like a missing peer.
+class BulkClients {
+ public:
+  BulkClients(int port_offset, std::string socket_dir, int64_t timeout_ms)
+      : port_offset_(port_offset), socket_dir_(std::move(socket_dir)), timeout_ms_(timeout_ms) {}
+
+  // Returns nullptr whenever the bulk path is unavailable for this peer. Every
+  // caller treats that as "use gRPC", which is why it is not an error.
+  bulk::Client* Get(const std::string& service_address, const std::string& expect_node_id) {
+    std::lock_guard<std::mutex> lock(mu_);
+    auto it = clients_.find(service_address);
+    if (it != clients_.end())
+      return it->second.get();
+    // A peer that failed to connect is remembered as unavailable so a
+    // cross-host peer is not re-dialed on every single forwarded write.
+    if (unavailable_.count(service_address) != 0)
+      return nullptr;
+
+    bulk::Endpoint endpoint =
+        bulk::EndpointForPeer(service_address, port_offset_, socket_dir_);
+    bulk::ClientOptions options;
+    options.io_timeout_ms = timeout_ms_;
+    options.accept_memfd = true;
+    options.expect_node_id = expect_node_id;
+
+    std::string error;
+    auto client = bulk::Client::Connect(endpoint, options, &error);
+    if (!client) {
+      unavailable_.insert(service_address);
+      return nullptr;
+    }
+    bulk::Client* raw = client.get();
+    clients_[service_address] = std::move(client);
+    return raw;
+  }
+
+  // Drops a connection that failed mid-request. The next attempt redials once;
+  // a peer that keeps failing lands in unavailable_ and stops being retried.
+  void Drop(const std::string& service_address) {
+    std::lock_guard<std::mutex> lock(mu_);
+    clients_.erase(service_address);
+  }
+
+  void Retain(const std::unordered_set<std::string>& keep) {
+    std::lock_guard<std::mutex> lock(mu_);
+    for (auto it = clients_.begin(); it != clients_.end();) {
+      it = keep.count(it->first) != 0 ? std::next(it) : clients_.erase(it);
+    }
+    for (auto it = unavailable_.begin(); it != unavailable_.end();) {
+      it = keep.count(*it) != 0 ? std::next(it) : unavailable_.erase(it);
+    }
+  }
+
+  void Clear() {
+    std::lock_guard<std::mutex> lock(mu_);
+    clients_.clear();
+    unavailable_.clear();
+  }
+
+ private:
+  std::mutex mu_;
+  std::unordered_map<std::string, std::unique_ptr<bulk::Client>> clients_;
+  std::unordered_set<std::string> unavailable_;
+  const int port_offset_;
+  const std::string socket_dir_;
+  const int64_t timeout_ms_;
 };
 
 // A bounded work queue for background replica writes.
@@ -450,6 +520,14 @@ struct ReplicationOptions {
   int64_t ack_timeout_ms = 2000;
   bool catch_up = true;
 
+  // Phase 6. When enabled, a forwarded value too large for the unary path is
+  // pushed over the bulk transport instead of PutChunked, and a catch-up scan
+  // pulls large values the same way. Both fall back to gRPC on ANY failure --
+  // that is what keeps this an optimisation rather than a new way to lose data.
+  bool bulk_enabled = false;
+  int bulk_port_offset = 1000;
+  std::string bulk_socket_dir;
+
   const std::string& PrimaryMetadataAddress() const {
     static const std::string kNone;
     return metadata_addresses.empty() ? kNone : metadata_addresses.front();
@@ -522,6 +600,8 @@ class ReplicationManager : public std::enable_shared_from_this<ReplicationManage
     while (ack_threads_.load(std::memory_order_relaxed) > 0 && Clock::now() < deadline)
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
     peers_.Clear();
+    if (bulk_)
+      bulk_->Clear();
   }
 
   // PlanFor resolves one key against the current topology in a single read, so
@@ -604,6 +684,22 @@ class ReplicationManager : public std::enable_shared_from_this<ReplicationManage
 
   uint64_t dropped_writes() const { return queue_.dropped(); }
 
+  struct BulkStats {
+    uint64_t writes;
+    uint64_t reads;
+    uint64_t shared_memory_reads;
+    uint64_t fallbacks;
+    bool enabled;
+  };
+
+  BulkStats bulk_stats() const {
+    return BulkStats{bulk_writes_.load(std::memory_order_relaxed),
+                     bulk_reads_.load(std::memory_order_relaxed),
+                     bulk_shared_memory_reads_.load(std::memory_order_relaxed),
+                     bulk_fallbacks_.load(std::memory_order_relaxed),
+                     bulk_ != nullptr};
+  }
+
   std::shared_ptr<const TopologyView> View() const {
     std::lock_guard<std::mutex> lock(view_mu_);
     return view_;
@@ -614,6 +710,11 @@ class ReplicationManager : public std::enable_shared_from_this<ReplicationManage
       : options_(std::move(options)),
         engine_(engine),
         queue_(kAsyncWorkerCount, kAsyncQueueDepth, kAsyncQueueBytes) {
+    if (options_.bulk_enabled) {
+      bulk_ = std::make_unique<BulkClients>(options_.bulk_port_offset,
+                                            options_.bulk_socket_dir,
+                                            options_.ack_timeout_ms + kAsyncForwardTimeoutMs);
+    }
     grpc::ChannelArguments args;
     args.SetMaxSendMessageSize(kPeerMaxMessageBytes);
     args.SetMaxReceiveMessageSize(kPeerMaxMessageBytes);
@@ -658,6 +759,15 @@ class ReplicationManager : public std::enable_shared_from_this<ReplicationManage
       context.set_deadline(DeadlineFromNow(timeout_ms));
       status = stub->Put(&context, request, &response);
     } else {
+      // Phase 6: a value above the unary limit is exactly the case the bulk
+      // transport exists for. Try it; on ANY failure fall through to the
+      // chunked gRPC path, which is still the correctness baseline.
+      //
+      // A bulk PUT stores locally and never forwards -- the same rule
+      // from_replication encodes on the gRPC path -- so a replicated write
+      // cannot fan out a second time no matter which transport carried it.
+      if (SendOneBulk(address, key, value))
+        return std::string();
       status = SendChunked(*stub, key, value, timeout_ms);
     }
 
@@ -667,6 +777,41 @@ class ReplicationManager : public std::enable_shared_from_this<ReplicationManage
                                status.error_message();
     LogFailure(address, reason);
     return reason;
+  }
+
+  // SendOneBulk returns true only on a complete, acknowledged bulk write.
+  // Every other outcome is silent-and-false, because the caller's fallback is
+  // the real error path.
+  bool SendOneBulk(const std::string& address, const std::string& key,
+                   const std::string& value) {
+    if (bulk_ == nullptr)
+      return false;
+    bulk::Client* client = bulk_->Get(address, PeerNodeIdFor(address));
+    if (client == nullptr)
+      return false;
+
+    std::string error;
+    if (client->Put(key, reinterpret_cast<const uint8_t*>(value.data()), value.size(), &error)) {
+      bulk_writes_.fetch_add(1, std::memory_order_relaxed);
+      return true;
+    }
+    // A failed request leaves the connection's framing in an unknown state, so
+    // it is discarded rather than reused.
+    bulk_->Drop(address);
+    bulk_fallbacks_.fetch_add(1, std::memory_order_relaxed);
+    LogFailure(address, "bulk write to " + address + " fell back to gRPC: " + error);
+    return false;
+  }
+
+  // The node ID the current topology says owns this address, so the bulk
+  // handshake can reject a convention-derived endpoint that turns out to
+  // belong to somebody else.
+  std::string PeerNodeIdFor(const std::string& address) const {
+    auto view = View();
+    if (!view)
+      return std::string();
+    auto it = view->node_id_of_address.find(address);
+    return it == view->node_id_of_address.end() ? std::string() : it->second;
   }
 
   grpc::Status SendChunked(nodev1::NodeService::Stub& stub, const std::string& key,
@@ -854,8 +999,10 @@ class ReplicationManager : public std::enable_shared_from_this<ReplicationManage
     view->shard_count = shards.shard_count();
     view->replication_factor = shards.replication_factor();
     view->live_nodes = address_of.size();
-    for (const auto& entry : address_of)
+    for (const auto& entry : address_of) {
       view->live_addresses.insert(entry.second);
+      view->node_id_of_address[entry.second] = entry.first;
+    }
 
     for (const auto& entry : shards.shard_to_owners()) {
       const uint32_t shard = entry.first;
@@ -909,6 +1056,8 @@ class ReplicationManager : public std::enable_shared_from_this<ReplicationManage
       view_ = view;
     }
     peers_.Retain(view->live_addresses);
+    if (bulk_)
+      bulk_->Retain(view->live_addresses);
 
     size_t primary_shards = view->replica_targets.size();
     size_t replicated = 0;
@@ -1044,7 +1193,14 @@ class ReplicationManager : public std::enable_shared_from_this<ReplicationManage
         // Above the unary limit, so PrefixMatch did not inline it. Without this
         // second fetch every multi-megabyte value would silently fail to
         // backfill, which is precisely the size of value this cache exists for.
-        if (!FetchChunked(*stub, match.key(), &value)) {
+        //
+        // Phase 6: try the bulk transport first. This is the single biggest
+        // consumer of large transfers in the whole system -- a node that just
+        // gained 29 shards pulls every oversized value in them -- and it falls
+        // back to the chunked path per key, so a peer without a bulk listener
+        // simply backfills the way it always did.
+        if (!FetchBulk(address, match.key(), &value) &&
+            !FetchChunked(*stub, match.key(), &value)) {
           (*skipped)++;
           continue;
         }
@@ -1066,6 +1222,37 @@ class ReplicationManager : public std::enable_shared_from_this<ReplicationManage
     if (!status.ok())
       LogFailure(address, "catch-up scan of " + address + " failed: " + status.error_message());
     return copied;
+  }
+
+  // FetchBulk pulls one oversized value over the bulk transport. Same contract
+  // as SendOneBulk: true only on a complete, verified-length transfer, false
+  // for every other outcome so the caller falls back.
+  bool FetchBulk(const std::string& address, const std::string& key, std::string* out) {
+    if (bulk_ == nullptr)
+      return false;
+    bulk::Client* client = bulk_->Get(address, PeerNodeIdFor(address));
+    if (client == nullptr)
+      return false;
+
+    bulk::Blob blob;
+    bool found = false;
+    std::string error;
+    if (!client->Get(key, &blob, &found, &error)) {
+      bulk_->Drop(address);
+      bulk_fallbacks_.fetch_add(1, std::memory_order_relaxed);
+      return false;
+    }
+    if (!found)
+      return false;  // vanished between scan and fetch; the scan is not a snapshot
+
+    // Copied out of the blob because the value is about to go into the engine,
+    // which owns its own storage. On the shared-memory path this is the only
+    // copy the receiver makes.
+    out->assign(reinterpret_cast<const char*>(blob.data()), blob.size());
+    bulk_reads_.fetch_add(1, std::memory_order_relaxed);
+    if (blob.mapped())
+      bulk_shared_memory_reads_.fetch_add(1, std::memory_order_relaxed);
+    return true;
   }
 
   bool FetchChunked(nodev1::NodeService::Stub& stub, const std::string& key,
@@ -1104,6 +1291,11 @@ class ReplicationManager : public std::enable_shared_from_this<ReplicationManage
   std::shared_ptr<const TopologyView> view_;
 
   PeerClients peers_;
+  std::unique_ptr<BulkClients> bulk_;
+  std::atomic<uint64_t> bulk_writes_{0};
+  std::atomic<uint64_t> bulk_reads_{0};
+  std::atomic<uint64_t> bulk_shared_memory_reads_{0};
+  std::atomic<uint64_t> bulk_fallbacks_{0};
   AsyncQueue queue_;
   // One entry per control-plane replica, built once at construction and never
   // mutated, so the poller can read it without a lock.
@@ -1556,6 +1748,15 @@ struct Options {
   uint64_t topology_poll_interval_ms = 2000;
   uint64_t replica_ack_timeout_ms = 2000;
   bool catch_up = true;
+
+  // Phase 6 bulk transport. On by default because it is strictly an
+  // optimisation with a total fallback; --no-bulk-transport turns it off, which
+  // is what the benchmark uses to measure the two paths against each other.
+  bool bulk_transport = true;
+  int bulk_port_offset = 1000;
+  std::string bulk_socket_dir = "/tmp/pulsekv-bulk";
+  std::string bulk_send_mode = "write";
+  bool bulk_memfd = true;
 };
 
 void PrintUsage(const char* argv0) {
@@ -1598,7 +1799,26 @@ void PrintUsage(const char* argv0) {
       "                            for its acks (default %llu)\n"
       "  --no-catch-up             do not backfill newly-held shards from a peer.\n"
       "                            Replication still runs; only the initial copy\n"
-      "                            is skipped.\n",
+      "                            is skipped.\n"
+      "\n"
+      "bulk transport (Phase 6; large values only, always optional):\n"
+      "  --no-bulk-transport       do not listen for, or use, bulk transfers.\n"
+      "                            Every large value then moves over the Phase 1\n"
+      "                            chunked gRPC path, exactly as before.\n"
+      "  --bulk-port-offset N      bulk TCP port = --port + N (default 1000)\n"
+      "  --bulk-socket-dir PATH    directory for the same-host unix socket\n"
+      "                            (default /tmp/pulsekv-bulk). A peer on another\n"
+      "                            host simply will not find this path, which is\n"
+      "                            how same-host is detected.\n"
+      "  --bulk-send-mode MODE     how an inline value reaches the socket:\n"
+      "                            write (default) or sendfile. Exposed because\n"
+      "                            Phase 6 measured them rather than assuming.\n"
+      "                            A vmsplice/splice mode was implemented, then\n"
+      "                            removed for corrupting data under concurrent\n"
+      "                            readers -- see node/grpc_shim/bulk.cc.\n"
+      "  --no-bulk-memfd           never hand a memfd to a same-host peer; send\n"
+      "                            the bytes inline instead. For measuring what\n"
+      "                            the shared-memory path actually buys.\n",
       argv0, (unsigned long long)PK_ENGINE_DEFAULT_RAM_BUDGET_BYTES,
       (unsigned long long)PK_ENGINE_DEFAULT_MAX_VALUE_BYTES,
       (unsigned long long)2000, (unsigned long long)2000);
@@ -1675,6 +1895,33 @@ bool ParseOptions(int argc, char** argv, Options* out) {
         return false;
     } else if (name == "--no-catch-up") {
       out->catch_up = false;
+    } else if (name == "--no-bulk-transport") {
+      out->bulk_transport = false;
+    } else if (name == "--no-bulk-memfd") {
+      out->bulk_memfd = false;
+    } else if (name == "--bulk-port-offset") {
+      if (!next_value("--bulk-port-offset")) return false;
+      char* end = nullptr;
+      const long parsed = std::strtol(value.c_str(), &end, 10);
+      if (end == value.c_str() || *end != '\0' || parsed == 0 || parsed < -65535 ||
+          parsed > 65535) {
+        std::fprintf(stderr, "error: --bulk-port-offset %s is not a usable offset\n",
+                     value.c_str());
+        return false;
+      }
+      out->bulk_port_offset = static_cast<int>(parsed);
+    } else if (name == "--bulk-socket-dir") {
+      if (!next_value("--bulk-socket-dir")) return false;
+      out->bulk_socket_dir = value;
+    } else if (name == "--bulk-send-mode") {
+      if (!next_value("--bulk-send-mode")) return false;
+      bulk::SendMode parsed;
+      if (!bulk::ParseSendMode(value, &parsed)) {
+        std::fprintf(stderr, "error: --bulk-send-mode %s is not write or sendfile\n",
+                     value.c_str());
+        return false;
+      }
+      out->bulk_send_mode = value;
     } else if (name == "--port") {
       if (!next_value("--port")) return false;
       char* end = nullptr;
@@ -1794,7 +2041,44 @@ int main(int argc, char** argv) {
     replication_options.ack_timeout_ms =
         static_cast<int64_t>(options.replica_ack_timeout_ms);
     replication_options.catch_up = options.catch_up;
+    replication_options.bulk_enabled = options.bulk_transport;
+    replication_options.bulk_port_offset = options.bulk_port_offset;
+    replication_options.bulk_socket_dir = options.bulk_socket_dir;
     replication = ReplicationManager::Create(std::move(replication_options), engine);
+  }
+
+  // The bulk listener is opened before anything advertises this node as ready.
+  // A peer that can reach us over gRPC but not over bulk would simply fall
+  // back, so this is not a correctness requirement -- but it does avoid a
+  // pointless burst of fallbacks in the first seconds after a restart.
+  std::unique_ptr<bulk::Server> bulk_server;
+  if (options.bulk_transport) {
+    bulk::ServerOptions bulk_options;
+    bulk_options.node_id = options.node_id;
+    bulk_options.host = options.host;
+    bulk_options.tcp_port = bulk::BulkPort(options.port, options.bulk_port_offset);
+    bulk_options.unix_path =
+        bulk::UnixSocketPath(options.bulk_socket_dir, options.host, options.port);
+    bulk_options.max_value_bytes = pk_engine_max_value_bytes(engine);
+    bulk_options.allow_memfd = options.bulk_memfd;
+    bulk::ParseSendMode(options.bulk_send_mode, &bulk_options.send_mode);
+
+    if (!options.bulk_socket_dir.empty()) {
+      // Best effort: a directory we cannot create simply means no unix socket,
+      // and the TCP listener still works.
+      ::mkdir(options.bulk_socket_dir.c_str(), 0700);
+    }
+
+    std::string bulk_error;
+    bulk_server = bulk::Server::Start(std::move(bulk_options), engine, &bulk_error);
+    if (!bulk_server) {
+      // Not fatal. A node without a bulk listener is a node that moves large
+      // values over gRPC, which is exactly what every phase before this one did.
+      std::fprintf(stderr,
+                   "[%s] warning: bulk transport disabled (%s); large transfers "
+                   "will use the chunked gRPC path\n",
+                   options.node_id.c_str(), bulk_error.c_str());
+    }
   }
 
   NodeServiceImpl service(options.node_id, engine, replication);
@@ -1852,6 +2136,18 @@ int main(int argc, char** argv) {
     std::printf("[%s] engine: nvme tier at %s/spill (purged at start and stop)\n",
                 options.node_id.c_str(), options.data_dir.c_str());
   }
+  if (bulk_server) {
+    std::printf("[%s] bulk transport: tcp %s:%d, unix %s, send-mode %s, memfd %s\n",
+                options.node_id.c_str(), options.host.c_str(), bulk_server->tcp_port(),
+                bulk_server->unix_path().empty() ? "(none)"
+                                                 : bulk_server->unix_path().c_str(),
+                options.bulk_send_mode.c_str(),
+                (options.bulk_memfd && bulk::MemfdSupported()) ? "on" : "off");
+  } else {
+    std::printf("[%s] bulk transport: DISABLED; large values use the chunked "
+                "gRPC path\n",
+                options.node_id.c_str());
+  }
   if (replication) {
     std::printf("[%s] replication: reading ownership from [%s] every %llu ms, "
                 "ack timeout %llu ms, catch-up %s\n",
@@ -1885,12 +2181,40 @@ int main(int argc, char** argv) {
   server->Shutdown();
   serving.join();
 
+  // Stopped after the gRPC server and before the engine, for the same reason
+  // replication is: its handlers call pk_engine_get/put, so every one of them
+  // must be finished while the engine is still alive.
+  if (bulk_server) {
+    const auto& bulk_stats = bulk_server->stats();
+    std::printf("[%s] bulk transport: %llu get(s), %llu put(s), %llu memfd handoff(s), "
+                "%llu inline send(s), %llu error(s), %llu refused connection(s)\n",
+                options.node_id.c_str(),
+                (unsigned long long)bulk_stats.gets.load(),
+                (unsigned long long)bulk_stats.puts.load(),
+                (unsigned long long)bulk_stats.memfd_handoffs.load(),
+                (unsigned long long)bulk_stats.inline_sends.load(),
+                (unsigned long long)bulk_stats.errors.load(),
+                (unsigned long long)bulk_stats.rejected_connections.load());
+    bulk_server->Stop();
+    bulk_server.reset();
+  }
+
   // Stopped after the server, and before the engine: catch-up is the one piece
   // of replication that calls into the engine, so it must be joined while the
   // engine is still alive. Stop() drains the background queue and waits, with a
   // bound, for detached strong-ack forwards.
   if (replication) {
     replication->Stop();
+    const auto bulk_client_stats = replication->bulk_stats();
+    if (bulk_client_stats.enabled) {
+      std::printf("[%s] bulk client: %llu write(s), %llu read(s) (%llu via shared "
+                  "memory), %llu fallback(s) to gRPC\n",
+                  options.node_id.c_str(),
+                  (unsigned long long)bulk_client_stats.writes,
+                  (unsigned long long)bulk_client_stats.reads,
+                  (unsigned long long)bulk_client_stats.shared_memory_reads,
+                  (unsigned long long)bulk_client_stats.fallbacks);
+    }
     const uint64_t dropped = replication->dropped_writes();
     if (dropped > 0) {
       std::printf("[%s] replication: %llu background write(s) were dropped at the "

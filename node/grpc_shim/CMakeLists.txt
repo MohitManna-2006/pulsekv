@@ -117,9 +117,32 @@ target_compile_options(pulsekv_proto PRIVATE -w)
 # #include of one fails to compile.
 add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../engine" engine)
 
+# The bulk transport is a separate translation unit, and separate on purpose:
+# it speaks no gRPC and no protobuf at all. It is a raw framed socket protocol
+# plus memfd/SCM_RIGHTS, and keeping it out of main.cpp is what makes that
+# obvious -- and what lets the benchmark harness link it without dragging the
+# whole node in.
+add_library(pulsekv_bulk STATIC bulk.cc)
+target_include_directories(pulsekv_bulk PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_options(pulsekv_bulk PRIVATE -Wall -Wextra)
+target_link_libraries(pulsekv_bulk PUBLIC pulsekv_engine Threads::Threads)
+
 add_executable(pulsekv-node main.cpp)
 target_compile_options(pulsekv-node PRIVATE -Wall -Wextra)
-target_link_libraries(pulsekv-node PRIVATE pulsekv_proto pulsekv_engine Threads::Threads)
+target_link_libraries(pulsekv-node PRIVATE pulsekv_proto pulsekv_engine pulsekv_bulk Threads::Threads)
+
+# ---------------------------------------------------------------------------
+# Bulk transfer benchmark.
+#
+# A benchmark harness, NOT an adapter. Phase 7 builds the real SGLang HiCache
+# backend; this exists only to put numbers on the transports Phase 6 added, and
+# it doubles as the "synthetic adapter" the phase needs -- a co-located process
+# that consumes values over the shared-memory path, which is exactly the shape
+# a real adapter has.
+# ---------------------------------------------------------------------------
+add_executable(pulsekv-bulk-bench bulk_bench.cc)
+target_compile_options(pulsekv-bulk-bench PRIVATE -Wall -Wextra)
+target_link_libraries(pulsekv-bulk-bench PRIVATE pulsekv_proto pulsekv_engine pulsekv_bulk Threads::Threads)
 
 # Server reflection lets grpcurl introspect a running node without the .proto
 # files. Optional: the shim compiles and serves identically without it, so a
