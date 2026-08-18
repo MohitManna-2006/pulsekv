@@ -273,7 +273,9 @@ pk_join_host_port() {
 
 # pk_controlplane_ids -- one control-plane replica ID per line, in config order.
 pk_controlplane_ids() {
-    pk_config_read --print-control-plane | cut -f1
+    local table
+    table="$(pk_config_read --print-control-plane)" || return 1
+    printf '%s\n' "$table" | cut -f1
 }
 
 # pk_controlplane_line ID -- `node_id<TAB>host<TAB>port` for one replica.
@@ -290,11 +292,12 @@ pk_controlplane_line() {
 # when no ID is given. Callers that can talk to any replica should prefer
 # pk_controlplane_endpoints, which does not care which one is up.
 pk_controlplane_address() {
-    local wanted="${1:-}" id host port line
+    local wanted="${1:-}" id host port line table
     if [ -n "$wanted" ]; then
         line="$(pk_controlplane_line "$wanted")" || return 1
     else
-        line="$(pk_config_read --print-control-plane | head -1)" || return 1
+        table="$(pk_config_read --print-control-plane)" || return 1
+        line="$(printf '%s\n' "$table" | head -1)"
     fi
     IFS=$'\t' read -r id host port <<< "$line"
     [ -n "$host" ] && [ -n "$port" ] || return 1

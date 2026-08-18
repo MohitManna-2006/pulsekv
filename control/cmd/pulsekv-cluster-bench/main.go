@@ -786,6 +786,7 @@ func (b *benchmark) runWorker(cluster *sdk.Client, worker int, result *workerRes
 				result.recordRPCError(fmt.Errorf("Get key %d: %w", keyIndex, err))
 				b.noteLive(func(l *liveCounters) { l.rpcErrors.Add(1) })
 				if b.continueOnError {
+					time.Sleep(2 * time.Millisecond)
 					continue
 				}
 				return
@@ -826,6 +827,7 @@ func (b *benchmark) runWorker(cluster *sdk.Client, worker int, result *workerRes
 			result.recordRPCError(fmt.Errorf("Put key %d: %w", keyIndex, err))
 			b.noteLive(func(l *liveCounters) { l.rpcErrors.Add(1) })
 			if b.continueOnError {
+				time.Sleep(2 * time.Millisecond)
 				continue
 			}
 			return

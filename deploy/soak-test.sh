@@ -260,14 +260,14 @@ if [ "$ENABLE_CHAOS" -eq 1 ]; then
             if [ $((cycle % 4)) -eq 0 ]; then
                 cp_count="$(pk_controlplane_ids | grep -c . || echo 0)"
                 if [ "$cp_count" -ge 3 ]; then
-                    leader_id="$("$PULSEKV_SMOKE_BIN" --config "$PULSEKV_CONFIG" --mode=leader 2>/dev/null | grep -o 'controlplane-[0-9]' || true)"
+                    leader_id="$("$PULSEKV_SMOKE_BIN" --config "$PULSEKV_CONFIG" --mode=leader 2>/dev/null | grep -o 'cp-[0-9]' || true)"
                     if [ -n "$leader_id" ]; then
                         printf '[%s] [chaos-cycle %d] Cycling Raft leader: %s\n' \
                             "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$cycle" "$leader_id" >> "$CHAOS_LOG"
-                        pk_stop_managed "$leader_id" 2 >> "$CHAOS_LOG" 2>&1 || true
+                        pk_stop_managed "controlplane:${leader_id}" 2 >> "$CHAOS_LOG" 2>&1 || true
                         sleep 4
-                        # Restart it so group returns to full quorum.
-                        "$PULSEKV_SMOKE_BIN" --config "$PULSEKV_CONFIG" --mode=wait --min-control-plane=2 >> "$CHAOS_LOG" 2>&1 || true
+                        pk_start_controlplane "$leader_id" >> "$CHAOS_LOG" 2>&1 || true
+                        "$PULSEKV_SMOKE_BIN" --config "$PULSEKV_CONFIG" --mode=wait --min-control-plane=3 >> "$CHAOS_LOG" 2>&1 || true
                     fi
                 fi
             fi
