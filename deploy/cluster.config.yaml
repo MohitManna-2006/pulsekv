@@ -2,8 +2,9 @@
 #
 # This file is the single source of truth for the dev cluster's shape. It is
 # read by:
-#   * the Go control plane, which uses it for its fixed shard count and gossip
-#     bootstrap endpoints; live membership itself comes from SWIM
+#   * every Go control-plane replica, which uses it for its fixed shard count,
+#     its own identity, its Raft peer list, and gossip bootstrap endpoints;
+#     live membership itself comes from SWIM and is then agreed through Raft
 #   * deploy/run-local-cluster.sh and deploy/stop-local-cluster.sh, which get
 #     the node list by shelling out to `controlplane --print-nodes` rather than
 #     parsing YAML themselves
@@ -42,17 +43,72 @@
 # sidecar must join the gossip ring before ClusterMetadataService publishes it,
 # and a terminal leave/death removes it without changing this file.
 #
-# Phase 4 added replication_factor below. There is still no explicit shard
-# assignment here: Phase 5's Raft state machine replaces this file as the source
-# of the shard map. The ClusterMetadataService methods remain stable; a
+# Phase 4 added replication_factor; Phase 5 turned `control_plane` into a list
+# and added `raft`. There is still no explicit shard assignment here, and there
+# never will be: ownership is derived, not configured. What Phase 5 changed is
+# WHO agrees on the derivation's input -- a Raft group rather than each replica's
+# own gossip view. The ClusterMetadataService methods remain stable; a
 # content-derived topology fingerprint prevents clients from combining epochs
 # across its two calls.
 
+# ---------------------------------------------------------------------------
+# Control-plane replicas (Phase 5)
+# ---------------------------------------------------------------------------
+# This is a LIST, and the list IS the Raft metadata group. Three replicas is the
+# smallest group that survives losing one, which is the property Phase 5 exists
+# to demonstrate; the implementation plan's range is 3-5. Use an odd count --
+# an even one needs a larger quorum while tolerating no more failures.
+#
+# Each replica needs three ports, and every field except the gRPC one has an
+# indexed default so this stays short:
+#
+#   port        7000 + i   ClusterMetadataService (clients and data nodes)
+#   gossip_port 7240 + i   memberlist TCP state exchange and UDP probes
+#   raft_port   7300 + i   Raft transport between replicas
+#
+# node_id defaults to cp-<i> and is the replica's RAFT SERVER ID, so it must be
+# stable across restarts: a replica returning under a new one would look like a
+# brand-new voter rather than the one that left.
+#
+# Clients and data nodes are given the whole list and fall back across it, so
+# any single replica can be down or mid-election without anyone noticing.
 control_plane:
-  # host is optional and defaults to 127.0.0.1.
-  port: 7000
-  # memberlist uses this port for both TCP state exchange and UDP probes.
-  gossip_port: 7200
+  - node_id: cp-0
+    # host is optional and defaults to 127.0.0.1.
+    port: 7000
+  - node_id: cp-1
+    port: 7001
+  - node_id: cp-2
+    port: 7002
+
+# ---------------------------------------------------------------------------
+# Raft metadata group (Phase 5)
+# ---------------------------------------------------------------------------
+# What the group agrees on is deliberately small: the live data-node set and
+# replication_factor. NOT the shard map -- router.AssignShards is a pure
+# function of that input, so every replica derives a byte-identical map locally
+# with nothing to coordinate. Putting 256 map entries through consensus to
+# re-derive something already agreed would add a second way to disagree and buy
+# nothing. See control/internal/metastore.
+raft:
+  # Per-replica log and snapshot state, relative to this file. Each replica
+  # owns <data_dir>/<node_id>. Unlike the engine's spill tier this is MEANT to
+  # survive a restart: it is what lets a returning replica catch up from where
+  # it left off instead of replaying the world.
+  data_dir: run/raft
+
+  # One knob drives heartbeat, election, and leader-lease timeouts together,
+  # because they have ordering constraints between them and deriving the rest
+  # makes an invalid combination unrepresentable. 500 ms puts local failover at
+  # roughly 0.5-1.5 s: fast enough that a chaos cycle is not mostly waiting,
+  # slow enough that a busy laptop does not trigger spurious elections. It is
+  # not a production number.
+  election_timeout_ms: 500
+
+  # How often the leader reconciles its own gossip view with committed
+  # membership. Well under the election timeout, so a membership change commits
+  # long before it could be mistaken for leader trouble.
+  propose_interval_ms: 200
 
 # The label carried by every memberlist packet. Participants with a different
 # label cannot accidentally merge into this ring. The local demo binds every

@@ -26,10 +26,17 @@ type mutableSource struct {
 func (s *mutableSource) Snapshot() membership.Snapshot {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return membership.Snapshot{
+	out := membership.Snapshot{
 		Generation: s.snapshot.Generation,
 		Nodes:      append([]membership.Node(nil), s.snapshot.Nodes...),
 	}
+	// Propagated by value, like the real sources do. A fake that dropped it
+	// would make every assertion about the agreed factor vacuous.
+	if s.snapshot.ReplicationFactor != nil {
+		factor := *s.snapshot.ReplicationFactor
+		out.ReplicationFactor = &factor
+	}
+	return out
 }
 
 func (s *mutableSource) set(snapshot membership.Snapshot) {
@@ -387,6 +394,145 @@ func TestGetShardMapDegradesWhenReplicasExceedLiveNodes(t *testing.T) {
 		if entry.GetReplicas()[0] == entry.GetPrimary() {
 			t.Fatalf("shard %d replicates to its own primary %q", shard, entry.GetPrimary())
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5: the source may be authoritative about configuration
+// ---------------------------------------------------------------------------
+
+// A source that reports an agreed replication factor overrides local config.
+//
+// This is what makes the Raft-backed factor real: Phase 4 left every control
+// plane applying its own configured number, so two replicas could publish owner
+// maps computed from different factors for the same membership. Once the group
+// agrees on it, the agreed value is the one placement uses.
+func TestAgreedReplicationFactorOverridesLocalConfig(t *testing.T) {
+	source := fourNodeSource(21)
+
+	// Local config says 0; the source says 2.
+	agreed := 2
+	source.snapshot.ReplicationFactor = &agreed
+	svc := newTestServiceWithReplicas(t, 32, 0, source)
+
+	resp, err := svc.GetShardMap(context.Background(), &metadatav1.GetShardMapRequest{})
+	if err != nil {
+		t.Fatalf("GetShardMap: %v", err)
+	}
+	if resp.GetReplicationFactor() != 2 {
+		t.Fatalf("published replication_factor = %d, want the agreed 2", resp.GetReplicationFactor())
+	}
+
+	want := router.AssignShardOwners([]string{"node-0", "node-1", "node-2", "node-3"}, 32, 2)
+	for shard := uint32(0); shard < 32; shard++ {
+		entry := resp.GetShardToOwners()[shard]
+		if len(entry.GetReplicas()) != len(want[shard].Replicas) {
+			t.Fatalf("shard %d has %d replica(s); the agreed factor of 2 wants %d",
+				shard, len(entry.GetReplicas()), len(want[shard].Replicas))
+		}
+	}
+
+	// An agreed 0 must win over a configured 2, the same way round. A pointer
+	// is what makes that expressible.
+	zero := 0
+	source.snapshot.ReplicationFactor = &zero
+	configuredTwo := newTestServiceWithReplicas(t, 32, 2, source)
+	resp, err = configuredTwo.GetShardMap(context.Background(), &metadatav1.GetShardMapRequest{})
+	if err != nil {
+		t.Fatalf("GetShardMap: %v", err)
+	}
+	if resp.GetReplicationFactor() != 0 {
+		t.Fatalf("published replication_factor = %d, want the agreed 0", resp.GetReplicationFactor())
+	}
+	for shard := uint32(0); shard < 32; shard++ {
+		if len(resp.GetShardToOwners()[shard].GetReplicas()) != 0 {
+			t.Fatalf("shard %d has replicas at an agreed factor of 0", shard)
+		}
+	}
+}
+
+// A gossip source leaves the factor nil, and the service must then behave
+// exactly as it did in Phase 3/4: local config decides.
+func TestNilAgreedFactorFallsBackToLocalConfig(t *testing.T) {
+	source := fourNodeSource(22)
+	if source.snapshot.ReplicationFactor != nil {
+		t.Fatal("the test source must model a gossip view, which knows no factor")
+	}
+	svc := newTestServiceWithReplicas(t, 32, 1, source)
+
+	resp, err := svc.GetShardMap(context.Background(), &metadatav1.GetShardMapRequest{})
+	if err != nil {
+		t.Fatalf("GetShardMap: %v", err)
+	}
+	if resp.GetReplicationFactor() != 1 {
+		t.Fatalf("published replication_factor = %d, want the configured 1", resp.GetReplicationFactor())
+	}
+}
+
+// The agreed factor is part of what the fingerprint identifies, because it
+// changes every shard's owner list.
+func TestFingerprintFollowsTheAgreedFactor(t *testing.T) {
+	source := fourNodeSource(23)
+	svc := newTestServiceWithReplicas(t, 32, 0, source)
+
+	one, two := 1, 2
+	source.snapshot.ReplicationFactor = &one
+	first, err := svc.GetShardMap(context.Background(), &metadatav1.GetShardMapRequest{})
+	if err != nil {
+		t.Fatalf("GetShardMap: %v", err)
+	}
+	source.snapshot.ReplicationFactor = &two
+	second, err := svc.GetShardMap(context.Background(), &metadatav1.GetShardMapRequest{})
+	if err != nil {
+		t.Fatalf("GetShardMap: %v", err)
+	}
+	if bytes.Equal(first.GetTopologyFingerprint(), second.GetTopologyFingerprint()) {
+		t.Fatal("changing the agreed factor did not change the topology fingerprint")
+	}
+}
+
+// The leader fields are diagnostic and must NOT reach the fingerprint. Two
+// replicas holding the same committed state have to fingerprint the same even
+// when one has not yet noticed an election -- otherwise a perfectly valid
+// follower response would look like a different topology.
+func TestLeaderInfoIsReportedButNotFingerprinted(t *testing.T) {
+	source := fourNodeSource(24)
+
+	plain := newTestServiceWithReplicas(t, 32, 1, source)
+	withoutLeader, err := plain.GetShardMap(context.Background(), &metadatav1.GetShardMapRequest{})
+	if err != nil {
+		t.Fatalf("GetShardMap: %v", err)
+	}
+	if withoutLeader.GetRaftLeaderId() != "" || withoutLeader.GetRaftTerm() != 0 {
+		t.Fatalf("a service with no Raft group reported leader %q term %d",
+			withoutLeader.GetRaftLeaderId(), withoutLeader.GetRaftTerm())
+	}
+
+	svc, err := New(&config.Config{ShardCount: 32, ReplicationFactor: 1}, source,
+		WithLeaderInfo(func() (string, uint64) { return "cp-1", 7 }))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	withLeader, err := svc.GetShardMap(context.Background(), &metadatav1.GetShardMapRequest{})
+	if err != nil {
+		t.Fatalf("GetShardMap: %v", err)
+	}
+	if withLeader.GetRaftLeaderId() != "cp-1" || withLeader.GetRaftTerm() != 7 {
+		t.Fatalf("leader = %q term %d, want cp-1 term 7",
+			withLeader.GetRaftLeaderId(), withLeader.GetRaftTerm())
+	}
+	if !bytes.Equal(withLeader.GetTopologyFingerprint(), withoutLeader.GetTopologyFingerprint()) {
+		t.Fatal("leadership information leaked into the topology fingerprint")
+	}
+
+	// And GetNodeList must still agree with GetShardMap, or the coherence
+	// retry in internal/topology could never converge.
+	nodesResp, err := svc.GetNodeList(context.Background(), &metadatav1.GetNodeListRequest{})
+	if err != nil {
+		t.Fatalf("GetNodeList: %v", err)
+	}
+	if !bytes.Equal(nodesResp.GetTopologyFingerprint(), withLeader.GetTopologyFingerprint()) {
+		t.Fatal("GetNodeList and GetShardMap disagree on the fingerprint")
 	}
 }
 

@@ -167,9 +167,11 @@ func TestCheckRoutingUsesSDKAndProvesPhysicalPlacement(t *testing.T) {
 	})
 	metadataHost, metadataPort := splitRoutingTestAddress(t, metadataAddress)
 	cfg := &config.Config{
-		ControlPlane: config.Endpoint{Host: metadataHost, Port: metadataPort},
-		ShardCount:   shardCount,
-		Nodes:        nodes,
+		ControlPlanes: config.ControlPlaneList{{
+			NodeID: "cp-0", Host: metadataHost, Port: metadataPort,
+		}},
+		ShardCount: shardCount,
+		Nodes:      nodes,
 	}
 
 	conn, err := dial(metadataAddress)

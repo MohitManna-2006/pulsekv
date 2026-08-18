@@ -21,10 +21,32 @@ type Node struct {
 type Snapshot struct {
 	Generation uint64
 	Nodes      []Node
+
+	// ReplicationFactor is the cluster-agreed replicas-per-shard when this
+	// source is authoritative about configuration, and nil when it is not.
+	//
+	// A gossip view always leaves it nil: memberlist observes liveness, not
+	// configuration, and inventing a number here would be a guess. Phase 5's
+	// Raft-backed source does set it, because the factor is one of the two
+	// things the metadata group agrees on.
+	//
+	// It rides on the Snapshot rather than being fetched separately for a
+	// correctness reason, not convenience: the node set and the factor are
+	// both inputs to one placement computation, and reading them through two
+	// calls could interleave with an apply and produce a shard map describing
+	// a state that never existed. One read, one coherent answer.
+	//
+	// A pointer because 0 is a real replication factor, the same reason
+	// config.ReplicationFactorSetting is one.
+	ReplicationFactor *int
 }
 
-// Source is the seam consumed by ClusterMetadataService. Phase 5 can replace
-// this gossip-derived implementation without changing metadata RPC handlers.
+// Source is the seam consumed by ClusterMetadataService.
+//
+// Phase 3 satisfied it with the gossip Manager below. Phase 5 satisfies it with
+// a Raft-backed view of committed state instead, and that substitution is the
+// entire integration: metadata's RPC handlers never learned that consensus
+// exists.
 type Source interface {
 	Snapshot() Snapshot
 }
@@ -57,10 +79,17 @@ func (v *view) Snapshot() Snapshot {
 }
 
 func cloneSnapshot(in Snapshot) Snapshot {
-	return Snapshot{
+	out := Snapshot{
 		Generation: in.Generation,
 		Nodes:      append([]Node(nil), in.Nodes...),
 	}
+	if in.ReplicationFactor != nil {
+		// Copy the value, not the pointer: a Snapshot handed to an RPC must not
+		// alias anything a later apply could rewrite underneath it.
+		factor := *in.ReplicationFactor
+		out.ReplicationFactor = &factor
+	}
+	return out
 }
 
 func (v *view) upsert(memberName string, raw []byte) error {

@@ -217,6 +217,10 @@ waits for the configured ack count.
 
 ## 8. Phase 5 — Raft-backed metadata plane (Go)
 
+**Status: complete (2026-08-18).** Implementation details, verification
+evidence, and the exact Phase 6 handoff are recorded in
+`pulsekv-v2-phase5-summary.md`.
+
 **Goal:** move shard ownership and cluster configuration off ad hoc gossip-derived state and onto
 a small, consistent, consensus-backed source of truth — the one place in this system where real
 consensus is the correct tool.

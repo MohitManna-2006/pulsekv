@@ -8,7 +8,7 @@ from one config file.
 deploy/
 ├── Dockerfile              polyglot build image (C/C++/Go/Python + gRPC codegen)
 ├── cluster.config.yaml     four-node fast-loop launch/bootstrap inventory
-├── cluster.chaos.config.yaml eight-node gossip/chaos fixture
+├── cluster.chaos.config.yaml eight-node gossip/chaos/failover fixture
 ├── common.sh               shared paths and helpers, sourced by the scripts
 ├── gen-proto.sh            regenerate the Go and Python stubs
 ├── run-local-cluster.sh    build + boot + wait for health and membership
@@ -99,6 +99,38 @@ Default is 4 nodes (fast loop). `cluster.chaos.config.yaml` provides the
 eight-node membership/replication fixture; the broader design target for gossip
 and Phase 5 Raft chaos testing is 8–32 nodes on one machine.
 
+## The control-plane group
+
+`control_plane:` is a LIST, and that list is the Raft metadata group. The dev
+configs ship three replicas -- the smallest group that survives losing one.
+Every replica serves `ClusterMetadataService`; only the current Raft leader
+turns what it sees in gossip into committed membership.
+
+Reading from a follower is safe, not a compromise: a replica answers from its
+own applied log, which is always a prefix of the leader's committed one, so it
+can be a heartbeat behind but never describes a different cluster. Clients, data
+nodes, and every tool are therefore given the whole list and fall back across
+it, and no single replica is a single point of failure.
+
+```sh
+# who leads right now
+deploy/build/bin/pulsekv-smoke --config deploy/cluster.config.yaml --mode=leader
+
+# wait for the group to agree, optionally on someone new
+deploy/build/bin/pulsekv-smoke --config deploy/cluster.config.yaml \
+    --mode=leader-wait --min-replicas=3
+
+# kill the leader and watch it fail over, under load
+deploy/chaos-test.sh --config deploy/cluster.chaos.config.yaml \
+    --scenario both --target node-3 --cycles 2
+```
+
+Raft log and snapshot state lives under `raft.data_dir` (`deploy/run/raft/<id>`)
+and, unlike the engine's spill tier, is MEANT to survive a restart -- it is what
+lets a returning replica catch up instead of starting over. `deploy/run/` is
+gitignored; removing it resets the group, which is the right move when changing
+the replica set in the config.
+
 ## Replication factor
 
 `replication_factor` in the config sets how many replicas each shard gets beyond
@@ -115,9 +147,9 @@ started without `--metadata-addr` does not replicate at all.
 
 | Script | Guarantee |
 |---|---|
-| `run-local-cluster.sh` | Every service answers `HealthCheck`, every sidecar is running, and metadata publishes the exact live node set and HRW map before the ready banner. On timeout it dumps logs, stops the partial cluster, and exits non-zero. |
-| `local-node.sh` | Operates on one configured data/sidecar pair. Graceful leave is published before data shutdown; crash paths exercise either SWIM detection or the local-service watchdog; start waits for data health before advertising it. |
-| `chaos-test.sh` | Runs one sustained correctness watcher while a target repeatedly leaves/fails and rejoins. It verifies every topology generation, exact minimal HRW movement, stable-key operations, and physical placement, then writes a JSON report. At replication factor >= 1 it also strong-ack seeds keys on shards the target primaries and proves the promoted replica — and, after the rejoin, the restarted target's freshly backfilled engine — serves them byte-for-byte. At factor 0 it records why that proof was skipped. |
+| `run-local-cluster.sh` | Starts every control-plane replica and waits for the Raft group to elect a leader BEFORE booting data nodes -- until there is a leader nothing can commit membership, so a node that joined gossip would sit unpublished. Then every service answers `HealthCheck`, every sidecar is running, and metadata publishes the exact live node set and HRW map before the ready banner. On timeout it dumps logs, stops the partial cluster, and exits non-zero. |
+| `local-node.sh` | Operates on one configured data/sidecar pair. Graceful leave is published before data shutdown; crash paths exercise either SWIM detection or the local-service watchdog; start waits for data health before advertising it. It requires only a QUORUM of control-plane replicas, not all of them: it legitimately runs while one is down, and demanding every replica would make the lifecycle scripts stricter than the group they manage. |
+| `chaos-test.sh` | Runs one sustained correctness watcher while a target repeatedly leaves/fails and rejoins. It verifies every topology generation, exact minimal HRW movement, stable-key operations, and physical placement, then writes a JSON report. At replication factor >= 1 it also strong-ack seeds keys on shards the target primaries and proves the promoted replica — and, after the rejoin, the restarted target's freshly backfilled engine — serves them byte-for-byte. At factor 0 it records why that proof was skipped. With `--scenario both` it also kills the Raft leader at the same moment as the data node and restarts it at the same moment, then asserts the survivors converge on one new leader at a higher term, that no two replicas ever disagree about a committed state, and that the restarted former leader comes back fenced -- a follower that adopts the state committed while it was away rather than reasserting its own. |
 | `smoke-test.sh` | Three legs — Go contract and routing assertions, the Python adapters client, and an optional grpcurl reflection check. The Go leg independently reproduces the HRW shard map and proves SDK writes hit the predicted owner and miss a node holding no copy of that shard. It also reproduces the primary+replica owner map, then proves a strong-ack write is byte-identical on every replica via direct `NodeService.Get`. Non-zero on any failure. |
 | `stop-local-cluster.sh` | Stops watcher → sidecars → data nodes → control plane, with bounded SIGTERM grace, SIGKILL fallback, PID-identity guards, and an orphan sweep. |
 | `test-engine.sh` | Builds and runs the pure-C engine suite. No cluster, no gRPC, no network. |

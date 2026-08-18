@@ -90,11 +90,25 @@ func WithDialOptions(dialOptions ...grpc.DialOption) Option {
 
 type topology = clustertopology.Snapshot
 
+// metadataEndpoint is one control-plane replica the client may read from.
+type metadataEndpoint struct {
+	address string
+	conn    *grpc.ClientConn
+	client  metadatav1.ClusterMetadataServiceClient
+}
+
 // Client is a concurrency-safe PulseKV cluster client.
 type Client struct {
-	metadataConn *grpc.ClientConn
-	metadata     metadatav1.ClusterMetadataServiceClient
-	dialOptions  []grpc.DialOption
+	// endpoints is every control-plane replica, in the order given. Phase 5
+	// made the metadata plane a Raft group, so the replica this client happens
+	// to prefer can be down or mid-election while the group is perfectly
+	// healthy; refresh falls back across the rest rather than failing.
+	endpoints []metadataEndpoint
+	// preferred is the index refresh starts from. It sticks to whatever last
+	// answered, so a healthy client is not round-robining across replicas for
+	// no reason.
+	preferred   int
+	dialOptions []grpc.DialOption
 
 	refreshInterval time.Duration
 	refreshTimeout  time.Duration
@@ -116,9 +130,21 @@ type Client struct {
 // topology, and starts periodic metadata refresh. The initial metadata fetch is
 // eager: a successful return means the client has a complete authoritative
 // topology, which may explicitly contain no live data nodes.
+//
+// controlPlaneAddr may be a single address or a comma-separated list of
+// control-plane replicas ("host:1,host:2,host:3"). With a list, each refresh
+// tries the last replica that answered and falls back across the others, so a
+// replica being down or mid-election is invisible to the caller. Every existing
+// single-address call site keeps working unchanged.
+//
+// Reads are served by whichever replica answers, not necessarily the leader.
+// That is safe rather than sloppy: a Raft replica's applied state is always a
+// prefix of the leader's committed log, so a follower's answer may be slightly
+// behind but is never a contradictory reality.
 func New(controlPlaneAddr string, opts ...Option) (*Client, error) {
-	if strings.TrimSpace(controlPlaneAddr) == "" {
-		return nil, errors.New("control-plane address must not be empty")
+	addresses, err := splitEndpoints(controlPlaneAddr)
+	if err != nil {
+		return nil, err
 	}
 
 	cfg := options{
@@ -141,14 +167,27 @@ func New(controlPlaneAddr string, opts ...Option) (*Client, error) {
 		}
 	}
 
-	conn, err := grpc.NewClient(controlPlaneAddr, cfg.dialOptions...)
-	if err != nil {
-		return nil, fmt.Errorf("create control-plane client for %s: %w", controlPlaneAddr, err)
+	endpoints := make([]metadataEndpoint, 0, len(addresses))
+	closeEndpoints := func() {
+		for _, endpoint := range endpoints {
+			_ = endpoint.conn.Close()
+		}
+	}
+	for _, address := range addresses {
+		conn, err := grpc.NewClient(address, cfg.dialOptions...)
+		if err != nil {
+			closeEndpoints()
+			return nil, fmt.Errorf("create control-plane client for %s: %w", address, err)
+		}
+		endpoints = append(endpoints, metadataEndpoint{
+			address: address,
+			conn:    conn,
+			client:  metadatav1.NewClusterMetadataServiceClient(conn),
+		})
 	}
 
 	c := &Client{
-		metadataConn:    conn,
-		metadata:        metadatav1.NewClusterMetadataServiceClient(conn),
+		endpoints:       endpoints,
 		dialOptions:     append([]grpc.DialOption(nil), cfg.dialOptions...),
 		refreshInterval: cfg.refreshInterval,
 		refreshTimeout:  cfg.refreshTimeout,
@@ -165,7 +204,7 @@ func New(controlPlaneAddr string, opts ...Option) (*Client, error) {
 	err = c.refresh(ctx)
 	cancel()
 	if err != nil {
-		_ = conn.Close()
+		closeEndpoints()
 		return nil, fmt.Errorf("load PulseKV topology from %s: %w", controlPlaneAddr, err)
 	}
 
@@ -308,10 +347,12 @@ func (c *Client) Close() error {
 	c.closed = true
 	cancel := c.refreshCancel
 	done := c.refreshDone
-	metadataConn := c.metadataConn
-	conns := make([]*grpc.ClientConn, 0, len(c.nodeConns))
+	conns := make([]*grpc.ClientConn, 0, len(c.nodeConns)+len(c.endpoints))
 	for _, conn := range c.nodeConns {
 		conns = append(conns, conn)
+	}
+	for _, endpoint := range c.endpoints {
+		conns = append(conns, endpoint.conn)
 	}
 	c.mu.Unlock()
 
@@ -325,9 +366,6 @@ func (c *Client) Close() error {
 		if err := conn.Close(); err != nil && firstErr == nil {
 			firstErr = err
 		}
-	}
-	if err := metadataConn.Close(); err != nil && firstErr == nil {
-		firstErr = err
 	}
 
 	c.mu.Lock()
@@ -354,11 +392,70 @@ func (c *Client) refreshLoop(ctx context.Context) {
 	}
 }
 
+// splitEndpoints parses one or more comma-separated control-plane addresses.
+func splitEndpoints(text string) ([]string, error) {
+	seen := make(map[string]bool)
+	var addresses []string
+	for _, raw := range strings.Split(text, ",") {
+		address := strings.TrimSpace(raw)
+		if address == "" {
+			continue
+		}
+		if seen[address] {
+			continue // a duplicated endpoint would just retry the same replica
+		}
+		seen[address] = true
+		addresses = append(addresses, address)
+	}
+	if len(addresses) == 0 {
+		return nil, errors.New("control-plane address must not be empty")
+	}
+	return addresses, nil
+}
+
+// fetchTopology reads a coherent topology from whichever replica answers,
+// starting with the one that answered last.
+//
+// The coherence algorithm inside clustertopology.Fetch is untouched and does
+// not know a Raft group exists. Crucially, one Fetch is confined to ONE
+// replica: its two RPCs must observe the same publisher, or a fingerprint
+// mismatch between a leader and a slightly-behind follower would look like
+// membership churn and burn the retry budget for no reason.
+func (c *Client) fetchTopology(ctx context.Context) (topology, error) {
+	c.mu.RLock()
+	start := c.preferred
+	c.mu.RUnlock()
+
+	var firstErr error
+	for attempt := 0; attempt < len(c.endpoints); attempt++ {
+		if err := ctx.Err(); err != nil {
+			if firstErr != nil {
+				return topology{}, firstErr
+			}
+			return topology{}, err
+		}
+		index := (start + attempt) % len(c.endpoints)
+		snapshot, err := clustertopology.Fetch(ctx, c.endpoints[index].client)
+		if err == nil {
+			if index != start {
+				c.mu.Lock()
+				c.preferred = index
+				c.mu.Unlock()
+			}
+			return snapshot, nil
+		}
+		if firstErr == nil {
+			firstErr = fmt.Errorf("control plane %s: %w", c.endpoints[index].address, err)
+		}
+	}
+	return topology{}, firstErr
+}
+
 func (c *Client) refresh(ctx context.Context) error {
 	c.refreshMu.Lock()
 	defer c.refreshMu.Unlock()
 
-	next, err := clustertopology.Fetch(ctx, c.metadata)
+	next, err := c.fetchTopology(ctx)
 	if err != nil {
 		return err
 	}

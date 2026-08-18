@@ -67,6 +67,26 @@ type settings struct {
 	workers           int
 	promotionKeys     int
 	catchUpTimeout    time.Duration
+
+	// Phase 5.
+	scenario          string
+	leaderReadyFile   string
+	leaderTimeout     time.Duration
+	leaderPollTimeout time.Duration
+}
+
+const (
+	scenarioDataNode = "data-node"
+	scenarioLeader   = "leader"
+	scenarioBoth     = "both"
+)
+
+func (c settings) runsDataNodeScenario() bool {
+	return c.scenario == scenarioDataNode || c.scenario == scenarioBoth
+}
+
+func (c settings) runsLeaderScenario() bool {
+	return c.scenario == scenarioLeader || c.scenario == scenarioBoth
 }
 
 func main() {
@@ -87,6 +107,17 @@ func main() {
 			"(0 disables it; ignored when the cluster's replication factor is 0)")
 	flag.DurationVar(&cfg.catchUpTimeout, "catch-up-timeout", 20*time.Second,
 		"how long to wait for a rejoined target to backfill its promotion keys from a peer")
+	flag.StringVar(&cfg.scenario, "scenario", scenarioDataNode,
+		"`data-node`, `leader`, or `both` (run a control-plane leader kill alongside the data-node cycles)")
+	flag.StringVar(&cfg.leaderReadyFile, "leader-ready-file", "run/chaos/leader-ready",
+		"atomic progress-file path for the leader scenario; separate from --ready-file because the two scenarios advance independently")
+	flag.DurationVar(&cfg.leaderTimeout, "leader-timeout", 30*time.Second,
+		"deadline for each expected control-plane leadership transition")
+	flag.DurationVar(&cfg.leaderPollTimeout, "leader-poll-timeout", 500*time.Millisecond,
+		"deadline for ONE observation of ONE replica during a leadership sweep. Deliberately "+
+			"much shorter than --rpc-timeout: a killed replica is exactly what these sweeps "+
+			"are looking at, and waiting the full data-plane budget on it would make the "+
+			"measured failover time mostly this harness's own patience")
 	flag.Parse()
 
 	if err := cfg.validate(); err != nil {
@@ -149,6 +180,19 @@ func (c settings) validate() error {
 		return errors.New("--promotion-keys must not be negative")
 	case c.catchUpTimeout <= 0:
 		return errors.New("--catch-up-timeout must be positive")
+	case c.scenario != scenarioDataNode && c.scenario != scenarioLeader && c.scenario != scenarioBoth:
+		return fmt.Errorf("--scenario must be %s, %s, or %s",
+			scenarioDataNode, scenarioLeader, scenarioBoth)
+	case c.leaderTimeout <= 0:
+		return errors.New("--leader-timeout must be positive")
+	case c.leaderPollTimeout <= 0:
+		return errors.New("--leader-poll-timeout must be positive")
+	case c.runsLeaderScenario() && strings.TrimSpace(c.leaderReadyFile) == "":
+		return errors.New("--leader-ready-file must not be empty")
+	case c.runsLeaderScenario() &&
+		(filepath.Clean(c.leaderReadyFile) == filepath.Clean(c.readyFile) ||
+			filepath.Clean(c.leaderReadyFile) == filepath.Clean(c.reportPath)):
+		return errors.New("--leader-ready-file must differ from --ready-file and --report")
 	default:
 		return nil
 	}
@@ -177,6 +221,12 @@ type runReport struct {
 	BaselineProof       epochProofReport   `json:"baseline_proof"`
 	Transitions         []transitionReport `json:"transitions"`
 	Load                loadReport         `json:"load"`
+
+	// Phase 5.
+	Scenario         string                 `json:"scenario"`
+	ControlPlanes    []string               `json:"control_planes"`
+	LeaderScenario   *leaderScenarioReport  `json:"leader_scenario,omitempty"`
+	ReplicaCoherence replicaCoherenceReport `json:"replica_coherence"`
 
 	// Phase 4.
 	ReplicationFactor uint32 `json:"replication_factor"`
@@ -213,6 +263,32 @@ type promotionReport struct {
 	ExampleShard    uint32 `json:"example_shard"`
 	ExamplePrevious string `json:"example_previous_primary"`
 	ExampleNow      string `json:"example_new_primary"`
+}
+
+// leaderScenarioReport records the control-plane failover evidence: who led
+// before, who led after, and that the old leader came back fenced.
+type leaderScenarioReport struct {
+	ReplicasObserved  int    `json:"replicas_observed"`
+	BaselineLeader    string `json:"baseline_leader"`
+	BaselineTerm      uint64 `json:"baseline_term"`
+	NewLeader         string `json:"new_leader"`
+	NewTerm           uint64 `json:"new_term"`
+	FailoverMillis    int64  `json:"failover_millis"`
+	FailoverSweeps    int    `json:"failover_sweeps"`
+	RejoinLeader      string `json:"rejoin_leader"`
+	RejoinTerm        uint64 `json:"rejoin_term"`
+	RejoinMillis      int64  `json:"rejoin_millis"`
+	RejoinGeneration  uint64 `json:"rejoin_generation"`
+	RejoinFingerprint string `json:"rejoin_fingerprint"`
+	RejoinNodes       int    `json:"rejoin_nodes"`
+}
+
+// replicaCoherenceReport is exit criterion 3's evidence: how many times every
+// replica was compared against every other, and how often they disagreed.
+type replicaCoherenceReport struct {
+	Sweeps         uint64 `json:"sweeps"`
+	ReachableReads uint64 `json:"reachable_reads"`
+	Violations     uint64 `json:"violations"`
 }
 
 // promotionEntry is one key deliberately placed on a shard the target primaries,
@@ -286,16 +362,42 @@ func run(ctx context.Context, cfg settings) (report runReport, runErr error) {
 		}
 	}()
 
+	report.Scenario = cfg.scenario
+	controlPlanes := splitCommaList(cfg.controlPlane)
+	if len(controlPlanes) == 0 {
+		return report, errors.New("--control-plane listed no usable address")
+	}
+	report.ControlPlanes = controlPlanes
+	if cfg.runsLeaderScenario() && len(controlPlanes) < 3 {
+		return report, fmt.Errorf(
+			"the leader scenario needs at least three control-plane replicas to survive "+
+				"losing one; --control-plane names %d", len(controlPlanes))
+	}
+
 	if err := prepareProgressFile(cfg.readyFile); err != nil {
 		return report, err
 	}
-
-	metadataConn, err := newGRPCConn(cfg.controlPlane)
-	if err != nil {
-		return report, fmt.Errorf("create metadata connection: %w", err)
+	if cfg.runsLeaderScenario() {
+		if err := prepareProgressFile(cfg.leaderReadyFile); err != nil {
+			return report, err
+		}
 	}
-	defer metadataConn.Close()
-	metadata := metadatav1.NewClusterMetadataServiceClient(metadataConn)
+
+	// One connection per replica. The watcher must be able to ask each of them
+	// separately -- checking that they agree is the whole assertion, and a
+	// client that transparently failed over could never see a disagreement.
+	replicas, err := dialReplicas(controlPlanes)
+	if err != nil {
+		return report, err
+	}
+	defer func() {
+		for _, replica := range replicas {
+			_ = replica.conn.Close()
+		}
+	}()
+	// The data-node half reads through the first replica, exactly as before.
+	// Any replica serves the same committed state.
+	metadata := replicas[0].metadata
 
 	baseline, err := fetchTopology(ctx, metadata, cfg.rpcTimeout)
 	if err != nil {
@@ -379,9 +481,42 @@ func run(ctx context.Context, cfg settings) (report runReport, runErr error) {
 	fmt.Printf("ready         seeded and reading; progress 0/%d at %s\n",
 		report.TransitionsExpected, cfg.readyFile)
 
+	// -------------------------------------------------------------------
+	// Phase 5. The control-plane half runs CONCURRENTLY with the data-node
+	// half below, under the same sustained load, because the two failure
+	// domains are supposed to be independent and running them together is
+	// what demonstrates it rather than assuming it.
+	//
+	// The coherence watcher runs for the whole session either way: a
+	// momentary divergence between replicas during an election would be
+	// missed by sampling only at transition boundaries.
+	// -------------------------------------------------------------------
+	coherence := &coherenceCounters{}
+	coherenceWG := watchReplicaCoherence(loadCtx, replicas, cfg, coherence, loadErrors)
+	defer func() {
+		stopLoad()
+		coherenceWG.Wait()
+		report.ReplicaCoherence = replicaCoherenceReport{
+			Sweeps:         coherence.sweeps.Load(),
+			ReachableReads: coherence.reachableReads.Load(),
+			Violations:     coherence.violations.Load(),
+		}
+	}()
+
+	leaderDone := make(chan error, 1)
+	var leaderReport leaderScenarioReport
+	if cfg.runsLeaderScenario() {
+		report.LeaderScenario = &leaderReport
+		go func() {
+			leaderDone <- runLeaderScenario(ctx, replicas, cfg, loadErrors, &leaderReport)
+		}()
+	} else {
+		leaderDone <- nil
+	}
+
 	previous := baseline
 	transitionIndex := 0
-	for cycle := 1; cycle <= cfg.cycles; cycle++ {
+	for cycle := 1; cfg.runsDataNodeScenario() && cycle <= cfg.cycles; cycle++ {
 		transitionIndex++
 		transitionStarted := time.Now()
 		removed, movement, _, err := waitForTransition(ctx, metadata, loadErrors,
@@ -485,8 +620,27 @@ func run(ctx context.Context, cfg settings) (report runReport, runErr error) {
 		}
 	}
 
+	// The data-node half is finished; wait for the control-plane half before
+	// tearing down the load, so its assertions run against a live workload.
+	if err := <-leaderDone; err != nil {
+		return report, fmt.Errorf("leader scenario: %w", err)
+	}
+
 	stopLoad()
 	loadWG.Wait()
+	coherenceWG.Wait()
+	report.ReplicaCoherence = replicaCoherenceReport{
+		Sweeps:         coherence.sweeps.Load(),
+		ReachableReads: coherence.reachableReads.Load(),
+		Violations:     coherence.violations.Load(),
+	}
+	if report.ReplicaCoherence.Violations != 0 {
+		return report, fmt.Errorf("replicas disagreed on committed state %d time(s)",
+			report.ReplicaCoherence.Violations)
+	}
+	if cfg.runsLeaderScenario() && report.ReplicaCoherence.Sweeps == 0 {
+		return report, errors.New("the replica coherence watcher never completed a sweep")
+	}
 	report.Load = counters.snapshot()
 	if report.Load.Misses != 0 || report.Load.Mismatches != 0 || report.Load.RPCErrors != 0 {
 		return report, fmt.Errorf("stable load had misses=%d mismatches=%d RPC errors=%d",
@@ -498,6 +652,9 @@ func run(ctx context.Context, cfg settings) (report runReport, runErr error) {
 	fmt.Printf("stable load   operations=%d verified=%d misses=%d mismatches=%d rpc_errors=%d\n",
 		report.Load.Operations, report.Load.Verified, report.Load.Misses,
 		report.Load.Mismatches, report.Load.RPCErrors)
+	fmt.Printf("replica agree %d sweep(s) over %d replica read(s); %d disagreement(s)\n",
+		report.ReplicaCoherence.Sweeps, report.ReplicaCoherence.ReachableReads,
+		report.ReplicaCoherence.Violations)
 	return report, nil
 }
 
@@ -902,7 +1059,7 @@ func describePromotion(report *promotionReport) string {
 }
 
 func startStableLoad(ctx context.Context, cluster *sdk.Client, entries []stableEntry,
-	cfg settings) (*loadCounters, <-chan error, *sync.WaitGroup) {
+	cfg settings) (*loadCounters, chan error, *sync.WaitGroup) {
 	counters := &loadCounters{}
 	errorsOut := make(chan error, 1)
 	wg := &sync.WaitGroup{}
@@ -1301,4 +1458,533 @@ func writeAtomic(path string, data []byte, mode os.FileMode) error {
 		return fmt.Errorf("publish %s: %w", path, err)
 	}
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5: control-plane leader failover
+// ---------------------------------------------------------------------------
+
+// replicaClient is one control-plane replica the watcher observes directly.
+//
+// The watcher deliberately talks to every replica by name rather than through
+// the SDK's fallback: the whole point is to check that they AGREE, which a
+// client that transparently fails over to whichever one answers could never
+// see.
+type replicaClient struct {
+	address  string
+	conn     *grpc.ClientConn
+	metadata metadatav1.ClusterMetadataServiceClient
+}
+
+// splitCommaList parses a comma-separated endpoint list, dropping blanks and
+// duplicates.
+func splitCommaList(text string) []string {
+	seen := make(map[string]bool)
+	var out []string
+	for _, raw := range strings.Split(text, ",") {
+		value := strings.TrimSpace(raw)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	return out
+}
+
+func dialReplicas(addresses []string) ([]replicaClient, error) {
+	replicas := make([]replicaClient, 0, len(addresses))
+	for _, address := range addresses {
+		conn, err := newGRPCConn(address)
+		if err != nil {
+			for _, opened := range replicas {
+				_ = opened.conn.Close()
+			}
+			return nil, fmt.Errorf("create metadata connection for %s: %w", address, err)
+		}
+		replicas = append(replicas, replicaClient{
+			address:  address,
+			conn:     conn,
+			metadata: metadatav1.NewClusterMetadataServiceClient(conn),
+		})
+	}
+	return replicas, nil
+}
+
+// replicaObservation is one replica's answer at one instant.
+type replicaObservation struct {
+	address   string
+	snapshot  clustertopology.Snapshot
+	reachable bool
+	err       error
+}
+
+// observeReplicas reads every replica once, in parallel, so the observations
+// are as close to simultaneous as an external observer can make them. A
+// sequential sweep across three replicas during an election would compare
+// answers from different moments and call it disagreement.
+func observeReplicas(ctx context.Context, replicas []replicaClient,
+	timeout time.Duration) []replicaObservation {
+	out := make([]replicaObservation, len(replicas))
+	var wg sync.WaitGroup
+	for i := range replicas {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			rpcCtx, cancel := context.WithTimeout(ctx, timeout)
+			defer cancel()
+			snapshot, err := clustertopology.Fetch(rpcCtx, replicas[i].metadata)
+			out[i] = replicaObservation{
+				address:   replicas[i].address,
+				snapshot:  snapshot,
+				reachable: err == nil,
+				err:       err,
+			}
+		}(i)
+	}
+	wg.Wait()
+	return out
+}
+
+// leaderConsensus is what the reachable replicas currently agree on, if
+// anything.
+type leaderConsensus struct {
+	leader    string
+	term      uint64
+	reachable int
+	agreed    bool
+	reason    string
+	// sweeps is how many observation rounds the harness needed. Reported so a
+	// failover duration can be read with its measurement resolution attached,
+	// rather than looking more precise than it is.
+	sweeps int
+}
+
+func summarizeLeader(observations []replicaObservation) leaderConsensus {
+	result := leaderConsensus{agreed: true}
+	for _, observation := range observations {
+		if !observation.reachable {
+			continue
+		}
+		result.reachable++
+		if observation.snapshot.RaftLeaderID == "" {
+			result.agreed = false
+			result.reason = fmt.Sprintf("%s sees no leader (term %d)",
+				observation.address, observation.snapshot.RaftTerm)
+			continue
+		}
+		if result.leader == "" {
+			result.leader = observation.snapshot.RaftLeaderID
+			result.term = observation.snapshot.RaftTerm
+			continue
+		}
+		if observation.snapshot.RaftLeaderID != result.leader ||
+			observation.snapshot.RaftTerm != result.term {
+			result.agreed = false
+			result.reason = fmt.Sprintf("%s says %s@%d, another says %s@%d",
+				observation.address, observation.snapshot.RaftLeaderID,
+				observation.snapshot.RaftTerm, result.leader, result.term)
+		}
+	}
+	if result.reachable == 0 {
+		result.agreed = false
+		result.reason = "no control-plane replica answered"
+	} else if result.leader == "" && result.reason == "" {
+		result.agreed = false
+		result.reason = "no reachable replica names a leader"
+	}
+	return result
+}
+
+// checkReplicaCoherence is exit criterion 3, evaluated on one observation
+// sweep: at the same committed state, every replica must give the same answer,
+// and no shard may be unowned or ambiguously owned anywhere.
+//
+// Replicas at DIFFERENT generations are not compared. A follower lagging the
+// leader is expected and safe -- an applied Raft log is a prefix of the
+// committed one -- so only same-generation answers are required to match. What
+// would be a genuine split brain is two replicas claiming the same committed
+// state and describing different clusters.
+func checkReplicaCoherence(observations []replicaObservation) error {
+	type witness struct {
+		address     string
+		fingerprint string
+	}
+	byGeneration := make(map[uint64]witness)
+
+	for _, observation := range observations {
+		if !observation.reachable {
+			continue
+		}
+		snapshot := observation.snapshot
+
+		// Every shard must have exactly one live owner. Fetch already validates
+		// this, so a violation here would mean the validation itself regressed
+		// -- worth catching either way, and free.
+		if len(snapshot.Nodes) > 0 {
+			for shard := uint32(0); shard < snapshot.ShardCount; shard++ {
+				owner, ok := snapshot.ShardMap[shard]
+				if !ok || owner == "" {
+					return fmt.Errorf("%s left shard %d unassigned at generation %d",
+						observation.address, shard, snapshot.Generation)
+				}
+				if _, live := snapshot.Nodes[owner]; !live {
+					return fmt.Errorf("%s assigned shard %d to %q, which is not in its live set",
+						observation.address, shard, owner)
+				}
+			}
+		}
+
+		fingerprint := hex.EncodeToString(snapshot.Fingerprint)
+		previous, seen := byGeneration[snapshot.Generation]
+		if !seen {
+			byGeneration[snapshot.Generation] = witness{observation.address, fingerprint}
+			continue
+		}
+		if previous.fingerprint != fingerprint {
+			return fmt.Errorf(
+				"split brain: %s and %s both report committed generation %d but different "+
+					"topologies (%s vs %s)",
+				previous.address, observation.address, snapshot.Generation,
+				truncate(previous.fingerprint), truncate(fingerprint))
+		}
+	}
+	return nil
+}
+
+func truncate(text string) string {
+	if len(text) <= 16 {
+		return text
+	}
+	return text[:16]
+}
+
+type coherenceCounters struct {
+	sweeps         atomic.Uint64
+	reachableReads atomic.Uint64
+	violations     atomic.Uint64
+}
+
+// watchReplicaCoherence runs the check above continuously for the whole run, so
+// a momentary divergence during an election is caught rather than missed by
+// sampling only at transition boundaries.
+func watchReplicaCoherence(ctx context.Context, replicas []replicaClient, cfg settings,
+	counters *coherenceCounters, out chan<- error) *sync.WaitGroup {
+	wg := &sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+			observations := observeReplicas(ctx, replicas, cfg.rpcTimeout)
+			if ctx.Err() != nil {
+				return
+			}
+			counters.sweeps.Add(1)
+			for _, observation := range observations {
+				if observation.reachable {
+					counters.reachableReads.Add(1)
+				}
+			}
+			if err := checkReplicaCoherence(observations); err != nil {
+				counters.violations.Add(1)
+				reportFirst(out, err)
+				return
+			}
+			if err := waitInterval(ctx, cfg.pollInterval); err != nil {
+				return
+			}
+		}
+	}()
+	return wg
+}
+
+// runLeaderScenario drives the control-plane half of the run, concurrently with
+// the data-node half.
+//
+// Running them at the same time is the point of exit criterion 7: a data-node
+// promotion must not be disrupted by a concurrent control-plane election, and
+// vice versa. They are genuinely independent failure domains, and running them
+// together is what says so out loud rather than assuming it.
+func runLeaderScenario(ctx context.Context, replicas []replicaClient, cfg settings,
+	loadErrors <-chan error, report *leaderScenarioReport) error {
+
+	// (1) Everyone agrees on a leader before anything is touched. Without this
+	// the later "the leader changed" assertion could be comparing against a
+	// state that was never settled in the first place.
+	baseline, err := awaitLeaderConsensus(ctx, replicas, cfg, "", len(replicas), loadErrors)
+	if err != nil {
+		return fmt.Errorf("baseline leader consensus: %w", err)
+	}
+	report.BaselineLeader = baseline.leader
+	report.BaselineTerm = baseline.term
+	report.ReplicasObserved = baseline.reachable
+	fmt.Printf("leader        baseline %s at term %d; %d replica(s) agree\n",
+		baseline.leader, baseline.term, baseline.reachable)
+
+	if err := writeProgress(cfg.leaderReadyFile, 0); err != nil {
+		return fmt.Errorf("publish leader readiness: %w", err)
+	}
+
+	// (2)+(3) The shell kills the leader. Wait for the survivors to converge on
+	// a DIFFERENT leader, at a higher term.
+	//
+	// The clock starts at the first sweep that OBSERVES the disruption, not at
+	// this line. Between publishing readiness and killing the leader the shell
+	// also kills a data node, and timing from here would silently fold that in
+	// -- reporting several seconds for an election that took about one.
+	elected, disruptedAt, err := awaitFailover(ctx, replicas, cfg, baseline, loadErrors)
+	if err != nil {
+		return fmt.Errorf("re-election after killing %s: %w", baseline.leader, err)
+	}
+	failoverStarted := disruptedAt
+	if elected.term <= baseline.term {
+		return fmt.Errorf("new leader %s is at term %d, which did not advance past %d",
+			elected.leader, elected.term, baseline.term)
+	}
+	report.NewLeader = elected.leader
+	report.NewTerm = elected.term
+	report.FailoverMillis = time.Since(failoverStarted).Milliseconds()
+	report.FailoverSweeps = elected.sweeps
+	fmt.Printf("leader        failover %s(term %d) -> %s(term %d) in %d ms; %d survivor(s) agree\n",
+		baseline.leader, baseline.term, elected.leader, elected.term,
+		report.FailoverMillis, elected.reachable)
+
+	if err := writeProgress(cfg.leaderReadyFile, 1); err != nil {
+		return fmt.Errorf("publish failover progress: %w", err)
+	}
+
+	// (6) The shell restarts the old leader. It must come back as a FOLLOWER
+	// and adopt the state committed while it was away -- state it never saw,
+	// because the data-node half of this run changed membership in the
+	// meantime. An unfenced replica would reassert its own stale view here.
+	rejoinStarted := time.Now()
+	rejoined, err := awaitAllReplicas(ctx, replicas, cfg, loadErrors)
+	if err != nil {
+		return fmt.Errorf("waiting for %s to rejoin: %w", baseline.leader, err)
+	}
+	report.RejoinMillis = time.Since(rejoinStarted).Milliseconds()
+
+	final := summarizeLeader(rejoined)
+	if !final.agreed {
+		return fmt.Errorf("replicas disagree after %s rejoined: %s", baseline.leader, final.reason)
+	}
+	if final.leader == baseline.leader {
+		return fmt.Errorf(
+			"the restarted former leader %s took leadership back while %s was healthy; "+
+				"it must rejoin fenced, as a follower", baseline.leader, elected.leader)
+	}
+	if final.term < elected.term {
+		return fmt.Errorf("term went backwards after rejoin: %d < %d", final.term, elected.term)
+	}
+	report.RejoinLeader = final.leader
+	report.RejoinTerm = final.term
+
+	// The positive half of the fencing check: the rejoined replica did not
+	// merely fail to lead, it ADOPTED the newer committed state. Its own stale
+	// view lost, which is the property a fenced replica has and an unfenced one
+	// does not.
+	if err := assertGroupConvergedOnOneState(rejoined, report); err != nil {
+		return err
+	}
+	fmt.Printf("leader        %s rejoined as a follower of %s at term %d in %d ms; "+
+		"adopted committed generation %d\n",
+		baseline.leader, final.leader, final.term, report.RejoinMillis, report.RejoinGeneration)
+
+	return writeProgress(cfg.leaderReadyFile, 2)
+}
+
+// assertGroupConvergedOnOneState proves every replica -- including the rejoined
+// former leader -- is serving the same committed state.
+//
+// Identity is compared by FINGERPRINT, not by generation alone. Two replicas
+// reporting the same generation with different content is precisely the split
+// brain being looked for, and comparing numbers would miss it.
+func assertGroupConvergedOnOneState(observations []replicaObservation,
+	report *leaderScenarioReport) error {
+	var reachable []replicaObservation
+	for _, observation := range observations {
+		if !observation.reachable {
+			return fmt.Errorf("%s was unreachable during the rejoin check", observation.address)
+		}
+		reachable = append(reachable, observation)
+	}
+	if len(reachable) == 0 {
+		return errors.New("no replica answered during the rejoin check")
+	}
+
+	base := reachable[0]
+	baseFingerprint := hex.EncodeToString(base.snapshot.Fingerprint)
+	for _, observation := range reachable[1:] {
+		fingerprint := hex.EncodeToString(observation.snapshot.Fingerprint)
+		if observation.snapshot.Generation != base.snapshot.Generation ||
+			fingerprint != baseFingerprint {
+			return fmt.Errorf(
+				"after rejoin, %s is at generation %d (%s) but %s is at %d (%s); the group "+
+					"did not converge on one committed state",
+				base.address, base.snapshot.Generation, truncate(baseFingerprint),
+				observation.address, observation.snapshot.Generation, truncate(fingerprint))
+		}
+	}
+	report.RejoinGeneration = base.snapshot.Generation
+	report.RejoinFingerprint = baseFingerprint
+	report.RejoinNodes = len(base.snapshot.Nodes)
+	return nil
+}
+
+// awaitFailover waits for the group to re-elect after its leader is killed, and
+// separately reports when the disruption first became VISIBLE.
+//
+// Splitting those two instants is what makes the reported duration mean
+// something. An external observer cannot see the kill itself; the first thing
+// it can see is the old leader refusing connections, or the survivors no longer
+// naming it. Timing from there measures the election rather than the harness's
+// own scheduling.
+//
+// Sweeps use leaderPollTimeout, not rpcTimeout: a killed replica is exactly
+// what these sweeps look at, and waiting the full data-plane budget on it every
+// round would make the measurement mostly this harness's patience.
+func awaitFailover(ctx context.Context, replicas []replicaClient, cfg settings,
+	baseline leaderConsensus, loadErrors <-chan error) (leaderConsensus, time.Time, error) {
+	deadline := time.Now().Add(cfg.leaderTimeout)
+	survivors := len(replicas) - 1
+	var disruptedAt time.Time
+	var last leaderConsensus
+	sweeps := 0
+
+	for {
+		if loadErrors != nil {
+			select {
+			case err := <-loadErrors:
+				return leaderConsensus{}, time.Time{},
+					fmt.Errorf("correctness failure during failover: %w", err)
+			default:
+			}
+		}
+
+		sweepAt := time.Now()
+		sweeps++
+		observations := observeReplicas(ctx, replicas, cfg.leaderPollTimeout)
+		if err := checkReplicaCoherence(observations); err != nil {
+			return leaderConsensus{}, time.Time{}, err
+		}
+		last = summarizeLeader(observations)
+
+		if disruptedAt.IsZero() {
+			unreachable := 0
+			for _, observation := range observations {
+				if !observation.reachable {
+					unreachable++
+				}
+			}
+			// Either the old leader stopped answering, or the survivors stopped
+			// agreeing on it. Both mean the kill has landed.
+			if unreachable > 0 || !last.agreed || last.leader != baseline.leader {
+				disruptedAt = sweepAt
+				sweeps = 1
+			}
+		}
+
+		if !disruptedAt.IsZero() && last.agreed && last.reachable >= survivors &&
+			last.leader != baseline.leader {
+			last.sweeps = sweeps
+			return last, disruptedAt, nil
+		}
+		if time.Now().After(deadline) {
+			reason := last.reason
+			if reason == "" && last.leader == baseline.leader {
+				reason = fmt.Sprintf("leader is still %s", last.leader)
+			}
+			return leaderConsensus{}, time.Time{}, fmt.Errorf(
+				"no agreement among >=%d survivor(s) within %s (%d reachable: %s)",
+				survivors, cfg.leaderTimeout, last.reachable, reason)
+		}
+		if err := waitInterval(ctx, cfg.pollInterval); err != nil {
+			return leaderConsensus{}, time.Time{}, err
+		}
+	}
+}
+
+// awaitLeaderConsensus polls until at least minReplicas replicas agree on one
+// leader and term, optionally requiring it to differ from changedFrom.
+func awaitLeaderConsensus(ctx context.Context, replicas []replicaClient, cfg settings,
+	changedFrom string, minReplicas int, loadErrors <-chan error) (leaderConsensus, error) {
+	deadline := time.Now().Add(cfg.leaderTimeout)
+	var last leaderConsensus
+	for {
+		if loadErrors != nil {
+			select {
+			case err := <-loadErrors:
+				return leaderConsensus{}, fmt.Errorf("correctness failure during leader wait: %w", err)
+			default:
+			}
+		}
+
+		observations := observeReplicas(ctx, replicas, cfg.leaderPollTimeout)
+		if err := checkReplicaCoherence(observations); err != nil {
+			return leaderConsensus{}, err
+		}
+		last = summarizeLeader(observations)
+		if last.agreed && last.reachable >= minReplicas && last.leader != changedFrom {
+			return last, nil
+		}
+		if time.Now().After(deadline) {
+			reason := last.reason
+			if reason == "" && last.leader == changedFrom {
+				reason = fmt.Sprintf("leader is still %s", last.leader)
+			}
+			return leaderConsensus{}, fmt.Errorf(
+				"no agreement among >=%d replica(s) within %s (%d reachable: %s)",
+				minReplicas, cfg.leaderTimeout, last.reachable, reason)
+		}
+		if err := waitInterval(ctx, cfg.pollInterval); err != nil {
+			return leaderConsensus{}, err
+		}
+	}
+}
+
+// awaitAllReplicas polls until every replica answers again, which is how the
+// watcher learns the killed one was restarted without the shell telling it.
+func awaitAllReplicas(ctx context.Context, replicas []replicaClient, cfg settings,
+	loadErrors <-chan error) ([]replicaObservation, error) {
+	deadline := time.Now().Add(cfg.leaderTimeout)
+	var last []replicaObservation
+	for {
+		if loadErrors != nil {
+			select {
+			case err := <-loadErrors:
+				return nil, fmt.Errorf("correctness failure during rejoin wait: %w", err)
+			default:
+			}
+		}
+
+		last = observeReplicas(ctx, replicas, cfg.leaderPollTimeout)
+		if err := checkReplicaCoherence(last); err != nil {
+			return nil, err
+		}
+		complete := true
+		for _, observation := range last {
+			complete = complete && observation.reachable
+		}
+		if complete && summarizeLeader(last).agreed {
+			return last, nil
+		}
+		if time.Now().After(deadline) {
+			unreachable := make([]string, 0, len(last))
+			for _, observation := range last {
+				if !observation.reachable {
+					unreachable = append(unreachable, observation.address)
+				}
+			}
+			return nil, fmt.Errorf("not every replica answered within %s (missing: %s)",
+				cfg.leaderTimeout, strings.Join(unreachable, ", "))
+		}
+		if err := waitInterval(ctx, cfg.pollInterval); err != nil {
+			return nil, err
+		}
+	}
 }

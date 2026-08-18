@@ -38,7 +38,8 @@ const (
 
 func main() {
 	var (
-		controlPlane    = flag.String("control-plane", "127.0.0.1:7000", "ClusterMetadataService address")
+		controlPlane = flag.String("control-plane", "127.0.0.1:7000",
+			"comma-separated ClusterMetadataService addresses; any replica answers")
 		concurrency     = flag.Int("concurrency", 16, "number of concurrent SDK workers")
 		valueSize       = flag.Int("value-size", 16*1024, "value size in bytes")
 		keys            = flag.Int("keys", 2048, "working set size, in keys")
@@ -227,26 +228,62 @@ type clusterTopology struct {
 	ownerIDs   []string
 }
 
+// fetchTopology reads the cluster shape from whichever control-plane replica
+// answers first.
+//
+// --control-plane may name several replicas, comma-separated, since Phase 5
+// made the metadata plane a Raft group. Any of them serves the same committed
+// state; a follower can be a heartbeat behind, never contradictory. One Fetch
+// stays on ONE replica so its two RPCs observe the same publisher.
 func (b *benchmark) fetchTopology() (clusterTopology, error) {
-	conn, err := grpc.NewClient(b.controlPlane,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(
-			grpc.MaxCallRecvMsgSize(defaultMaxMessageBytes),
-			grpc.MaxCallSendMsgSize(defaultMaxMessageBytes),
-		))
-	if err != nil {
-		return clusterTopology{}, fmt.Errorf("create metadata client: %w", err)
+	addresses := splitEndpoints(b.controlPlane)
+	if len(addresses) == 0 {
+		return clusterTopology{}, fmt.Errorf("--control-plane listed no usable address")
 	}
-	defer conn.Close()
 
-	metadata := metadatav1.NewClusterMetadataServiceClient(conn)
-	ctx, cancel := context.WithTimeout(context.Background(), b.metadataTimeout)
-	defer cancel()
-	snapshot, err := clustertopology.Fetch(ctx, metadata)
-	if err != nil {
-		return clusterTopology{}, err
+	var firstErr error
+	for _, address := range addresses {
+		conn, err := grpc.NewClient(address,
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithDefaultCallOptions(
+				grpc.MaxCallRecvMsgSize(defaultMaxMessageBytes),
+				grpc.MaxCallSendMsgSize(defaultMaxMessageBytes),
+			))
+		if err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("create metadata client for %s: %w", address, err)
+			}
+			continue
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), b.metadataTimeout)
+		snapshot, err := clustertopology.Fetch(ctx, metadatav1.NewClusterMetadataServiceClient(conn))
+		cancel()
+		conn.Close()
+		if err == nil {
+			return validateTopology(snapshot)
+		}
+		if firstErr == nil {
+			firstErr = fmt.Errorf("control plane %s: %w", address, err)
+		}
 	}
-	return validateTopology(snapshot)
+	return clusterTopology{}, firstErr
+}
+
+// splitEndpoints parses a comma-separated address list, dropping blanks and
+// duplicates.
+func splitEndpoints(text string) []string {
+	seen := make(map[string]bool)
+	var out []string
+	for _, raw := range strings.Split(text, ",") {
+		address := strings.TrimSpace(raw)
+		if address == "" || seen[address] {
+			continue
+		}
+		seen[address] = true
+		out = append(out, address)
+	}
+	return out
 }
 
 func validateTopology(snapshot clustertopology.Snapshot) (clusterTopology, error) {

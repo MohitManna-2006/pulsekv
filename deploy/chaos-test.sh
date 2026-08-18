@@ -7,6 +7,7 @@
 #                        [--failure-mode alternating|crash|node-crash|leave]
 #                        [--transition-timeout SECONDS]
 #                        [--promotion-keys N]
+#                        [--scenario data-node|leader|both]
 #                        [--ready-file PATH] [--report PATH]
 #
 # pulsekv-chaos owns the correctness workload and topology-transition checks.
@@ -25,6 +26,20 @@
 #       --replication-factor 0
 #
 # Every Phase 3 assertion is unchanged and still runs in both cases.
+#
+# PHASE 5: --scenario=both additionally kills the Raft LEADER of the
+# control-plane group at the same time as the data node, and restarts it at the
+# same time too. Running the two together is the point: control-plane leadership
+# and data-node ownership are meant to be independent failure domains, and doing
+# them concurrently is what demonstrates that rather than assuming it. The
+# watcher owns every assertion -- that the survivors converge on one new leader
+# at a higher term, that replicas never disagree about a committed state, and
+# that the restarted former leader comes back fenced as a follower and adopts
+# the state committed while it was away.
+#
+# The two scenarios advance through SEPARATE progress files, because they are
+# genuinely independent event streams and forcing them through one counter would
+# serialise the very concurrency being tested.
 
 set -euo pipefail
 
@@ -37,7 +52,9 @@ SEED=7
 FAILURE_MODE=alternating
 TRANSITION_TIMEOUT=15
 PROMOTION_KEYS=8
+SCENARIO=data-node
 READY_FILE=""
+LEADER_READY_FILE=""
 REPORT=""
 
 usage() {
@@ -60,6 +77,8 @@ while [ $# -gt 0 ]; do
         --transition-timeout=*) TRANSITION_TIMEOUT="${1#*=}"; shift ;;
         --promotion-keys) [ $# -ge 2 ] || pk_die "--promotion-keys requires a number"; PROMOTION_KEYS="$2"; shift 2 ;;
         --promotion-keys=*) PROMOTION_KEYS="${1#*=}"; shift ;;
+        --scenario) [ $# -ge 2 ] || pk_die "--scenario requires a value"; SCENARIO="$2"; shift 2 ;;
+        --scenario=*) SCENARIO="${1#*=}"; shift ;;
         --ready-file) [ $# -ge 2 ] || pk_die "--ready-file requires a path"; READY_FILE="$2"; shift 2 ;;
         --ready-file=*) READY_FILE="${1#*=}"; shift ;;
         --report) [ $# -ge 2 ] || pk_die "--report requires a path"; REPORT="$2"; shift 2 ;;
@@ -89,13 +108,24 @@ case "$FAILURE_MODE" in
     alternating|crash|node-crash|leave) ;;
     *) pk_die "--failure-mode must be alternating, crash, node-crash, or leave" ;;
 esac
+case "$SCENARIO" in
+    data-node|leader|both) ;;
+    *) pk_die "--scenario must be data-node, leader, or both" ;;
+esac
+RUNS_LEADER=0
+RUNS_DATA=0
+case "$SCENARIO" in
+    data-node) RUNS_DATA=1 ;;
+    leader)    RUNS_LEADER=1 ;;
+    both)      RUNS_DATA=1; RUNS_LEADER=1 ;;
+esac
 
 [ -f "$PULSEKV_CONFIG" ] || pk_die "config not found: $PULSEKV_CONFIG"
 for bin in "$PULSEKV_CONTROLPLANE_BIN" "$PULSEKV_MEMBER_BIN" "$PULSEKV_SMOKE_BIN" \
            "$PULSEKV_CHAOS_BIN" "$PULSEKV_NODE_BIN"; do
     [ -x "$bin" ] || pk_die "$(pk_relpath "$bin") is missing; run deploy/run-local-cluster.sh"
 done
-pk_recorded_alive controlplane || pk_die "the local control plane is not running"
+pk_any_controlplane_alive || pk_die "no control-plane replica is running"
 
 node_table="$(pk_config_read --print-nodes)" || pk_die "could not read nodes from $PULSEKV_CONFIG"
 [ -n "$node_table" ] || pk_die "config defines no nodes"
@@ -112,14 +142,22 @@ pk_recorded_alive "member:${TARGET}" || pk_die "member:${TARGET} is not running"
 CHAOS_DIR="${PULSEKV_RUN_DIR}/chaos"
 mkdir -p "$CHAOS_DIR"
 [ -n "$READY_FILE" ] || READY_FILE="${CHAOS_DIR}/ready"
+[ -n "$LEADER_READY_FILE" ] || LEADER_READY_FILE="${CHAOS_DIR}/leader-ready"
 [ -n "$REPORT" ] || REPORT="${CHAOS_DIR}/report.json"
 [ "$READY_FILE" != "$REPORT" ] || pk_die "--ready-file and --report must differ"
+[ "$LEADER_READY_FILE" != "$READY_FILE" ] || pk_die "--ready-file and the leader progress file must differ"
 [ ! -d "$READY_FILE" ] || pk_die "ready-file path is a directory: $READY_FILE"
 [ ! -d "$REPORT" ] || pk_die "report path is a directory: $REPORT"
-mkdir -p "$(dirname -- "$READY_FILE")" "$(dirname -- "$REPORT")"
-rm -f -- "$READY_FILE" "$REPORT"
+mkdir -p "$(dirname -- "$READY_FILE")" "$(dirname -- "$LEADER_READY_FILE")" "$(dirname -- "$REPORT")"
+rm -f -- "$READY_FILE" "$LEADER_READY_FILE" "$REPORT"
 
-CONTROL_PLANE="$(pk_controlplane_address)"
+# The leader scenario needs a group that survives losing a member.
+CP_COUNT="$(pk_controlplane_ids | grep -c .)"
+if [ "$RUNS_LEADER" -eq 1 ] && [ "$CP_COUNT" -lt 3 ]; then
+    pk_die "--scenario $SCENARIO needs at least three control-plane replicas; the config has $CP_COUNT"
+fi
+
+CONTROL_PLANE="$(pk_controlplane_endpoints)"
 ALL_LIVE="$(pk_node_ids_csv)"
 WITHOUT_TARGET="$(pk_node_ids_csv "$TARGET")"
 LOCAL_NODE="${PULSEKV_DEPLOY_DIR}/local-node.sh"
@@ -128,6 +166,8 @@ CHAOS_LOG="$(pk_log_for_label chaos)"
 
 WATCHER_PID=""
 RESTORE_NEEDED=0
+LEADER_KILLED=""
+LEADER_RESTORE_NEEDED=0
 
 restore_target() {
     if pk_recorded_alive "data:${TARGET}" && pk_recorded_alive "member:${TARGET}"; then
@@ -169,6 +209,14 @@ cleanup() {
             rc=1
         }
     fi
+    if [ "$LEADER_RESTORE_NEEDED" -eq 1 ]; then
+        pk_warn "restoring control-plane replica ${LEADER_KILLED} after an interrupted run"
+        pk_start_controlplane "$LEADER_KILLED" || {
+            pk_err "automatic restoration of controlplane:${LEADER_KILLED} failed"
+            rc=1
+        }
+        LEADER_RESTORE_NEEDED=0
+    fi
     if [ -n "$WATCHER_PID" ]; then
         pk_pid_remove_if chaos "$WATCHER_PID"
     fi
@@ -194,6 +242,9 @@ pk_start_managed chaos "$CONTROL_PLANE" "$CHAOS_LOG" \
         --ready-file "$READY_FILE" \
         --report "$REPORT" \
         --promotion-keys "$PROMOTION_KEYS" \
+        --scenario "$SCENARIO" \
+        --leader-ready-file "$LEADER_READY_FILE" \
+        --leader-timeout "${TRANSITION_TIMEOUT}s" \
         --transition-timeout "${TRANSITION_TIMEOUT}s"
 WATCHER_PID="$PK_LAST_PID"
 pk_info "watcher pid $WATCHER_PID; waiting for seeded stable-key workload"
@@ -202,24 +253,30 @@ pk_info "watcher pid $WATCHER_PID; waiting for seeded stable-key workload"
 # running cluster was not actually booted with cannot mislead the assertions.
 pk_dim "configured replication factor: $(pk_replication_factor 2>/dev/null || echo '?'); promotion keys: $PROMOTION_KEYS"
 
-read_transition_count() {
+read_progress_count() {
+    local file="$1"
     PK_TRANSITION_COUNT=""
-    [ -f "$READY_FILE" ] || return 1
-    IFS= read -r PK_TRANSITION_COUNT < "$READY_FILE" || [ -n "$PK_TRANSITION_COUNT" ]
+    [ -f "$file" ] || return 1
+    IFS= read -r PK_TRANSITION_COUNT < "$file" || [ -n "$PK_TRANSITION_COUNT" ]
     case "$PK_TRANSITION_COUNT" in
         ''|*[!0-9]*) return 1 ;;
     esac
     PK_TRANSITION_COUNT=$((10#$PK_TRANSITION_COUNT))
 }
 
-wait_transition_count() {
-    local expected="$1" description="$2" deadline
-    deadline=$((SECONDS + TRANSITION_TIMEOUT))
+# wait_progress FILE EXPECTED DESCRIPTION [TIMEOUT]
+#
+# The same one-mutation/one-verified-step handshake Phase 3 established, now
+# parameterised by progress file so the data-node and control-plane streams can
+# advance independently -- which is what lets the two run concurrently.
+wait_progress() {
+    local file="$1" expected="$2" description="$3" timeout="${4:-$TRANSITION_TIMEOUT}" deadline
+    deadline=$((SECONDS + timeout))
     while :; do
-        # Read before checking liveness: after the final verified transition,
-        # the watcher may publish the count and exit between two polls.
-        if read_transition_count && [ "$PK_TRANSITION_COUNT" -ge "$expected" ]; then
-            pk_ok "$description (verified transitions=$PK_TRANSITION_COUNT)"
+        # Read before checking liveness: after the final verified step, the
+        # watcher may publish the count and exit between two polls.
+        if read_progress_count "$file" && [ "$PK_TRANSITION_COUNT" -ge "$expected" ]; then
+            pk_ok "$description (verified steps=$PK_TRANSITION_COUNT)"
             return 0
         fi
         if ! pk_pid_alive "$WATCHER_PID"; then
@@ -228,14 +285,29 @@ wait_transition_count() {
         fi
         [ "$SECONDS" -lt "$deadline" ] || {
             pk_tail_process_log chaos 40
-            pk_die "pulsekv-chaos did not confirm $description within ${TRANSITION_TIMEOUT}s"
+            pk_die "pulsekv-chaos did not confirm $description within ${timeout}s"
         }
         sleep 0.05
     done
 }
 
-wait_transition_count 0 "stable-key workload ready"
-pk_ok "watcher ready; target=$TARGET cycles=$CYCLES seed=$SEED"
+wait_transition_count() {
+    wait_progress "$READY_FILE" "$1" "$2"
+}
+
+# current_leader -- the control-plane replica ID the group currently agrees on.
+current_leader() {
+    "$PULSEKV_SMOKE_BIN" --config "$PULSEKV_CONFIG" --mode=leader \
+        --rpc-timeout=2s 2>/dev/null | cut -f1
+}
+
+if [ "$RUNS_DATA" -eq 1 ]; then
+    wait_transition_count 0 "stable-key workload ready"
+fi
+if [ "$RUNS_LEADER" -eq 1 ]; then
+    wait_progress "$LEADER_READY_FILE" 0 "control-plane leader baseline agreed"
+fi
+pk_ok "watcher ready; scenario=$SCENARIO target=$TARGET cycles=$CYCLES seed=$SEED"
 
 mode_for_cycle() {
     local cycle="$1"
@@ -250,27 +322,98 @@ mode_for_cycle() {
     esac
 }
 
+# ---------------------------------------------------------------------------
+# The control-plane leader kill, run in the FIRST data-node cycle so the two
+# failures overlap in time. Anything later would be a sequence of failures
+# rather than a concurrent one, and concurrency is the property under test.
+# ---------------------------------------------------------------------------
+LEADER_KILLED=""
+LEADER_RESTORE_NEEDED=0
+
+kill_current_leader() {
+    LEADER_KILLED="$(current_leader)"
+    [ -n "$LEADER_KILLED" ] || {
+        pk_tail_process_log chaos 20
+        pk_die "could not determine the current Raft leader"
+    }
+    pk_recorded_alive "controlplane:${LEADER_KILLED}" || \
+        pk_die "the reported leader ${LEADER_KILLED} is not a locally managed process"
+    pk_info "killing the Raft leader ${LEADER_KILLED}"
+    LEADER_RESTORE_NEEDED=1
+    # SIGKILL, not a graceful stop: a leader that gets to hand over cleanly
+    # would be testing leadership transfer, not failure detection.
+    pk_signal_managed "controlplane:${LEADER_KILLED}" KILL || \
+        pk_die "could not signal controlplane:${LEADER_KILLED}"
+    pk_wait_pid_gone "$PK_LAST_PID" "$TRANSITION_TIMEOUT" || \
+        pk_die "controlplane:${LEADER_KILLED} survived SIGKILL"
+    pk_pid_remove_if "controlplane:${LEADER_KILLED}" "$PK_LAST_PID"
+}
+
+restart_killed_leader() {
+    [ -n "$LEADER_KILLED" ] || return 0
+    pk_info "restarting the former leader ${LEADER_KILLED}"
+    pk_start_controlplane "$LEADER_KILLED" || \
+        pk_die "could not restart controlplane:${LEADER_KILLED}"
+    LEADER_RESTORE_NEEDED=0
+}
+
 for ((cycle = 1; cycle <= CYCLES; cycle++)); do
     mode="$(mode_for_cycle "$cycle")"
-    pk_step "Chaos cycle ${cycle}/${CYCLES}: $mode $TARGET"
+    if [ "$RUNS_DATA" -eq 1 ]; then
+        pk_step "Chaos cycle ${cycle}/${CYCLES}: $mode $TARGET"
+    else
+        pk_step "Chaos cycle ${cycle}/${CYCLES}: control-plane only"
+    fi
     pk_pid_alive "$WATCHER_PID" || {
         pk_tail_process_log chaos 40
         pk_die "pulsekv-chaos exited before cycle $cycle"
     }
 
+    leader_this_cycle=0
+    if [ "$RUNS_LEADER" -eq 1 ] && [ "$cycle" -eq 1 ]; then
+        leader_this_cycle=1
+    fi
+
     # Set this before mutation so the EXIT trap repairs even a half-completed
     # lifecycle command.
-    RESTORE_NEEDED=1
-    "$LOCAL_NODE" --config "$PULSEKV_CONFIG" --timeout "$TRANSITION_TIMEOUT" \
-        "$mode" "$TARGET"
-    wait_transition_count "$((2 * cycle - 1))" \
-        "cycle $cycle removal of $TARGET"
+    if [ "$RUNS_DATA" -eq 1 ]; then
+        RESTORE_NEEDED=1
+        "$LOCAL_NODE" --config "$PULSEKV_CONFIG" --timeout "$TRANSITION_TIMEOUT" \
+            "$mode" "$TARGET"
+    fi
+    # Killed immediately after the data node, with neither transition verified
+    # yet, so the election and the shard-ownership change are genuinely in
+    # flight at the same time.
+    if [ "$leader_this_cycle" -eq 1 ]; then
+        kill_current_leader
+    fi
 
-    "$LOCAL_NODE" --config "$PULSEKV_CONFIG" --timeout "$TRANSITION_TIMEOUT" \
-        start "$TARGET"
-    wait_transition_count "$((2 * cycle))" \
-        "cycle $cycle rejoin of $TARGET"
-    RESTORE_NEEDED=0
+    if [ "$RUNS_DATA" -eq 1 ]; then
+        wait_transition_count "$((2 * cycle - 1))" \
+            "cycle $cycle removal of $TARGET"
+    fi
+    if [ "$leader_this_cycle" -eq 1 ]; then
+        wait_progress "$LEADER_READY_FILE" 1 \
+            "re-election after killing ${LEADER_KILLED}"
+    fi
+
+    if [ "$RUNS_DATA" -eq 1 ]; then
+        "$LOCAL_NODE" --config "$PULSEKV_CONFIG" --timeout "$TRANSITION_TIMEOUT" \
+            start "$TARGET"
+    fi
+    if [ "$leader_this_cycle" -eq 1 ]; then
+        restart_killed_leader
+    fi
+
+    if [ "$RUNS_DATA" -eq 1 ]; then
+        wait_transition_count "$((2 * cycle))" \
+            "cycle $cycle rejoin of $TARGET"
+        RESTORE_NEEDED=0
+    fi
+    if [ "$leader_this_cycle" -eq 1 ]; then
+        wait_progress "$LEADER_READY_FILE" 2 \
+            "fenced rejoin of the former leader ${LEADER_KILLED}"
+    fi
 done
 
 pk_step "Waiting for the watcher to verify all topology transitions"
@@ -302,6 +445,17 @@ else:
     kinds = sorted({p["kind"] for p in proofs})
     print(f"    replication factor {report.get('replication_factor', '?')}: "
           f"{len(proofs)} promotion proof(s) over {keys} key(s) [{', '.join(kinds)}]")
+leader = report.get("leader_scenario")
+if leader:
+    print(f"    raft failover: {leader['baseline_leader']}(term {leader['baseline_term']}) -> "
+          f"{leader['new_leader']}(term {leader['new_term']}) in {leader['failover_millis']} ms; "
+          f"{leader['baseline_leader']} rejoined under {leader['rejoin_leader']}"
+          f"(term {leader['rejoin_term']}) in {leader['rejoin_millis']} ms")
+coherence = report.get("replica_coherence", {})
+if coherence.get("sweeps"):
+    print(f"    replica agreement: {coherence['sweeps']} sweep(s), "
+          f"{coherence['reachable_reads']} replica read(s), "
+          f"{coherence['violations']} disagreement(s)")
 PY
 fi
 pk_dim "watcher log: $(pk_relpath "$CHAOS_LOG")"

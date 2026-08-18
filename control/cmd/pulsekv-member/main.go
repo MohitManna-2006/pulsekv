@@ -105,8 +105,14 @@ func run(ctx context.Context, opts options) error {
 			}
 			return errors.Join(err, closeErr)
 		}
-		log.Printf("joined cluster %q; advertising NodeService %s from gossip %s",
-			cfg.Membership.ClusterName, node.Address(), members.LocalGossipAddress())
+		// Having joined SOMEONE, now push/pull with every remaining
+		// control-plane replica. See syncControlPlanes for why one is not
+		// enough any more.
+		synced := syncControlPlanes(ctx, members, cfg, deadline, opts.joinTimeout)
+		log.Printf("joined cluster %q; advertising NodeService %s from gossip %s "+
+			"(directly synced with %d of %d control-plane replica(s))",
+			cfg.Membership.ClusterName, node.Address(), members.LocalGossipAddress(),
+			synced, len(cfg.ControlPlanes))
 		failed, err := monitorNode(ctx, members, node, opts)
 		if err != nil {
 			return err
@@ -268,14 +274,58 @@ func probeNodeContext(ctx context.Context, node config.Node, timeout time.Durati
 	return nil
 }
 
+// bootstrapSeeds lists every gossip endpoint this sidecar may join through.
+//
+// Every control-plane replica comes first, not just one: Phase 5 turned the
+// control plane into a group, and seeding from a single replica would make a
+// data node's ability to join the ring depend on which replica happened to be
+// up. Data peers follow, which is what already let a node recover when no
+// control-plane process was reachable at all.
 func bootstrapSeeds(cfg *config.Config, localNodeID string) []string {
-	seeds := []string{cfg.ControlPlane.GossipAddress()}
+	seeds := cfg.ControlPlaneGossipSeeds()
 	for _, node := range cfg.Nodes {
 		if node.NodeID != localNodeID {
 			seeds = append(seeds, node.GossipAddress())
 		}
 	}
 	return uniqueStrings(seeds)
+}
+
+// syncControlPlanes push/pulls with every control-plane replica, best effort.
+//
+// This is not redundancy for its own sake. Phase 5 made any replica a possible
+// Raft leader, and the leader proposes committed membership from ITS OWN gossip
+// view -- so a replica that has not heard of this node cannot publish it, no
+// matter how healthy everything else is.
+//
+// Until Phase 5 there was exactly one control plane, every sidecar seeded from
+// it, and its Join push/pull gave it a complete view immediately. With three
+// replicas, seeding from the first one that answers leaves the other two to
+// learn this node through gossip propagation -- which is a best-effort UDP
+// broadcast with a bounded retransmit count, backstopped only by the 15 s
+// push/pull interval. That is how a freshly booted cluster ends up with a
+// leader publishing three of four nodes for fifteen seconds.
+//
+// One extra TCP sync per replica at startup removes the guesswork. Failures are
+// ignored: the node has already joined the ring, and a replica that is down
+// will pick this node up from gossip or its own push/pull when it returns.
+func syncControlPlanes(ctx context.Context, manager *membership.Manager, cfg *config.Config,
+	deadline time.Time, joinTimeout time.Duration) int {
+	synced := 0
+	for _, seed := range cfg.ControlPlaneGossipSeeds() {
+		select {
+		case <-ctx.Done():
+			return synced
+		default:
+		}
+		if _, err := boundedAttemptTimeout(deadline, joinTimeout); err != nil {
+			return synced // out of startup budget; the ring already has us
+		}
+		if joined, err := manager.Join([]string{seed}); err == nil && joined > 0 {
+			synced++
+		}
+	}
+	return synced
 }
 
 func joinUntil(ctx context.Context, manager *membership.Manager, seeds []string,

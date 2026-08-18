@@ -33,11 +33,20 @@ func TestLoadAppliesDefaults(t *testing.T) {
 		t.Fatalf("Load: %v", err)
 	}
 
-	if got, want := cfg.ControlPlane.Address(), "127.0.0.1:7000"; got != want {
+	if got, want := len(cfg.ControlPlanes), 1; got != want {
+		t.Fatalf("control plane replica count = %d, want %d", got, want)
+	}
+	if got, want := cfg.ControlPlanes[0].Address(), "127.0.0.1:7000"; got != want {
 		t.Errorf("control plane address = %q, want %q", got, want)
 	}
-	if got, want := cfg.ControlPlane.GossipAddress(), "127.0.0.1:7200"; got != want {
+	if got, want := cfg.ControlPlanes[0].GossipAddress(), "127.0.0.1:7240"; got != want {
 		t.Errorf("control plane gossip address = %q, want %q", got, want)
+	}
+	if got, want := cfg.ControlPlanes[0].RaftAddress(), "127.0.0.1:7300"; got != want {
+		t.Errorf("control plane raft address = %q, want %q", got, want)
+	}
+	if got, want := cfg.ControlPlanes[0].NodeID, "cp-0"; got != want {
+		t.Errorf("control plane node ID = %q, want %q", got, want)
 	}
 	if got, want := cfg.Nodes[1].Address(), "127.0.0.1:7101"; got != want {
 		t.Errorf("node-1 address = %q, want %q", got, want)
@@ -95,11 +104,11 @@ func TestLoadRejectsBadConfigs(t *testing.T) {
 		{
 			name: "node service collides with control plane gossip",
 			body: "control_plane:\n  port: 7000\n  gossip_port: 7100\nnodes:\n  - {node_id: a, port: 7100, gossip_port: 7201}\n",
-			want: "already used by control_plane.gossip",
+			want: "already used by control_plane[0].gossip",
 		},
 		{
 			name: "duplicate gossip address",
-			body: "control_plane:\n  port: 7000\nnodes:\n  - {node_id: a, port: 7100, gossip_port: 7300}\n  - {node_id: b, port: 7101, gossip_port: 7300}\n",
+			body: "control_plane:\n  port: 7000\nnodes:\n  - {node_id: a, port: 7100, gossip_port: 7205}\n  - {node_id: b, port: 7101, gossip_port: 7205}\n",
 			want: "already used by nodes[0].gossip",
 		},
 		{
@@ -136,6 +145,26 @@ func TestLoadRejectsBadConfigs(t *testing.T) {
 			name: "node id delimiter",
 			body: "control_plane:\n  port: 7000\nnodes:\n  - {node_id: 'node,other', port: 7100}\n",
 			want: "must match [A-Za-z0-9][A-Za-z0-9._-]*",
+		},
+		{
+			name: "no control-plane replicas",
+			body: "control_plane: []\nnodes:\n  - {node_id: a, port: 7100}\n",
+			want: "at least one replica is required",
+		},
+		{
+			name: "duplicate control-plane id",
+			body: "control_plane:\n  - {node_id: cp, port: 7000}\n  - {node_id: cp, port: 7001}\nnodes:\n  - {node_id: a, port: 7100}\n",
+			want: "already used by control_plane[0]",
+		},
+		{
+			name: "two replicas sharing a raft port",
+			body: "control_plane:\n  - {node_id: cp-0, port: 7000, raft_port: 7300}\n  - {node_id: cp-1, port: 7001, raft_port: 7300}\nnodes:\n  - {node_id: a, port: 7100}\n",
+			want: "already used by control_plane[0].raft",
+		},
+		{
+			name: "raft election timeout too small",
+			body: "control_plane:\n  port: 7000\nraft:\n  election_timeout_ms: 5\nnodes:\n  - {node_id: a, port: 7100}\n",
+			want: "is too small",
 		},
 		{
 			name: "no nodes",
@@ -250,5 +279,132 @@ func TestReplicationFactorAboveClusterSizeWarnsButLoads(t *testing.T) {
 func TestLoadMissingFile(t *testing.T) {
 	if _, err := Load(filepath.Join(t.TempDir(), "nope.yaml")); err == nil {
 		t.Fatal("Load on a missing file succeeded; want an error")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5: the control-plane group
+// ---------------------------------------------------------------------------
+
+const threeReplicaConfig = `
+control_plane:
+  - node_id: cp-0
+    port: 7000
+  - node_id: cp-1
+    port: 7001
+  - node_id: cp-2
+    port: 7002
+shard_count: 8
+nodes:
+  - {node_id: node-0, port: 7100}
+`
+
+func TestControlPlaneListDefaultsEachReplica(t *testing.T) {
+	cfg, err := Load(write(t, threeReplicaConfig))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.ControlPlanes) != 3 {
+		t.Fatalf("replica count = %d, want 3", len(cfg.ControlPlanes))
+	}
+
+	// Every default is indexed, so three replicas that name only their gRPC
+	// port still land on three distinct gossip and Raft endpoints.
+	wantGossip := []string{"127.0.0.1:7240", "127.0.0.1:7241", "127.0.0.1:7242"}
+	wantRaft := []string{"127.0.0.1:7300", "127.0.0.1:7301", "127.0.0.1:7302"}
+	for i, replica := range cfg.ControlPlanes {
+		if got := replica.GossipAddress(); got != wantGossip[i] {
+			t.Errorf("replica %d gossip address = %q, want %q", i, got, wantGossip[i])
+		}
+		if got := replica.RaftAddress(); got != wantRaft[i] {
+			t.Errorf("replica %d raft address = %q, want %q", i, got, wantRaft[i])
+		}
+	}
+
+	if got, want := cfg.ControlPlaneEndpoints(), "127.0.0.1:7000,127.0.0.1:7001,127.0.0.1:7002"; got != want {
+		t.Errorf("endpoints = %q, want %q", got, want)
+	}
+	if got := cfg.ControlPlaneIDs(); len(got) != 3 || got[2] != "cp-2" {
+		t.Errorf("control plane IDs = %v", got)
+	}
+	if replica, ok := cfg.ControlPlaneByID("cp-1"); !ok || replica.Port != 7001 {
+		t.Errorf("ControlPlaneByID(cp-1) = %+v, ok=%v", replica, ok)
+	}
+	if _, ok := cfg.ControlPlaneByID("cp-9"); ok {
+		t.Error("ControlPlaneByID accepted an unknown replica")
+	}
+}
+
+// A config written against the pre-Phase-5 shape -- a bare mapping rather than
+// a list -- must parse as a one-replica group. A single-voter Raft group is
+// valid, elects itself immediately, and is what every one-replica test uses.
+func TestControlPlaneAcceptsLegacySingleMapping(t *testing.T) {
+	cfg, err := Load(write(t, goodConfig))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.ControlPlanes) != 1 {
+		t.Fatalf("legacy mapping produced %d replicas, want 1", len(cfg.ControlPlanes))
+	}
+	if got, want := cfg.ControlPlaneEndpoints(), "127.0.0.1:7000"; got != want {
+		t.Errorf("endpoints = %q, want %q", got, want)
+	}
+}
+
+func TestRaftDefaultsAndDerivedTimings(t *testing.T) {
+	cfg, err := Load(write(t, threeReplicaConfig))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Raft.ElectionTimeoutMillis != DefaultRaftElectionTimeoutMillis {
+		t.Errorf("election timeout = %d, want default %d",
+			cfg.Raft.ElectionTimeoutMillis, DefaultRaftElectionTimeoutMillis)
+	}
+	if cfg.Raft.DataDir != DefaultRaftDataDir {
+		t.Errorf("raft data dir = %q, want %q", cfg.Raft.DataDir, DefaultRaftDataDir)
+	}
+
+	// The derived timings must satisfy hashicorp/raft's own ordering rule, which
+	// is the entire reason they are derived rather than configured.
+	if cfg.Raft.LeaderLeaseTimeout() > cfg.Raft.HeartbeatTimeout() {
+		t.Errorf("leader lease %s exceeds heartbeat %s",
+			cfg.Raft.LeaderLeaseTimeout(), cfg.Raft.HeartbeatTimeout())
+	}
+	if cfg.Raft.ProposeInterval() >= cfg.Raft.ElectionTimeout() {
+		t.Errorf("propose interval %s is not comfortably under the election timeout %s",
+			cfg.Raft.ProposeInterval(), cfg.Raft.ElectionTimeout())
+	}
+}
+
+// An even-sized group is legal but strictly worse than the odd size below it.
+// It must load, and it must say so.
+func TestEvenControlPlaneGroupWarns(t *testing.T) {
+	cfg, err := Load(write(t, `
+control_plane:
+  - {node_id: cp-0, port: 7000}
+  - {node_id: cp-1, port: 7001}
+shard_count: 8
+nodes:
+  - {node_id: node-0, port: 7100}
+`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	var found bool
+	for _, warning := range cfg.Warnings() {
+		found = found || strings.Contains(warning, "even-sized Raft group")
+	}
+	if !found {
+		t.Fatalf("warnings = %v, want one about the even-sized group", cfg.Warnings())
+	}
+
+	odd, err := Load(write(t, threeReplicaConfig))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	for _, warning := range odd.Warnings() {
+		if strings.Contains(warning, "even-sized Raft group") {
+			t.Fatalf("three replicas warned about being even-sized: %s", warning)
+		}
 	}
 }

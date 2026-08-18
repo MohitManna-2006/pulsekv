@@ -16,6 +16,11 @@
 //	--mode=topology-wait
 //	              wait for an exact live membership set and coherent shard map.
 //	              Used by the Phase 3 node lifecycle and chaos scripts.
+//	--mode=leader print the Raft leader ID and term, so a script knows which
+//	              control-plane process to act on.
+//	--mode=leader-wait
+//	              wait until every reachable replica agrees on one leader and
+//	              term, optionally requiring it to have changed.
 package main
 
 import (
@@ -79,6 +84,14 @@ func main() {
 			"comma-separated node IDs that must be absent in --mode=topology-wait")
 		minGeneration = flag.Uint64("min-generation", 0,
 			"minimum topology generation for --mode=topology-wait")
+		leaderChangedFrom = flag.String("expect-leader-change-from", "",
+			"for --mode=leader-wait: require the converged leader to differ from this replica ID")
+		minReplicas = flag.Int("min-replicas", 1,
+			"for --mode=leader-wait: how many replicas must answer and agree")
+		minControlPlane = flag.Int("min-control-plane", 0,
+			"for --mode=wait: how many control-plane replicas must be healthy (0 = all). "+
+				"A Raft group tolerates losing a minority, so a lifecycle check that "+
+				"demanded every replica would be stricter than the system it manages")
 	)
 	flag.Parse()
 
@@ -90,9 +103,14 @@ func main() {
 
 	switch *mode {
 	case "wait":
-		os.Exit(runWait(cfg, *timeout, *rpcTimeout, *pollInterval))
+		os.Exit(runWait(cfg, *minControlPlane, *timeout, *rpcTimeout, *pollInterval))
 	case "smoke":
 		os.Exit(runSmoke(cfg, *rpcTimeout))
+	case "leader":
+		os.Exit(runLeader(cfg, *rpcTimeout))
+	case "leader-wait":
+		os.Exit(runLeaderWait(cfg, *leaderChangedFrom, *minReplicas,
+			*timeout, *rpcTimeout, *pollInterval))
 	case "topology-wait":
 		live, err := expectedNodeIDs(cfg, *expectLive)
 		if err != nil {
@@ -107,7 +125,8 @@ func main() {
 		os.Exit(runTopologyWait(cfg, live, absent, *minGeneration,
 			*timeout, *rpcTimeout, *pollInterval))
 	default:
-		fmt.Fprintf(os.Stderr, "pulsekv-smoke: unknown --mode %q (want wait, smoke, or topology-wait)\n", *mode)
+		fmt.Fprintf(os.Stderr,
+			"pulsekv-smoke: unknown --mode %q (want wait, smoke, topology-wait, leader, or leader-wait)\n", *mode)
 		os.Exit(2)
 	}
 }
@@ -124,24 +143,61 @@ type process struct {
 }
 
 func processes(cfg *config.Config) []process {
-	ps := []process{{label: "controlplane", address: cfg.ControlPlane.Address()}}
+	ps := make([]process, 0, len(cfg.ControlPlanes)+len(cfg.Nodes))
+	for _, replica := range cfg.ControlPlanes {
+		ps = append(ps, process{label: "controlplane:" + replica.NodeID, address: replica.Address()})
+	}
 	for _, n := range cfg.Nodes {
 		ps = append(ps, process{label: n.NodeID, address: n.Address(), isNode: true})
 	}
 	return ps
 }
 
-func runWait(cfg *config.Config, budget, rpcTimeout, interval time.Duration) int {
+// runWait polls until every data node and the required number of control-plane
+// replicas report healthy.
+//
+// minControlPlane exists because Phase 5 made the control plane a group. Boot
+// asks for all of them -- a cluster that silently comes up one replica short is
+// worth catching. A targeted node restart asks only for a quorum, because it
+// legitimately runs while a replica is down, and demanding all of them would
+// make the lifecycle scripts refuse to work during exactly the failover the
+// chaos harness creates.
+func runWait(cfg *config.Config, minControlPlane int, budget, rpcTimeout, interval time.Duration) int {
 	ps := processes(cfg)
+	replicas := len(cfg.ControlPlanes)
+	required := minControlPlane
+	if required <= 0 || required > replicas {
+		required = replicas
+	}
 	deadline := time.Now().Add(budget)
 
-	fmt.Printf("waiting up to %s for %d service(s) to report healthy...\n", budget, len(ps))
+	if required < replicas {
+		fmt.Printf("waiting up to %s for %d data service(s) and %d of %d control-plane replica(s)...\n",
+			budget, len(cfg.Nodes), required, replicas)
+	} else {
+		fmt.Printf("waiting up to %s for %d service(s) to report healthy...\n", budget, len(ps))
+	}
 
 	var lastErrs map[string]error
+	var healthyReplicas int
 	for attempt := 1; ; attempt++ {
 		lastErrs = probeAll(ps, rpcTimeout)
-		if len(lastErrs) == 0 {
-			fmt.Printf("all %d service(s) healthy after %d poll(s)\n", len(ps), attempt)
+
+		healthyReplicas = replicas
+		dataFailures := 0
+		for _, p := range ps {
+			if _, bad := lastErrs[p.label]; !bad {
+				continue
+			}
+			if p.isNode {
+				dataFailures++
+			} else {
+				healthyReplicas--
+			}
+		}
+		if dataFailures == 0 && healthyReplicas >= required {
+			fmt.Printf("all %d data service(s) and %d of %d control-plane replica(s) healthy after %d poll(s)\n",
+				len(cfg.Nodes), healthyReplicas, replicas, attempt)
 			return 0
 		}
 		if time.Now().After(deadline) {
@@ -152,11 +208,12 @@ func runWait(cfg *config.Config, budget, rpcTimeout, interval time.Duration) int
 
 	// Fail loudly and specifically. "cluster did not come up" is useless;
 	// "node-2 on 127.0.0.1:7102 refused the connection" is actionable.
-	fmt.Fprintf(os.Stderr, "\nFAILED: %d of %d process(es) did not become healthy within %s\n",
-		len(lastErrs), len(ps), budget)
+	fmt.Fprintf(os.Stderr,
+		"\nFAILED: %d process(es) unhealthy within %s (%d of %d control-plane replica(s) up, want %d)\n",
+		len(lastErrs), budget, healthyReplicas, replicas, required)
 	for _, p := range ps {
 		if err, bad := lastErrs[p.label]; bad {
-			fmt.Fprintf(os.Stderr, "  %-14s %-22s %v\n", p.label, p.address, compact(err))
+			fmt.Fprintf(os.Stderr, "  %-18s %-22s %v\n", p.label, p.address, compact(err))
 		}
 	}
 	return 1
@@ -172,7 +229,7 @@ func runTopologyWait(cfg *config.Config, expected, absent []string, minGeneratio
 	deadline := time.Now().Add(budget)
 	var lastErr error
 	for attempt := 1; ; attempt++ {
-		lastErr = probeTopology(cfg.ControlPlane.Address(), cfg.ShardCount,
+		lastErr = probeTopology(cfg.ControlPlaneAddresses(), cfg.ShardCount,
 			expected, absent, minGeneration, rpcTimeout)
 		if lastErr == nil {
 			fmt.Printf("topology converged after %d poll(s): generation >= %d, live=[%s]\n",
@@ -187,18 +244,18 @@ func runTopologyWait(cfg *config.Config, expected, absent []string, minGeneratio
 	}
 }
 
-func probeTopology(controlPlane string, shardCount uint32, expected, absent []string, minGeneration uint64,
+// probeTopology checks one coherent topology, read from whichever
+// control-plane replica answers first.
+//
+// Any replica is an acceptable source: they serve from their own applied Raft
+// log, which is a prefix of the leader's committed one. A follower can be a
+// heartbeat behind, so this poll simply retries until whichever replica it
+// reached has caught up -- it never sees a contradictory answer, only an
+// earlier one.
+func probeTopology(controlPlanes []string, shardCount uint32, expected, absent []string, minGeneration uint64,
 	rpcTimeout time.Duration) error {
 
-	conn, err := dial(controlPlane)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
-	defer cancel()
-	snapshot, err := clustertopology.Fetch(ctx, metadatav1.NewClusterMetadataServiceClient(conn))
+	snapshot, _, err := fetchFromAnyReplica(controlPlanes, rpcTimeout)
 	if err != nil {
 		return err
 	}
@@ -239,6 +296,178 @@ func probeTopology(controlPlane string, shardCount uint32, expected, absent []st
 			snapshot.Generation, strings.Join(differences, "; "))
 	}
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// control-plane replica helpers
+// ---------------------------------------------------------------------------
+
+// dialAnyReplica returns a connection to the first replica that answers
+// HealthCheck. The caller owns the connection.
+func dialAnyReplica(addresses []string, rpcTimeout time.Duration) (string, *grpc.ClientConn, error) {
+	var firstErr error
+	for _, address := range addresses {
+		conn, err := dial(address)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("%s: %w", address, err)
+			}
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
+		_, err = metadatav1.NewClusterMetadataServiceClient(conn).HealthCheck(
+			ctx, &metadatav1.HealthCheckRequest{})
+		cancel()
+		if err == nil {
+			return address, conn, nil
+		}
+		conn.Close()
+		if firstErr == nil {
+			firstErr = fmt.Errorf("%s: %w", address, err)
+		}
+	}
+	if firstErr == nil {
+		firstErr = errors.New("no control-plane replicas configured")
+	}
+	return "", nil, firstErr
+}
+
+// fetchFromAnyReplica reads one coherent topology from the first replica that
+// answers, and reports which one that was.
+func fetchFromAnyReplica(addresses []string, rpcTimeout time.Duration) (clustertopology.Snapshot, string, error) {
+	var firstErr error
+	for _, address := range addresses {
+		conn, err := dial(address)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("%s: %w", address, err)
+			}
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
+		snapshot, err := clustertopology.Fetch(ctx, metadatav1.NewClusterMetadataServiceClient(conn))
+		cancel()
+		conn.Close()
+		if err == nil {
+			return snapshot, address, nil
+		}
+		if firstErr == nil {
+			firstErr = fmt.Errorf("%s: %w", address, err)
+		}
+	}
+	if firstErr == nil {
+		firstErr = errors.New("no control-plane replicas configured")
+	}
+	return clustertopology.Snapshot{}, "", firstErr
+}
+
+// ---------------------------------------------------------------------------
+// leader modes
+// ---------------------------------------------------------------------------
+
+// runLeader prints `leader_id<TAB>term` from the first replica that answers.
+//
+// deploy/chaos-test.sh uses it to discover which control-plane process to kill.
+// The harness owns every assertion about leadership; this only answers "who".
+func runLeader(cfg *config.Config, rpcTimeout time.Duration) int {
+	snapshot, address, err := fetchFromAnyReplica(cfg.ControlPlaneAddresses(), rpcTimeout)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "pulsekv-smoke: no control-plane replica answered: %v\n", err)
+		return 1
+	}
+	if snapshot.RaftLeaderID == "" {
+		fmt.Fprintf(os.Stderr,
+			"pulsekv-smoke: %s reports no Raft leader (term %d); the group may be electing\n",
+			address, snapshot.RaftTerm)
+		return 1
+	}
+	fmt.Printf("%s\t%d\n", snapshot.RaftLeaderID, snapshot.RaftTerm)
+	return 0
+}
+
+// runLeaderWait blocks until every reachable replica agrees on one leader, and
+// on a leader different from --expect-leader-change-from when that is given.
+//
+// Convergence is the real property: "some replica named a leader" would pass
+// while two replicas still disagreed, which is exactly the state Phase 5 exists
+// to make impossible.
+func runLeaderWait(cfg *config.Config, changedFrom string, minReplicas int,
+	budget, rpcTimeout, interval time.Duration) int {
+
+	deadline := time.Now().Add(budget)
+	var lastErr error
+	for attempt := 1; ; attempt++ {
+		leader, term, reached, err := observeLeader(cfg.ControlPlaneAddresses(), rpcTimeout)
+		switch {
+		case err != nil:
+			lastErr = err
+		case reached < minReplicas:
+			lastErr = fmt.Errorf("only %d of %d replica(s) answered, want at least %d",
+				reached, len(cfg.ControlPlanes), minReplicas)
+		case leader == "":
+			lastErr = errors.New("reachable replicas do not agree on a leader yet")
+		case changedFrom != "" && leader == changedFrom:
+			lastErr = fmt.Errorf("leader is still %s at term %d", leader, term)
+		default:
+			fmt.Printf("leader converged after %d poll(s): %s at term %d (%d replica(s) agree)\n",
+				attempt, leader, term, reached)
+			return 0
+		}
+		if time.Now().After(deadline) {
+			fmt.Fprintf(os.Stderr, "FAILED: leadership did not converge within %s: %v\n", budget, lastErr)
+			return 1
+		}
+		time.Sleep(interval)
+	}
+}
+
+// observeLeader returns the leader every reachable replica agrees on, or an
+// empty ID when they disagree or any of them names no leader at all.
+func observeLeader(addresses []string, rpcTimeout time.Duration) (string, uint64, int, error) {
+	var (
+		leader   string
+		term     uint64
+		reached  int
+		firstErr error
+	)
+	for _, address := range addresses {
+		conn, err := dial(address)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
+		resp, err := metadatav1.NewClusterMetadataServiceClient(conn).GetShardMap(
+			ctx, &metadatav1.GetShardMapRequest{})
+		cancel()
+		conn.Close()
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		reached++
+		if resp.GetRaftLeaderId() == "" {
+			return "", 0, reached, nil // this replica sees no leader yet
+		}
+		if leader == "" {
+			leader, term = resp.GetRaftLeaderId(), resp.GetRaftTerm()
+			continue
+		}
+		if resp.GetRaftLeaderId() != leader || resp.GetRaftTerm() != term {
+			return "", 0, reached, nil // replicas disagree; not converged
+		}
+	}
+	if reached == 0 {
+		if firstErr == nil {
+			firstErr = errors.New("no control-plane replicas configured")
+		}
+		return "", 0, 0, firstErr
+	}
+	return leader, term, reached, nil
 }
 
 func sortedNodeIDs(nodes map[string]string) []string {
@@ -355,12 +584,13 @@ func probeOne(p process, rpcTimeout time.Duration) error {
 func runSmoke(cfg *config.Config, rpcTimeout time.Duration) int {
 	r := &reporter{}
 
-	cpConn, err := dial(cfg.ControlPlane.Address())
+	cpAddress, cpConn, err := dialAnyReplica(cfg.ControlPlaneAddresses(), rpcTimeout)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "pulsekv-smoke: cannot reach control plane at %s: %v\n",
-			cfg.ControlPlane.Address(), err)
+		fmt.Fprintf(os.Stderr, "pulsekv-smoke: cannot reach any control-plane replica (%s): %v\n",
+			strings.Join(cfg.ControlPlaneAddresses(), ", "), err)
 		return 1
 	}
+	_ = cpAddress
 	defer cpConn.Close()
 
 	checkControlPlane(r, cfg, cpConn, rpcTimeout)
@@ -585,7 +815,7 @@ func checkRouting(r *reporter, cfg *config.Config, conn *grpc.ClientConn, rpcTim
 		topology.generation, len(topology.nodes), len(topology.shardMap)))
 
 	routed, err := pulsekvclient.New(
-		cfg.ControlPlane.Address(),
+		cfg.ControlPlaneEndpoints(),
 		pulsekvclient.WithRefreshInterval(0),
 		pulsekvclient.WithRefreshTimeout(rpcTimeout),
 	)
@@ -776,7 +1006,7 @@ func checkReplication(r *reporter, cfg *config.Config, conn *grpc.ClientConn, rp
 	}
 
 	routed, err := pulsekvclient.New(
-		cfg.ControlPlane.Address(),
+		cfg.ControlPlaneEndpoints(),
 		pulsekvclient.WithRefreshInterval(0),
 		pulsekvclient.WithRefreshTimeout(rpcTimeout),
 	)

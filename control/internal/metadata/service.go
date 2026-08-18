@@ -37,6 +37,7 @@ type Service struct {
 	source            membership.Source
 	configPath        string
 	started           time.Time
+	leaderInfo        func() (string, uint64)
 }
 
 // Option customises a Service.
@@ -46,6 +47,21 @@ type Option func(*Service)
 // server otherwise uses process start.
 func WithStartTime(t time.Time) Option {
 	return func(s *Service) { s.started = t }
+}
+
+// WithLeaderInfo supplies the Raft leader ID and term reported on
+// GetShardMapResponse.
+//
+// Purely diagnostic, and deliberately kept out of the topology fingerprint: two
+// replicas holding the same committed state must produce the same fingerprint
+// even when one has not yet noticed an election. It exists so the chaos harness
+// can assert "the leader actually changed" directly instead of inferring it
+// from timing.
+//
+// Unset on a control plane with no Raft group, which reports an empty ID and
+// term 0 — an honest "not applicable" rather than a fabricated value.
+func WithLeaderInfo(fn func() (leaderID string, term uint64)) Option {
+	return func(s *Service) { s.leaderInfo = fn }
 }
 
 // New builds a Service over cfg's fixed shard count and a live membership
@@ -146,14 +162,26 @@ func (s *Service) GetShardMap(_ context.Context, _ *metadatav1.GetShardMapReques
 		wireOwners[shard] = entry
 	}
 
+	leaderID, term := s.leader()
 	return &metadatav1.GetShardMapResponse{
 		ShardToNodeId:       placement.shardMap,
 		TopologyGeneration:  snapshot.Generation,
 		TopologyFingerprint: clustertopology.Fingerprint(placement.fingerprintInput()),
 		ShardCount:          s.shardCount,
 		ShardToOwners:       wireOwners,
-		ReplicationFactor:   uint32(s.replicationFactor),
+		ReplicationFactor:   placement.replicationFactor,
+		RaftLeaderId:        leaderID,
+		RaftTerm:            term,
 	}, nil
+}
+
+// leader reports the metadata group's current leader as this replica sees it,
+// or an empty ID when there is no Raft group at all.
+func (s *Service) leader() (string, uint64) {
+	if s.leaderInfo == nil {
+		return "", 0
+	}
+	return s.leaderInfo()
 }
 
 // placement is one generation's complete, self-consistent ownership decision.
@@ -192,8 +220,26 @@ func (s *Service) placement(snapshot membership.Snapshot) (placement, error) {
 		nodeIDs = append(nodeIDs, node.NodeID)
 	}
 
+	// The replication factor comes from the snapshot when the source is
+	// authoritative about configuration, and from local config when it is not.
+	//
+	// Phase 5's Raft-backed source sets it; gossip leaves it nil, so a Phase 3/4
+	// control plane behaves byte-identically. Taking it from the SNAPSHOT rather
+	// than reading it separately is what keeps this coherent: the node set and
+	// the factor are both inputs to the computation below, and fetching them
+	// through two calls could interleave with a Raft apply and produce a shard
+	// map describing a state that never existed.
+	replicationFactor := s.replicationFactor
+	if snapshot.ReplicationFactor != nil {
+		replicationFactor = *snapshot.ReplicationFactor
+	}
+	if replicationFactor < 0 {
+		return placement{}, status.Errorf(codes.Internal,
+			"agreed replication factor %d is negative", replicationFactor)
+	}
+
 	shardMap := router.AssignShards(nodeIDs, s.shardCount)
-	owners := router.AssignShardOwners(nodeIDs, s.shardCount, s.replicationFactor)
+	owners := router.AssignShardOwners(nodeIDs, s.shardCount, replicationFactor)
 	if len(shardMap) != len(owners) {
 		return placement{}, status.Errorf(codes.Internal,
 			"shard map has %d entries but the owner map has %d", len(shardMap), len(owners))
@@ -208,7 +254,7 @@ func (s *Service) placement(snapshot membership.Snapshot) (placement, error) {
 
 	return placement{
 		shardCount:        s.shardCount,
-		replicationFactor: uint32(s.replicationFactor),
+		replicationFactor: uint32(replicationFactor),
 		addresses:         addresses,
 		shardMap:          shardMap,
 		owners:            owners,

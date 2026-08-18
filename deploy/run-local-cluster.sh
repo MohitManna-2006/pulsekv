@@ -6,9 +6,15 @@
 #                               [--timeout SECONDS] [--replication-factor N]
 #
 # Builds the Go control plane, Go gossip sidecar, and C++ grpc_shim node. It
-# starts one control-plane gossip observer plus one data process and one
-# membership sidecar per configured node. A sidecar starts only after all data
-# services pass HealthCheck, so gossip never advertises an unready endpoint.
+# starts every configured control-plane replica, waits for the Raft metadata
+# group to elect a leader, then starts one data process and one membership
+# sidecar per configured node. A sidecar starts only after all data services
+# pass HealthCheck, so gossip never advertises an unready endpoint.
+#
+# Waiting for a leader before booting data nodes is not cosmetic: until the
+# group has one, nothing can commit membership, so a node that joined gossip
+# would sit unpublished and every readiness check downstream would be waiting on
+# an election it cannot see.
 #
 # --replication-factor N overrides the config's replication_factor for this boot
 # only, which is how one fixture gets exercised at 0, 1, and 2. It is passed to
@@ -180,7 +186,12 @@ fi
 # ---------------------------------------------------------------------------
 # Read the cluster shape through the control plane's own parser.
 # ---------------------------------------------------------------------------
+CP_ENDPOINTS="$(pk_controlplane_endpoints)" || pk_die "could not read control-plane addresses from $PULSEKV_CONFIG"
 CP_ADDRESS="$(pk_controlplane_address)" || pk_die "could not read the control-plane address from $PULSEKV_CONFIG"
+mapfile -t CP_IDS < <(pk_controlplane_ids)
+[ "${#CP_IDS[@]}" -gt 0 ] || pk_die "config defines no control-plane replicas"
+RAFT_ROOT_ABS="$(pk_raft_data_root_abs)" || pk_die "could not resolve raft.data_dir from $PULSEKV_CONFIG"
+mkdir -p "$RAFT_ROOT_ABS"
 
 node_table="$(pk_config_read --print-nodes)" || pk_die "could not read nodes from $PULSEKV_CONFIG"
 [ -n "$node_table" ] || pk_die "config defines no nodes"
@@ -232,17 +243,29 @@ report_failure_and_stop() {
 
 # Truncate only this cluster's process logs. Targeted restarts append markers
 # and retain the failure evidence from earlier incarnations.
-: > "$(pk_log_for_label controlplane)"
+for cp_id in "${CP_IDS[@]}"; do
+    : > "$(pk_log_for_label "controlplane:${cp_id}")"
+done
 for line in "${NODE_LINES[@]}"; do
     IFS=$'\t' read -r node_id _ <<< "$line"
     : > "$(pk_log_for_label "data:${node_id}")"
     : > "$(pk_log_for_label "member:${node_id}")"
 done
 
-pk_step "Starting control plane and data nodes"
-if ! pk_start_controlplane; then report_failure_and_stop; fi
-track_last_started
+pk_step "Starting the ${#CP_IDS[@]}-replica control-plane group"
+for cp_id in "${CP_IDS[@]}"; do
+    if ! pk_start_controlplane "$cp_id"; then report_failure_and_stop; fi
+    track_last_started
+done
 
+pk_info "waiting for the Raft metadata group to elect a leader"
+if ! "$PULSEKV_SMOKE_BIN" --config "$PULSEKV_CONFIG" \
+        --mode=leader-wait --min-replicas="${#CP_IDS[@]}" \
+        --timeout="${HEALTH_TIMEOUT}s" 2>&1 | sed 's/^/    /'; then
+    report_failure_and_stop
+fi
+
+pk_step "Starting data nodes"
 for line in "${NODE_LINES[@]}"; do
     IFS=$'\t' read -r node_id _ <<< "$line"
     if ! pk_start_data_node "$node_id"; then report_failure_and_stop; fi
@@ -306,10 +329,13 @@ pk_info "config:    $(pk_relpath "$PULSEKV_CONFIG")"
 pk_info "pids:      $(pk_relpath "$PULSEKV_PID_FILE")"
 pk_info "spill dirs: $(pk_relpath "$DATA_ROOT_ABS")/<node-id>  (purged at node start and stop)"
 echo
+pk_info "control plane: ${CP_ENDPOINTS}"
+pk_info "raft state:   $(pk_relpath "$RAFT_ROOT_ABS")/<replica-id>  (survives restarts, by design)"
 pk_info "smoke test:   deploy/smoke-test.sh"
 pk_info "engine tests: deploy/test-engine.sh"
-pk_info "example:      deploy/build/bin/pulsekv-example --control-plane ${CP_ADDRESS}"
-pk_info "cluster bench: deploy/build/bin/pulsekv-cluster-bench --control-plane ${CP_ADDRESS}"
+pk_info "example:      deploy/build/bin/pulsekv-example --control-plane ${CP_ENDPOINTS}"
+pk_info "cluster bench: deploy/build/bin/pulsekv-cluster-bench --control-plane ${CP_ENDPOINTS}"
+pk_info "raft leader:  deploy/build/bin/pulsekv-smoke --config $(pk_relpath "$PULSEKV_CONFIG") --mode=leader"
 DEMO_NODE_INDEX=0
 [ "${#NODE_LINES[@]}" -lt 2 ] || DEMO_NODE_INDEX=1
 IFS=$'\t' read -r DEMO_NODE_ID _ <<< "${NODE_LINES[$DEMO_NODE_INDEX]}"

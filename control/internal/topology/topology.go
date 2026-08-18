@@ -50,6 +50,18 @@ type Snapshot struct {
 	// reported. The count actually present in Owners can be lower when the
 	// cluster has fewer live nodes than 1 + ReplicationFactor.
 	ReplicationFactor uint32
+
+	// RaftLeaderID and RaftTerm are what the answering replica believed about
+	// the metadata group's leadership. Added in Phase 5, and DIAGNOSTIC ONLY:
+	// neither is part of the fingerprint, neither is validated, and neither
+	// affects routing. They exist so a harness can assert that leadership moved
+	// rather than infer it from timing.
+	//
+	// Empty and zero against a control plane with no Raft group, and empty
+	// while the group is electing -- an honest "nobody right now" rather than a
+	// stale guess.
+	RaftLeaderID string
+	RaftTerm     uint64
 }
 
 // Replicas returns the replica node IDs for one shard, or nil when the shard
@@ -109,6 +121,11 @@ func Fetch(ctx context.Context, metadata metadatav1.ClusterMetadataServiceClient
 				return Snapshot{}, errors.New("metadata topology fingerprint does not match response content")
 			}
 			snapshot.Fingerprint = bytes.Clone(shardFingerprint)
+			// Attached after validation and deliberately NOT hashed: two
+			// replicas at the same committed state must fingerprint the same
+			// even when one has not yet noticed an election.
+			snapshot.RaftLeaderID = shardsResp.GetRaftLeaderId()
+			snapshot.RaftTerm = shardsResp.GetRaftTerm()
 			return snapshot, nil
 		}
 
@@ -121,9 +138,15 @@ func Fetch(ctx context.Context, metadata metadatav1.ClusterMetadataServiceClient
 		if shardCount == 0 && len(shardsResp.GetShardToNodeId()) > 0 {
 			shardCount = uint32(len(shardsResp.GetShardToNodeId()))
 		}
-		return validate(nodeGeneration, shardCount,
+		snapshot, err := validate(nodeGeneration, shardCount,
 			nodesResp.GetNodes(), shardsResp.GetShardToNodeId(),
 			shardsResp.GetShardToOwners(), shardsResp.GetReplicationFactor())
+		if err != nil {
+			return Snapshot{}, err
+		}
+		snapshot.RaftLeaderID = shardsResp.GetRaftLeaderId()
+		snapshot.RaftTerm = shardsResp.GetRaftTerm()
+		return snapshot, nil
 	}
 
 	return Snapshot{}, fmt.Errorf(

@@ -436,11 +436,49 @@ struct AckFanout {
 struct ReplicationOptions {
   std::string node_id;
   std::string self_address;
-  std::string metadata_address;
+
+  // Every control-plane replica this node may read ownership from.
+  //
+  // Phase 5 made the metadata plane a Raft group, so the replica this node
+  // happens to prefer can be down or mid-election while the group is perfectly
+  // healthy. Reading from a follower is safe rather than sloppy: a replica
+  // answers from its own applied log, which is always a prefix of the leader's
+  // committed one, so it can be slightly behind but never contradictory.
+  std::vector<std::string> metadata_addresses;
+
   int64_t poll_interval_ms = 2000;
   int64_t ack_timeout_ms = 2000;
   bool catch_up = true;
+
+  const std::string& PrimaryMetadataAddress() const {
+    static const std::string kNone;
+    return metadata_addresses.empty() ? kNone : metadata_addresses.front();
+  }
 };
+
+// Splits a comma-separated endpoint list, dropping blanks and duplicates. A
+// duplicate would only make the fallback retry the same replica twice.
+std::vector<std::string> SplitEndpoints(const std::string& text) {
+  std::vector<std::string> out;
+  size_t start = 0;
+  while (start <= text.size()) {
+    const size_t comma = text.find(',', start);
+    const size_t end = comma == std::string::npos ? text.size() : comma;
+    std::string piece = text.substr(start, end - start);
+    // Trim surrounding whitespace so a hand-written flag with spaces works.
+    size_t lo = piece.find_first_not_of(" \t");
+    size_t hi = piece.find_last_not_of(" \t");
+    if (lo != std::string::npos) {
+      piece = piece.substr(lo, hi - lo + 1);
+      if (std::find(out.begin(), out.end(), piece) == out.end())
+        out.push_back(piece);
+    }
+    if (comma == std::string::npos)
+      break;
+    start = comma + 1;
+  }
+  return out;
+}
 
 // Owns everything replication needs: the published topology, the peer stubs,
 // the background queue, the poller, and the catch-up worker.
@@ -579,8 +617,12 @@ class ReplicationManager : public std::enable_shared_from_this<ReplicationManage
     grpc::ChannelArguments args;
     args.SetMaxSendMessageSize(kPeerMaxMessageBytes);
     args.SetMaxReceiveMessageSize(kPeerMaxMessageBytes);
-    metadata_ = metadatav1::ClusterMetadataService::NewStub(grpc::CreateCustomChannel(
-        options_.metadata_address, grpc::InsecureChannelCredentials(), args));
+    for (const std::string& address : options_.metadata_addresses) {
+      metadata_.push_back(MetadataEndpoint{
+          address,
+          metadatav1::ClusterMetadataService::NewStub(grpc::CreateCustomChannel(
+              address, grpc::InsecureChannelCredentials(), args))});
+    }
   }
 
   void Complete(const std::shared_ptr<AckFanout>& fanout, bool ok,
@@ -703,13 +745,47 @@ class ReplicationManager : public std::enable_shared_from_this<ReplicationManage
     }
   }
 
+  // FetchView reads a coherent topology, falling back across control-plane
+  // replicas until one answers.
+  //
+  // Phase 5 added the fallback; the coherence rule inside FetchViewFrom is
+  // unchanged and does not know a Raft group exists. The important structural
+  // point is that ONE attempt is confined to ONE replica: the two RPCs must
+  // observe the same publisher, and splitting them across a leader and a
+  // slightly-behind follower would produce a fingerprint mismatch that looks
+  // exactly like membership churn.
+  std::shared_ptr<const TopologyView> FetchView() {
+    const size_t count = metadata_.size();
+    if (count == 0)
+      return nullptr;
+
+    const size_t start = preferred_metadata_.load(std::memory_order_relaxed) % count;
+    for (size_t offset = 0; offset < count; offset++) {
+      if (stopping())
+        return nullptr;
+      const size_t index = (start + offset) % count;
+      auto view = FetchViewFrom(index);
+      if (view) {
+        // Stick with whatever answered, so a healthy node is not rotating
+        // across replicas for no reason.
+        if (index != start)
+          preferred_metadata_.store(index, std::memory_order_relaxed);
+        return view;
+      }
+    }
+    return nullptr;
+  }
+
   // The same coherence rule internal/topology.Fetch applies, kept deliberately
   // minimal: GetNodeList and GetShardMap are separate RPCs, so they can observe
   // different memberships. Retry until the two carry the same content-derived
   // fingerprint, then trust the content. Recomputing the SHA-256 here would
   // mean maintaining a second implementation of the canonical serialisation in
   // C++, and a bug in it would reject every valid topology.
-  std::shared_ptr<const TopologyView> FetchView() {
+  std::shared_ptr<const TopologyView> FetchViewFrom(size_t index) {
+    const std::string& address = metadata_[index].address;
+    auto& stub = metadata_[index].stub;
+
     for (int attempt = 0; attempt < kMaxCoherenceAttempts; attempt++) {
       if (stopping())
         return nullptr;
@@ -719,10 +795,9 @@ class ReplicationManager : public std::enable_shared_from_this<ReplicationManage
         grpc::ClientContext context;
         context.set_deadline(DeadlineFromNow(options_.poll_interval_ms));
         metadatav1::GetNodeListRequest request;
-        grpc::Status status = metadata_->GetNodeList(&context, request, &nodes);
+        grpc::Status status = stub->GetNodeList(&context, request, &nodes);
         if (!status.ok()) {
-          LogFailure(options_.metadata_address,
-                     "GetNodeList failed: " + status.error_message());
+          LogFailure(address, "GetNodeList on " + address + " failed: " + status.error_message());
           return nullptr;
         }
       }
@@ -732,42 +807,42 @@ class ReplicationManager : public std::enable_shared_from_this<ReplicationManage
         grpc::ClientContext context;
         context.set_deadline(DeadlineFromNow(options_.poll_interval_ms));
         metadatav1::GetShardMapRequest request;
-        grpc::Status status = metadata_->GetShardMap(&context, request, &shards);
+        grpc::Status status = stub->GetShardMap(&context, request, &shards);
         if (!status.ok()) {
-          LogFailure(options_.metadata_address,
-                     "GetShardMap failed: " + status.error_message());
+          LogFailure(address, "GetShardMap on " + address + " failed: " + status.error_message());
           return nullptr;
         }
       }
 
       if (nodes.topology_fingerprint().empty() || shards.topology_fingerprint().empty()) {
-        LogFailure(options_.metadata_address,
-                   "metadata published no topology fingerprint; replication needs a "
-                   "Phase 3 or later control plane");
+        LogFailure(address,
+                   "metadata on " + address + " published no topology fingerprint; "
+                   "replication needs a Phase 3 or later control plane");
         return nullptr;
       }
       if (nodes.topology_fingerprint() != shards.topology_fingerprint())
         continue;  // membership moved between the two calls
-      return BuildView(nodes, shards);
+      return BuildView(address, nodes, shards);
     }
-    LogFailure(options_.metadata_address,
-               "metadata topology did not converge across " +
+    LogFailure(address,
+               "metadata topology on " + address + " did not converge across " +
                    std::to_string(kMaxCoherenceAttempts) + " attempts");
     return nullptr;
   }
 
   std::shared_ptr<const TopologyView> BuildView(
+      const std::string& source,
       const metadatav1::GetNodeListResponse& nodes,
       const metadatav1::GetShardMapResponse& shards) {
     if (shards.shard_count() == 0) {
-      LogFailure(options_.metadata_address, "metadata published a zero shard count");
+      LogFailure(source, "metadata on " + source + " published a zero shard count");
       return nullptr;
     }
 
     std::unordered_map<std::string, std::string> address_of;
     for (const auto& node : nodes.nodes()) {
       if (node.node_id().empty() || node.address().empty()) {
-        LogFailure(options_.metadata_address, "metadata published a node with no ID or address");
+        LogFailure(source, "metadata on " + source + " published a node with no ID or address");
         return nullptr;
       }
       address_of[node.node_id()] = node.address();
@@ -1030,7 +1105,14 @@ class ReplicationManager : public std::enable_shared_from_this<ReplicationManage
 
   PeerClients peers_;
   AsyncQueue queue_;
-  std::unique_ptr<metadatav1::ClusterMetadataService::Stub> metadata_;
+  // One entry per control-plane replica, built once at construction and never
+  // mutated, so the poller can read it without a lock.
+  struct MetadataEndpoint {
+    std::string address;
+    std::unique_ptr<metadatav1::ClusterMetadataService::Stub> stub;
+  };
+  std::vector<MetadataEndpoint> metadata_;
+  std::atomic<size_t> preferred_metadata_{0};
 
   mutable std::mutex state_mu_;
   std::condition_variable state_cv_;
@@ -1497,13 +1579,18 @@ void PrintUsage(const char* argv0) {
       "  --max-value-bytes N       hard ceiling per value, in bytes (default %llu)\n"
       "\n"
       "replication (Phase 4; all optional):\n"
-      "  --metadata-addr HOST:PORT ClusterMetadataService to read shard\n"
-      "                            ownership from. WITHOUT THIS FLAG THE NODE\n"
-      "                            DOES NOT REPLICATE AT ALL and behaves exactly\n"
-      "                            as it did before Phase 4. With it, this node\n"
-      "                            forwards writes for the shards it primaries\n"
-      "                            to that shard's replicas, and backfills\n"
-      "                            shards it newly starts holding.\n"
+      "  --metadata-addr LIST      comma-separated ClusterMetadataService\n"
+      "                            addresses to read shard ownership from, e.g.\n"
+      "                            host:7000,host:7001,host:7002. Any replica may\n"
+      "                            answer; the node prefers whichever did last and\n"
+      "                            falls back across the rest, so one replica being\n"
+      "                            down or mid-election is not visible here.\n"
+      "                            WITHOUT THIS FLAG THE NODE DOES NOT REPLICATE\n"
+      "                            AT ALL and behaves exactly as it did before\n"
+      "                            Phase 4. With it, this node forwards writes for\n"
+      "                            the shards it primaries to that shard's\n"
+      "                            replicas, and backfills shards it newly starts\n"
+      "                            holding.\n"
       "  --topology-poll-interval-ms N\n"
       "                            how often to re-read ownership (default %llu)\n"
       "  --replica-ack-timeout-ms N\n"
@@ -1695,7 +1782,13 @@ int main(int argc, char** argv) {
     ReplicationOptions replication_options;
     replication_options.node_id = options.node_id;
     replication_options.self_address = address;
-    replication_options.metadata_address = options.metadata_addr;
+    replication_options.metadata_addresses = SplitEndpoints(options.metadata_addr);
+    if (replication_options.metadata_addresses.empty()) {
+      std::fprintf(stderr, "[%s] fatal: --metadata-addr listed no usable address\n",
+                   options.node_id.c_str());
+      pk_engine_destroy(engine);
+      return 1;
+    }
     replication_options.poll_interval_ms =
         static_cast<int64_t>(options.topology_poll_interval_ms);
     replication_options.ack_timeout_ms =
@@ -1760,7 +1853,7 @@ int main(int argc, char** argv) {
                 options.node_id.c_str(), options.data_dir.c_str());
   }
   if (replication) {
-    std::printf("[%s] replication: reading ownership from %s every %llu ms, "
+    std::printf("[%s] replication: reading ownership from [%s] every %llu ms, "
                 "ack timeout %llu ms, catch-up %s\n",
                 options.node_id.c_str(), options.metadata_addr.c_str(),
                 (unsigned long long)options.topology_poll_interval_ms,

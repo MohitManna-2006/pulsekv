@@ -7,10 +7,17 @@
 # override it per boot with run-local-cluster.sh --replication-factor, which is
 # how the same fixture is exercised at 0, 1, and 2 without three config files.
 
+# Three control-plane replicas: the Raft metadata group the leader-failover
+# chaos scenario kills a member of.
 control_plane:
-  host: 127.0.0.1
-  port: 7000
-  gossip_port: 7200
+  - {node_id: cp-0, host: 127.0.0.1, port: 7000}
+  - {node_id: cp-1, host: 127.0.0.1, port: 7001}
+  - {node_id: cp-2, host: 127.0.0.1, port: 7002}
+
+raft:
+  data_dir: run/raft
+  election_timeout_ms: 500
+  propose_interval_ms: 200
 
 membership:
   cluster_name: pulsekv-v2-chaos

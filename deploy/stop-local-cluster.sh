@@ -5,9 +5,11 @@
 #   deploy/stop-local-cluster.sh [--grace SECONDS] [--keep-logs|--clean-logs]
 #
 # Stops processes in dependency order: chaos watcher, membership sidecars
-# (which announce Leave), data nodes, and finally the control-plane gossip
-# observer. Each group receives SIGTERM concurrently, gets up to --grace
-# seconds to exit, then has a SIGKILL fallback.
+# (which announce Leave), data nodes, and finally every control-plane replica.
+# Each group receives SIGTERM concurrently, gets up to --grace seconds to exit,
+# then has a SIGKILL fallback. The control-plane group goes last for the same
+# reason it always did -- sidecars need somewhere to announce their Leave -- and
+# the existing bounded discipline generalises to N replicas with no new ordering.
 #
 # Finishes with an orphan sweep: any managed PulseKV process still alive that
 # is NOT in the pid file gets found and killed too,
@@ -93,10 +95,10 @@ select_group() {
             chaos:chaos) GROUP_INDICES+=("$i") ;;
             member:member:*) GROUP_INDICES+=("$i") ;;
             data:data:*|data:node-*) GROUP_INDICES+=("$i") ;;
-            control:controlplane) GROUP_INDICES+=("$i") ;;
+            control:controlplane|control:controlplane:*) GROUP_INDICES+=("$i") ;;
             other:*)
                 case "$label" in
-                    chaos|member:*|data:*|node-*|controlplane) ;;
+                    chaos|member:*|data:*|node-*|controlplane|controlplane:*) ;;
                     *) GROUP_INDICES+=("$i") ;;
                 esac
                 ;;

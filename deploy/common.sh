@@ -139,7 +139,7 @@ pk_pid_remove_if() {
 
 pk_expected_binary_for_label() {
     case "$1" in
-        controlplane) printf '%s\n' "$PULSEKV_CONTROLPLANE_BIN" ;;
+        controlplane|controlplane:*) printf '%s\n' "$PULSEKV_CONTROLPLANE_BIN" ;;
         data:*)       printf '%s\n' "$PULSEKV_NODE_BIN" ;;
         member:*)     printf '%s\n' "$PULSEKV_MEMBER_BIN" ;;
         chaos)        printf '%s\n' "$PULSEKV_CHAOS_BIN" ;;
@@ -169,7 +169,9 @@ pk_pid_matches_label() {
     esac
     cmd=" ${cmd} "
     case "$label" in
-        data:*|member:*)
+        data:*|member:*|controlplane:*)
+            # Every managed process carries --node-id, so a stale record for
+            # cp-1 cannot signal cp-2 (or node-1 match node-10).
             local node_id="${label#*:}"
             case "$cmd" in
                 *" --node-id ${node_id} "*|*" --node-id=${node_id} "*) ;;
@@ -186,6 +188,22 @@ pk_pid_matches_label() {
             ;;
     esac
     return 0
+}
+
+# pk_any_controlplane_alive -- true when at least one replica is running.
+#
+# "At least one" rather than "all": the metadata group tolerates losing a
+# replica, so requiring every one of them would make the lifecycle scripts
+# stricter than the system they manage -- and would refuse to work during
+# exactly the failover the chaos harness creates.
+pk_any_controlplane_alive() {
+    local id
+    while read -r id; do
+        [ -n "$id" ] || continue
+        pk_recorded_alive "controlplane:${id}" && return 0
+    done < <(pk_controlplane_ids)
+    # Pre-Phase-5 pid files used a bare `controlplane` label.
+    pk_recorded_alive controlplane
 }
 
 pk_recorded_alive() {
@@ -252,12 +270,57 @@ pk_join_host_port() {
     esac
 }
 
+# pk_controlplane_ids -- one control-plane replica ID per line, in config order.
+pk_controlplane_ids() {
+    pk_config_read --print-control-plane | cut -f1
+}
+
+# pk_controlplane_line ID -- `node_id<TAB>host<TAB>port` for one replica.
+pk_controlplane_line() {
+    local wanted="$1" table
+    table="$(pk_config_read --print-control-plane)" || return 1
+    awk -F '\t' -v wanted="$wanted" '
+        $1 == wanted { print; found = 1; exit }
+        END { if (!found) exit 1 }
+    ' <<< "$table"
+}
+
+# pk_controlplane_address [ID] -- one replica's gRPC address; the first replica
+# when no ID is given. Callers that can talk to any replica should prefer
+# pk_controlplane_endpoints, which does not care which one is up.
 pk_controlplane_address() {
-    local host port line
-    line="$(pk_config_read --print-control-plane)" || return 1
-    IFS=$'\t' read -r host port <<< "$line"
+    local wanted="${1:-}" id host port line
+    if [ -n "$wanted" ]; then
+        line="$(pk_controlplane_line "$wanted")" || return 1
+    else
+        line="$(pk_config_read --print-control-plane | head -1)" || return 1
+    fi
+    IFS=$'\t' read -r id host port <<< "$line"
     [ -n "$host" ] && [ -n "$port" ] || return 1
     pk_join_host_port "$host" "$port"
+}
+
+# pk_controlplane_endpoints -- every replica's address as one comma-separated
+# string. This is what clients, data nodes, and tools are given: Phase 5 made
+# the control plane a Raft group, so pinning anyone to a single replica would
+# make that replica a single point of failure the group does not have.
+pk_controlplane_endpoints() {
+    local id host port out="" table address
+    table="$(pk_config_read --print-control-plane)" || return 1
+    while IFS=$'\t' read -r id host port; do
+        [ -n "$id" ] || continue
+        address="$(pk_join_host_port "$host" "$port")"
+        if [ -n "$out" ]; then out="${out},${address}"; else out="$address"; fi
+    done <<< "$table"
+    [ -n "$out" ] || return 1
+    printf '%s\n' "$out"
+}
+
+# pk_raft_data_root_abs -- absolute path of raft.data_dir, resolved by the
+# control plane's own parser rather than re-derived in shell.
+pk_raft_data_root_abs() {
+    pk_config_read --print-raft | awk -F '\t' '$1 == "#" { print $2; found = 1 }
+        END { if (!found) exit 1 }'
 }
 
 pk_log_for_label() {
@@ -324,24 +387,35 @@ pk_replication_factor() {
     pk_config_read --print-replication
 }
 
+# pk_start_controlplane ID -- start one control-plane replica.
+#
+# Each replica is a separate managed process labelled `controlplane:<id>`, so
+# the chaos harness can kill exactly the current Raft leader and the PID-identity
+# guard can tell cp-0 from cp-1.
 pk_start_controlplane() {
-    local address log
-    address="$(pk_controlplane_address)" || return 1
-    log="$(pk_log_for_label controlplane)"
+    local node_id="$1" address log
+    address="$(pk_controlplane_address "$node_id")" || {
+        pk_err "unknown configured control-plane replica: $node_id"
+        return 1
+    }
+    log="$(pk_log_for_label "controlplane:${node_id}")"
     if [ -n "$PULSEKV_REPLICATION_FACTOR" ]; then
-        pk_start_managed controlplane "$address" "$log" \
+        pk_start_managed "controlplane:${node_id}" "$address" "$log" \
             "$PULSEKV_CONTROLPLANE_BIN" --config "$PULSEKV_CONFIG" \
+            --node-id "$node_id" \
             --replication-factor "$PULSEKV_REPLICATION_FACTOR"
     else
-        pk_start_managed controlplane "$address" "$log" \
-            "$PULSEKV_CONTROLPLANE_BIN" --config "$PULSEKV_CONFIG"
+        pk_start_managed "controlplane:${node_id}" "$address" "$log" \
+            "$PULSEKV_CONTROLPLANE_BIN" --config "$PULSEKV_CONFIG" \
+            --node-id "$node_id"
     fi
 }
 
-# Data nodes are handed --metadata-addr so they can read their own replica
-# peers. They are NOT handed a replication factor: placement is the control
-# plane's decision, and a node that carried its own copy of the number could
-# disagree with the map it is being sent.
+# Data nodes are handed the FULL control-plane endpoint list as --metadata-addr
+# so they can read their own replica peers from whichever replica is up. They
+# are NOT handed a replication factor: placement is the control plane's
+# decision, and a node carrying its own copy of the number could disagree with
+# the map it is being sent.
 pk_start_data_node() {
     local node_id="$1" line host port ram_budget max_value _root data_root address log engine_line cp_address
     line="$(pk_node_line "$node_id")" || {
@@ -353,7 +427,7 @@ pk_start_data_node() {
     IFS=$'\t' read -r ram_budget max_value _root <<< "$engine_line"
     [ -n "$ram_budget" ] && [ -n "$max_value" ] || return 1
     data_root="$(pk_data_root_abs)" || return 1
-    cp_address="$(pk_controlplane_address)" || return 1
+    cp_address="$(pk_controlplane_endpoints)" || return 1
     mkdir -p "${data_root}/${node_id}"
     address="$(pk_join_host_port "$host" "$port")"
     log="$(pk_log_for_label "data:${node_id}")"

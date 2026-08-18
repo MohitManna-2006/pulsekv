@@ -413,9 +413,28 @@ type GetShardMapResponse struct {
 	// Replicas per shard beyond the primary, as configured. The number actually
 	// present in shard_to_owners can be lower when the cluster has fewer live
 	// nodes than 1 + replication_factor.
+	//
+	// Phase 5 made this an agreed value: the metadata group's Raft leader
+	// proposes it and every replica applies the same one, so two control planes
+	// can no longer publish owner maps computed from different factors.
 	ReplicationFactor uint32 `protobuf:"varint,6,opt,name=replication_factor,json=replicationFactor,proto3" json:"replication_factor,omitempty"`
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	// Which control-plane replica this responder currently believes is the Raft
+	// leader, and the term it believes is current. Added in Phase 5.
+	//
+	// DIAGNOSTIC ONLY. Neither field is part of the topology fingerprint, and
+	// that omission is deliberate: correctness here means two replicas holding
+	// the same committed state give the same answer, and they must keep doing so
+	// even when one has not yet noticed an election. Folding the term into the
+	// identity would make a follower's perfectly valid response look like a
+	// different topology.
+	//
+	// An empty raft_leader_id means this replica currently sees no leader — an
+	// honest answer mid-election — or that it is running without a Raft group at
+	// all, which is how every pre-Phase-5 deployment reports.
+	RaftLeaderId  string `protobuf:"bytes,7,opt,name=raft_leader_id,json=raftLeaderId,proto3" json:"raft_leader_id,omitempty"`
+	RaftTerm      uint64 `protobuf:"varint,8,opt,name=raft_term,json=raftTerm,proto3" json:"raft_term,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *GetShardMapResponse) Reset() {
@@ -490,6 +509,20 @@ func (x *GetShardMapResponse) GetReplicationFactor() uint32 {
 	return 0
 }
 
+func (x *GetShardMapResponse) GetRaftLeaderId() string {
+	if x != nil {
+		return x.RaftLeaderId
+	}
+	return ""
+}
+
+func (x *GetShardMapResponse) GetRaftTerm() uint64 {
+	if x != nil {
+		return x.RaftTerm
+	}
+	return 0
+}
+
 var File_metadata_proto protoreflect.FileDescriptor
 
 const file_metadata_proto_rawDesc = "" +
@@ -511,7 +544,7 @@ const file_metadata_proto_rawDesc = "" +
 	"\x12GetShardMapRequest\"C\n" +
 	"\vShardOwners\x12\x18\n" +
 	"\aprimary\x18\x01 \x01(\tR\aprimary\x12\x1a\n" +
-	"\breplicas\x18\x02 \x03(\tR\breplicas\"\xba\x04\n" +
+	"\breplicas\x18\x02 \x03(\tR\breplicas\"\xfd\x04\n" +
 	"\x13GetShardMapResponse\x12d\n" +
 	"\x10shard_to_node_id\x18\x01 \x03(\v2;.pulsekv.metadata.v1.GetShardMapResponse.ShardToNodeIdEntryR\rshardToNodeId\x12/\n" +
 	"\x13topology_generation\x18\x02 \x01(\x04R\x12topologyGeneration\x121\n" +
@@ -519,7 +552,9 @@ const file_metadata_proto_rawDesc = "" +
 	"\vshard_count\x18\x04 \x01(\rR\n" +
 	"shardCount\x12c\n" +
 	"\x0fshard_to_owners\x18\x05 \x03(\v2;.pulsekv.metadata.v1.GetShardMapResponse.ShardToOwnersEntryR\rshardToOwners\x12-\n" +
-	"\x12replication_factor\x18\x06 \x01(\rR\x11replicationFactor\x1a@\n" +
+	"\x12replication_factor\x18\x06 \x01(\rR\x11replicationFactor\x12$\n" +
+	"\x0eraft_leader_id\x18\a \x01(\tR\fraftLeaderId\x12\x1b\n" +
+	"\traft_term\x18\b \x01(\x04R\braftTerm\x1a@\n" +
 	"\x12ShardToNodeIdEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\rR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1ab\n" +

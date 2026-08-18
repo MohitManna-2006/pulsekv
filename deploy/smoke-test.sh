@@ -67,8 +67,10 @@ if [ ! -x "$PULSEKV_SMOKE_BIN" ] && [ "$SKIP_BUILD" -eq 0 ]; then
 fi
 [ -x "$PULSEKV_SMOKE_BIN" ] || pk_die "$(pk_relpath "$PULSEKV_SMOKE_BIN") is missing"
 
-IFS=$'\t' read -r CP_HOST CP_PORT < <(pk_config_read --print-control-plane)
-CP_ADDRESS="${CP_HOST}:${CP_PORT}"
+# The Python and grpcurl legs each talk to one replica; any of them answers,
+# because a follower serves from its own applied Raft log. The Go leg gets the
+# whole list and does its own fallback.
+CP_ADDRESS="$(pk_controlplane_address)"
 
 IFS=$'\t' read -r FIRST_NODE_ID FIRST_NODE_HOST FIRST_NODE_PORT \
     < <(pk_config_read --print-nodes | head -1)

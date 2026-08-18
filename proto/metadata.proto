@@ -109,5 +109,25 @@ message GetShardMapResponse {
   // Replicas per shard beyond the primary, as configured. The number actually
   // present in shard_to_owners can be lower when the cluster has fewer live
   // nodes than 1 + replication_factor.
+  //
+  // Phase 5 made this an agreed value: the metadata group's Raft leader
+  // proposes it and every replica applies the same one, so two control planes
+  // can no longer publish owner maps computed from different factors.
   uint32 replication_factor = 6;
+
+  // Which control-plane replica this responder currently believes is the Raft
+  // leader, and the term it believes is current. Added in Phase 5.
+  //
+  // DIAGNOSTIC ONLY. Neither field is part of the topology fingerprint, and
+  // that omission is deliberate: correctness here means two replicas holding
+  // the same committed state give the same answer, and they must keep doing so
+  // even when one has not yet noticed an election. Folding the term into the
+  // identity would make a follower's perfectly valid response look like a
+  // different topology.
+  //
+  // An empty raft_leader_id means this replica currently sees no leader — an
+  // honest answer mid-election — or that it is running without a Raft group at
+  // all, which is how every pre-Phase-5 deployment reports.
+  string raft_leader_id = 7;
+  uint64 raft_term = 8;
 }

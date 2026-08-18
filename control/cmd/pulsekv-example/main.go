@@ -15,7 +15,8 @@ import (
 )
 
 func main() {
-	controlPlane := flag.String("control-plane", "127.0.0.1:7000", "ClusterMetadataService address")
+	controlPlane := flag.String("control-plane", "127.0.0.1:7000",
+		"comma-separated ClusterMetadataService addresses; the SDK falls back across them")
 	namespace := flag.String("namespace", "example-notes", "note key namespace")
 	timeout := flag.Duration("timeout", 10*time.Second, "deadline for the example")
 	flag.Parse()

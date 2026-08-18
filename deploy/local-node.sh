@@ -62,9 +62,20 @@ MEMBER_LABEL="member:${NODE_ID}"
 ALL_LIVE="$(pk_node_ids_csv)"
 WITHOUT_TARGET="$(pk_node_ids_csv "$NODE_ID")"
 
+# A quorum, not every replica. This runs during chaos runs that deliberately
+# have a control-plane replica down, and a node restart must not be blocked by
+# a failure the metadata group itself tolerates.
+control_plane_quorum() {
+    local count
+    count="$(pk_controlplane_ids | grep -c .)"
+    [ "$count" -gt 0 ] || { printf '1\n'; return; }
+    printf '%s\n' $(((count / 2) + 1))
+}
+
 wait_direct_health() {
     "$PULSEKV_SMOKE_BIN" --config "$PULSEKV_CONFIG" \
-        --mode=wait --timeout="${TIMEOUT}s" 2>&1 | sed 's/^/    /'
+        --mode=wait --min-control-plane="$(control_plane_quorum)" \
+        --timeout="${TIMEOUT}s" 2>&1 | sed 's/^/    /'
 }
 
 wait_topology() {
@@ -78,7 +89,7 @@ require_cluster_runtime() {
     [ -x "$PULSEKV_NODE_BIN" ] || pk_die "$(pk_relpath "$PULSEKV_NODE_BIN") is missing"
     [ -x "$PULSEKV_MEMBER_BIN" ] || pk_die "$(pk_relpath "$PULSEKV_MEMBER_BIN") is missing"
     [ -x "$PULSEKV_SMOKE_BIN" ] || pk_die "$(pk_relpath "$PULSEKV_SMOKE_BIN") is missing"
-    pk_recorded_alive controlplane || pk_die "the local control plane is not running"
+    pk_any_controlplane_alive || pk_die "no control-plane replica is running"
 }
 
 require_pair_alive() {
@@ -224,7 +235,9 @@ crash_pair() {
     pk_pid_remove_if "$DATA_LABEL" "$data_pid"
 
     wait_topology "$WITHOUT_TARGET" || {
-        pk_tail_process_log controlplane
+        for cp_id in $(pk_controlplane_ids); do
+            pk_tail_process_log "controlplane:${cp_id}"
+        done
         return 1
     }
     pk_ok "$NODE_ID crash detected and removed from shard ownership"

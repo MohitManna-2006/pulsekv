@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"maps"
 	"os"
 	"path/filepath"
@@ -355,6 +356,8 @@ func TestSettingsRequireDynamicVerifierInputs(t *testing.T) {
 		pollInterval: time.Millisecond, refreshInterval: time.Millisecond,
 		rpcTimeout: time.Second, workers: 1,
 		promotionKeys: 4, catchUpTimeout: time.Second,
+		scenario: scenarioDataNode, leaderReadyFile: "leader-ready", leaderTimeout: time.Second,
+		leaderPollTimeout: 100 * time.Millisecond,
 	}
 	if err := valid.validate(); err != nil {
 		t.Fatalf("valid settings: %v", err)
@@ -366,6 +369,28 @@ func TestSettingsRequireDynamicVerifierInputs(t *testing.T) {
 	disabled.promotionKeys = 0
 	if err := disabled.validate(); err != nil {
 		t.Fatalf("--promotion-keys=0 must be accepted: %v", err)
+	}
+
+	// Every scenario name must be accepted, and each selects the right halves.
+	for _, scenario := range []string{scenarioDataNode, scenarioLeader, scenarioBoth} {
+		cfg := valid
+		cfg.scenario = scenario
+		if err := cfg.validate(); err != nil {
+			t.Fatalf("--scenario=%s rejected: %v", scenario, err)
+		}
+	}
+	if !valid.runsDataNodeScenario() || valid.runsLeaderScenario() {
+		t.Fatal("the data-node scenario must run only the data-node half")
+	}
+	leaderOnly := valid
+	leaderOnly.scenario = scenarioLeader
+	if leaderOnly.runsDataNodeScenario() || !leaderOnly.runsLeaderScenario() {
+		t.Fatal("the leader scenario must run only the control-plane half")
+	}
+	both := valid
+	both.scenario = scenarioBoth
+	if !both.runsDataNodeScenario() || !both.runsLeaderScenario() {
+		t.Fatal("the both scenario must run both halves")
 	}
 
 	cases := []struct {
@@ -381,6 +406,17 @@ func TestSettingsRequireDynamicVerifierInputs(t *testing.T) {
 		{"zero workers", func(c *settings) { c.workers = 0 }},
 		{"negative promotion keys", func(c *settings) { c.promotionKeys = -1 }},
 		{"zero catch-up timeout", func(c *settings) { c.catchUpTimeout = 0 }},
+		{"unknown scenario", func(c *settings) { c.scenario = "everything" }},
+		{"zero leader timeout", func(c *settings) { c.leaderTimeout = 0 }},
+		{"zero leader poll timeout", func(c *settings) { c.leaderPollTimeout = 0 }},
+		{"leader progress file collides with the data one", func(c *settings) {
+			c.scenario = scenarioBoth
+			c.leaderReadyFile = c.readyFile
+		}},
+		{"leader progress file collides with the report", func(c *settings) {
+			c.scenario = scenarioBoth
+			c.leaderReadyFile = c.reportPath
+		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -390,5 +426,172 @@ func TestSettingsRequireDynamicVerifierInputs(t *testing.T) {
 				t.Fatal("invalid settings were accepted")
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5: replica agreement and leadership consensus
+// ---------------------------------------------------------------------------
+
+func observation(address string, snapshot clustertopology.Snapshot) replicaObservation {
+	return replicaObservation{address: address, snapshot: snapshot, reachable: true}
+}
+
+// withIdentity gives a snapshot the fingerprint a real publisher would compute,
+// so two snapshots describing the same cluster compare equal and two describing
+// different clusters do not.
+func withIdentity(snapshot clustertopology.Snapshot, generation uint64) clustertopology.Snapshot {
+	snapshot.Generation = generation
+	snapshot.Fingerprint = clustertopology.Fingerprint(snapshot.FingerprintInput())
+	return snapshot
+}
+
+// A follower lagging the leader is expected and safe: an applied Raft log is a
+// prefix of the committed one. Only replicas claiming the SAME committed state
+// have to describe the same cluster.
+func TestReplicaCoherenceAllowsLagButNotDisagreement(t *testing.T) {
+	older := withIdentity(testSnapshot(0, "node-a", "node-b"), 10)
+	newer := withIdentity(testSnapshot(0, "node-a", "node-b", "node-c"), 12)
+
+	if err := checkReplicaCoherence([]replicaObservation{
+		observation("cp-0", newer), observation("cp-1", older), observation("cp-2", newer),
+	}); err != nil {
+		t.Fatalf("a lagging follower was reported as a disagreement: %v", err)
+	}
+
+	// Same generation, different content: that is a split brain, and the whole
+	// point of exit criterion 3.
+	forged := withIdentity(testSnapshot(0, "node-a", "node-b", "node-c"), 10)
+	err := checkReplicaCoherence([]replicaObservation{
+		observation("cp-0", older), observation("cp-1", forged),
+	})
+	if err == nil || !strings.Contains(err.Error(), "split brain") {
+		t.Fatalf("error = %v, want a split-brain report", err)
+	}
+}
+
+func TestReplicaCoherenceRejectsUnassignedAndUnknownOwners(t *testing.T) {
+	base := withIdentity(testSnapshot(0, "node-a", "node-b"), 5)
+
+	missing := base
+	missing.ShardMap = maps.Clone(base.ShardMap)
+	delete(missing.ShardMap, 3)
+	if err := checkReplicaCoherence([]replicaObservation{observation("cp-0", missing)}); err == nil ||
+		!strings.Contains(err.Error(), "unassigned") {
+		t.Fatalf("error = %v, want an unassigned-shard report", err)
+	}
+
+	ghost := base
+	ghost.ShardMap = maps.Clone(base.ShardMap)
+	ghost.ShardMap[3] = "node-ghost"
+	if err := checkReplicaCoherence([]replicaObservation{observation("cp-0", ghost)}); err == nil ||
+		!strings.Contains(err.Error(), "not in its live set") {
+		t.Fatalf("error = %v, want an unknown-owner report", err)
+	}
+}
+
+// An unreachable replica is not a disagreement. During a leader kill exactly
+// one replica is expected to be unreachable, and treating that as a violation
+// would fail every run.
+func TestReplicaCoherenceIgnoresUnreachableReplicas(t *testing.T) {
+	live := withIdentity(testSnapshot(0, "node-a", "node-b"), 9)
+	if err := checkReplicaCoherence([]replicaObservation{
+		observation("cp-0", live),
+		{address: "cp-1", reachable: false, err: errors.New("connection refused")},
+	}); err != nil {
+		t.Fatalf("an unreachable replica was reported as a disagreement: %v", err)
+	}
+}
+
+func TestSummarizeLeaderRequiresUnanimityAmongTheReachable(t *testing.T) {
+	agreeing := func(leader string, term uint64) clustertopology.Snapshot {
+		snapshot := withIdentity(testSnapshot(0, "node-a"), 4)
+		snapshot.RaftLeaderID = leader
+		snapshot.RaftTerm = term
+		return snapshot
+	}
+
+	t.Run("unanimous", func(t *testing.T) {
+		result := summarizeLeader([]replicaObservation{
+			observation("cp-0", agreeing("cp-1", 4)),
+			observation("cp-1", agreeing("cp-1", 4)),
+			observation("cp-2", agreeing("cp-1", 4)),
+		})
+		if !result.agreed || result.leader != "cp-1" || result.term != 4 || result.reachable != 3 {
+			t.Fatalf("result = %+v, want unanimous cp-1 at term 4", result)
+		}
+	})
+
+	t.Run("different leaders", func(t *testing.T) {
+		result := summarizeLeader([]replicaObservation{
+			observation("cp-0", agreeing("cp-1", 4)),
+			observation("cp-1", agreeing("cp-2", 4)),
+		})
+		if result.agreed {
+			t.Fatal("two replicas naming different leaders were reported as agreeing")
+		}
+	})
+
+	t.Run("same leader different terms", func(t *testing.T) {
+		// Same name at different terms is still not agreement: it means one
+		// replica has not seen the newer election.
+		result := summarizeLeader([]replicaObservation{
+			observation("cp-0", agreeing("cp-1", 4)),
+			observation("cp-1", agreeing("cp-1", 5)),
+		})
+		if result.agreed {
+			t.Fatal("replicas at different terms were reported as agreeing")
+		}
+	})
+
+	t.Run("election in progress", func(t *testing.T) {
+		result := summarizeLeader([]replicaObservation{
+			observation("cp-0", agreeing("", 6)),
+			observation("cp-1", agreeing("cp-1", 6)),
+		})
+		if result.agreed {
+			t.Fatal("a replica seeing no leader was reported as agreement")
+		}
+		if !strings.Contains(result.reason, "sees no leader") {
+			t.Fatalf("reason = %q, want it to name the replica with no leader", result.reason)
+		}
+	})
+
+	t.Run("nobody answered", func(t *testing.T) {
+		result := summarizeLeader([]replicaObservation{
+			{address: "cp-0", reachable: false},
+		})
+		if result.agreed || !strings.Contains(result.reason, "no control-plane replica answered") {
+			t.Fatalf("result = %+v, want an unreachable-group report", result)
+		}
+	})
+
+	t.Run("unanimous among survivors", func(t *testing.T) {
+		// During a leader kill one replica is down; the survivors still have to
+		// agree, and that is what the harness waits for.
+		result := summarizeLeader([]replicaObservation{
+			{address: "cp-0", reachable: false},
+			observation("cp-1", agreeing("cp-2", 7)),
+			observation("cp-2", agreeing("cp-2", 7)),
+		})
+		if !result.agreed || result.leader != "cp-2" || result.reachable != 2 {
+			t.Fatalf("result = %+v, want two survivors agreeing on cp-2", result)
+		}
+	})
+}
+
+func TestSplitCommaListDropsBlanksAndDuplicates(t *testing.T) {
+	got := splitCommaList(" a:1 , b:2,, a:1 ,c:3 ")
+	want := []string{"a:1", "b:2", "c:3"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("got %v, want %v", got, want)
+		}
+	}
+	if len(splitCommaList("  ,, ")) != 0 {
+		t.Fatal("a list of blanks must produce no endpoints")
 	}
 }

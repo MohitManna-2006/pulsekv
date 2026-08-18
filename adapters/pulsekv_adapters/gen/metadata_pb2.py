@@ -24,7 +24,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0emetadata.proto\x12\x13pulsekv.metadata.v1\"\x14\n\x12HealthCheckRequest\"9\n\x13HealthCheckResponse\x12\n\n\x02ok\x18\x01 \x01(\x08\x12\x16\n\x0euptime_seconds\x18\x02 \x01(\x03\";\n\x08NodeInfo\x12\x0f\n\x07node_id\x18\x01 \x01(\t\x12\x0f\n\x07\x61\x64\x64ress\x18\x02 \x01(\t\x12\r\n\x05\x61live\x18\x03 \x01(\x08\"\x14\n\x12GetNodeListRequest\"~\n\x13GetNodeListResponse\x12,\n\x05nodes\x18\x01 \x03(\x0b\x32\x1d.pulsekv.metadata.v1.NodeInfo\x12\x1b\n\x13topology_generation\x18\x02 \x01(\x04\x12\x1c\n\x14topology_fingerprint\x18\x03 \x01(\x0c\"\x14\n\x12GetShardMapRequest\"0\n\x0bShardOwners\x12\x0f\n\x07primary\x18\x01 \x01(\t\x12\x10\n\x08replicas\x18\x02 \x03(\t\"\xbc\x03\n\x13GetShardMapResponse\x12U\n\x10shard_to_node_id\x18\x01 \x03(\x0b\x32;.pulsekv.metadata.v1.GetShardMapResponse.ShardToNodeIdEntry\x12\x1b\n\x13topology_generation\x18\x02 \x01(\x04\x12\x1c\n\x14topology_fingerprint\x18\x03 \x01(\x0c\x12\x13\n\x0bshard_count\x18\x04 \x01(\r\x12T\n\x0fshard_to_owners\x18\x05 \x03(\x0b\x32;.pulsekv.metadata.v1.GetShardMapResponse.ShardToOwnersEntry\x12\x1a\n\x12replication_factor\x18\x06 \x01(\r\x1a\x34\n\x12ShardToNodeIdEntry\x12\x0b\n\x03key\x18\x01 \x01(\r\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\x1aV\n\x12ShardToOwnersEntry\x12\x0b\n\x03key\x18\x01 \x01(\r\x12/\n\x05value\x18\x02 \x01(\x0b\x32 .pulsekv.metadata.v1.ShardOwners:\x02\x38\x01\x32\xbe\x02\n\x16\x43lusterMetadataService\x12`\n\x0bHealthCheck\x12\'.pulsekv.metadata.v1.HealthCheckRequest\x1a(.pulsekv.metadata.v1.HealthCheckResponse\x12`\n\x0bGetNodeList\x12\'.pulsekv.metadata.v1.GetNodeListRequest\x1a(.pulsekv.metadata.v1.GetNodeListResponse\x12`\n\x0bGetShardMap\x12\'.pulsekv.metadata.v1.GetShardMapRequest\x1a(.pulsekv.metadata.v1.GetShardMapResponseB,Z*pulsekv/control/gen/metadata/v1;metadatav1b\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0emetadata.proto\x12\x13pulsekv.metadata.v1\"\x14\n\x12HealthCheckRequest\"9\n\x13HealthCheckResponse\x12\n\n\x02ok\x18\x01 \x01(\x08\x12\x16\n\x0euptime_seconds\x18\x02 \x01(\x03\";\n\x08NodeInfo\x12\x0f\n\x07node_id\x18\x01 \x01(\t\x12\x0f\n\x07\x61\x64\x64ress\x18\x02 \x01(\t\x12\r\n\x05\x61live\x18\x03 \x01(\x08\"\x14\n\x12GetNodeListRequest\"~\n\x13GetNodeListResponse\x12,\n\x05nodes\x18\x01 \x03(\x0b\x32\x1d.pulsekv.metadata.v1.NodeInfo\x12\x1b\n\x13topology_generation\x18\x02 \x01(\x04\x12\x1c\n\x14topology_fingerprint\x18\x03 \x01(\x0c\"\x14\n\x12GetShardMapRequest\"0\n\x0bShardOwners\x12\x0f\n\x07primary\x18\x01 \x01(\t\x12\x10\n\x08replicas\x18\x02 \x03(\t\"\xe7\x03\n\x13GetShardMapResponse\x12U\n\x10shard_to_node_id\x18\x01 \x03(\x0b\x32;.pulsekv.metadata.v1.GetShardMapResponse.ShardToNodeIdEntry\x12\x1b\n\x13topology_generation\x18\x02 \x01(\x04\x12\x1c\n\x14topology_fingerprint\x18\x03 \x01(\x0c\x12\x13\n\x0bshard_count\x18\x04 \x01(\r\x12T\n\x0fshard_to_owners\x18\x05 \x03(\x0b\x32;.pulsekv.metadata.v1.GetShardMapResponse.ShardToOwnersEntry\x12\x1a\n\x12replication_factor\x18\x06 \x01(\r\x12\x16\n\x0eraft_leader_id\x18\x07 \x01(\t\x12\x11\n\traft_term\x18\x08 \x01(\x04\x1a\x34\n\x12ShardToNodeIdEntry\x12\x0b\n\x03key\x18\x01 \x01(\r\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\x1aV\n\x12ShardToOwnersEntry\x12\x0b\n\x03key\x18\x01 \x01(\r\x12/\n\x05value\x18\x02 \x01(\x0b\x32 .pulsekv.metadata.v1.ShardOwners:\x02\x38\x01\x32\xbe\x02\n\x16\x43lusterMetadataService\x12`\n\x0bHealthCheck\x12\'.pulsekv.metadata.v1.HealthCheckRequest\x1a(.pulsekv.metadata.v1.HealthCheckResponse\x12`\n\x0bGetNodeList\x12\'.pulsekv.metadata.v1.GetNodeListRequest\x1a(.pulsekv.metadata.v1.GetNodeListResponse\x12`\n\x0bGetShardMap\x12\'.pulsekv.metadata.v1.GetShardMapRequest\x1a(.pulsekv.metadata.v1.GetShardMapResponseB,Z*pulsekv/control/gen/metadata/v1;metadatav1b\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -51,11 +51,11 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_SHARDOWNERS']._serialized_start=353
   _globals['_SHARDOWNERS']._serialized_end=401
   _globals['_GETSHARDMAPRESPONSE']._serialized_start=404
-  _globals['_GETSHARDMAPRESPONSE']._serialized_end=848
-  _globals['_GETSHARDMAPRESPONSE_SHARDTONODEIDENTRY']._serialized_start=708
-  _globals['_GETSHARDMAPRESPONSE_SHARDTONODEIDENTRY']._serialized_end=760
-  _globals['_GETSHARDMAPRESPONSE_SHARDTOOWNERSENTRY']._serialized_start=762
-  _globals['_GETSHARDMAPRESPONSE_SHARDTOOWNERSENTRY']._serialized_end=848
-  _globals['_CLUSTERMETADATASERVICE']._serialized_start=851
-  _globals['_CLUSTERMETADATASERVICE']._serialized_end=1169
+  _globals['_GETSHARDMAPRESPONSE']._serialized_end=891
+  _globals['_GETSHARDMAPRESPONSE_SHARDTONODEIDENTRY']._serialized_start=751
+  _globals['_GETSHARDMAPRESPONSE_SHARDTONODEIDENTRY']._serialized_end=803
+  _globals['_GETSHARDMAPRESPONSE_SHARDTOOWNERSENTRY']._serialized_start=805
+  _globals['_GETSHARDMAPRESPONSE_SHARDTOOWNERSENTRY']._serialized_end=891
+  _globals['_CLUSTERMETADATASERVICE']._serialized_start=894
+  _globals['_CLUSTERMETADATASERVICE']._serialized_end=1212
 # @@protoc_insertion_point(module_scope)
