@@ -1,118 +1,186 @@
+# PulseKV Makefile — Ergonomic CLI for v2 Development & Testing
+#
+# Supports automatic container wrapping (Option A):
+# - When run on macOS/host, commands run seamlessly inside `pulsekv-v2-dev`.
+# - When run inside the container, commands execute natively.
+
+.DEFAULT_GOAL := help
+
+# ---------------------------------------------------------------------------
+# Environment Detection & Execution Wrapper
+# ---------------------------------------------------------------------------
+IN_CONTAINER := $(shell [ -f /.dockerenv ] && echo 1 || echo 0)
+DOCKER_IMAGE := pulsekv-v2-dev
+
+ifeq ($(IN_CONTAINER),1)
+  RUN_CMD  := bash -c
+  INTERACT := bash
+else
+  RUN_CMD  := docker run --rm -v "$(CURDIR):/src" -w /src $(DOCKER_IMAGE) bash -c
+  INTERACT := docker run --rm -it -v "$(CURDIR):/src" -w /src $(DOCKER_IMAGE) bash
+endif
+
+# ---------------------------------------------------------------------------
+# Terminal Colors & Help
+# ---------------------------------------------------------------------------
+CYAN  := \033[36m
+GREEN := \033[32m
+BOLD  := \033[1m
+RESET := \033[0m
+
+.PHONY: help
+help:
+	@printf "\n$(BOLD)PulseKV v2 Development CLI$(RESET)\n"
+	@printf "===============================================================\n"
+	@printf "$(CYAN)Cluster Management:$(RESET)\n"
+	@printf "  $(GREEN)make start$(RESET) / $(GREEN)make up$(RESET)       Boot 4-node cluster with 3-replica Raft control plane\n"
+	@printf "  $(GREEN)make stop$(RESET) / $(GREEN)make down$(RESET)      Stop all cluster processes and clean PIDs\n"
+	@printf "  $(GREEN)make restart$(RESET)             Gracefully restart the cluster\n"
+	@printf "  $(GREEN)make status$(RESET)              Show cluster leader and live service status\n"
+	@printf "\n$(CYAN)Testing & Verification:$(RESET)\n"
+	@printf "  $(GREEN)make test$(RESET)                Run complete test suite (smoke + engine + adapters)\n"
+	@printf "  $(GREEN)make test-adapter$(RESET)        Run Python Client SDK & SGLang HiCache tests\n"
+	@printf "  $(GREEN)make test-engine$(RESET)         Run pure-C storage engine tiering & stress tests\n"
+	@printf "  $(GREEN)make test-smoke$(RESET)          Run Go control plane + gRPC contract smoke test\n"
+	@printf "\n$(CYAN)Demos & Benchmarks:$(RESET)\n"
+	@printf "  $(GREEN)make demo$(RESET)                Run SGLang cross-replica prefix cache hit demo\n"
+	@printf "  $(GREEN)make bench$(RESET)               Run bulk transport and cluster benchmarks\n"
+	@printf "  $(GREEN)make chaos$(RESET)               Run node crash/restart fault injection chaos tests\n"
+	@printf "\n$(CYAN)Development Environment:$(RESET)\n"
+	@printf "  $(GREEN)make shell$(RESET)               Open an interactive bash shell in the dev container\n"
+	@printf "  $(GREEN)make dev-image$(RESET)           Build or update the pulsekv-v2-dev Docker image\n"
+	@printf "  $(GREEN)make clean$(RESET)               Clean build artifacts, run logs, and sockets\n"
+	@printf "===============================================================\n\n"
+
+# ---------------------------------------------------------------------------
+# Development Environment
+# ---------------------------------------------------------------------------
+.PHONY: dev-image image
+dev-image image:
+	docker build -t $(DOCKER_IMAGE) -f deploy/Dockerfile .
+
+.PHONY: shell
+shell:
+	$(INTERACT)
+
+# ---------------------------------------------------------------------------
+# Cluster Lifecycle
+# ---------------------------------------------------------------------------
+.PHONY: start up
+start up:
+	$(RUN_CMD) "deploy/run-local-cluster.sh"
+
+.PHONY: stop down
+stop down:
+	$(RUN_CMD) "deploy/stop-local-cluster.sh"
+
+.PHONY: restart
+restart:
+	$(RUN_CMD) "deploy/run-local-cluster.sh --restart"
+
+.PHONY: status
+status:
+	$(RUN_CMD) "deploy/build/bin/pulsekv-smoke --config deploy/cluster.config.yaml --mode=leader 2>/dev/null || true; grpcurl -plaintext 127.0.0.1:7000 list 2>/dev/null || echo 'Cluster is not running (start with make start)'"
+
+# ---------------------------------------------------------------------------
+# Testing
+# ---------------------------------------------------------------------------
+.PHONY: test
+test:
+	$(RUN_CMD) "\
+		deploy/run-local-cluster.sh && \
+		deploy/smoke-test.sh && \
+		deploy/test-engine.sh && \
+		PYTHONPATH=adapters python3 -m unittest discover -s adapters/tests && \
+		deploy/stop-local-cluster.sh \
+	"
+
+.PHONY: test-adapter
+test-adapter:
+	$(RUN_CMD) "\
+		deploy/run-local-cluster.sh && \
+		PYTHONPATH=adapters python3 -m unittest discover -s adapters/tests && \
+		deploy/stop-local-cluster.sh \
+	"
+
+.PHONY: test-engine
+test-engine:
+	$(RUN_CMD) "deploy/test-engine.sh"
+
+.PHONY: test-smoke
+test-smoke:
+	$(RUN_CMD) "\
+		deploy/run-local-cluster.sh && \
+		deploy/smoke-test.sh && \
+		deploy/stop-local-cluster.sh \
+	"
+
+# ---------------------------------------------------------------------------
+# Demos, Benchmarks & Chaos
+# ---------------------------------------------------------------------------
+.PHONY: demo demo-sglang
+demo demo-sglang:
+	$(RUN_CMD) "\
+		deploy/run-local-cluster.sh && \
+		deploy/demo-cross-replica-sglang.sh --trials 10 --prefix-tokens 512 && \
+		deploy/stop-local-cluster.sh \
+	"
+
+.PHONY: bench
+bench:
+	$(RUN_CMD) "\
+		deploy/run-local-cluster.sh && \
+		deploy/bench-bulk.sh && \
+		deploy/stop-local-cluster.sh \
+	"
+
+.PHONY: bench-bulk
+bench-bulk:
+	$(RUN_CMD) "deploy/bench-bulk.sh"
+
+.PHONY: chaos
+chaos:
+	$(RUN_CMD) "\
+		deploy/run-local-cluster.sh && \
+		deploy/chaos-test.sh --target node-1 --cycles 3 --seed 7 && \
+		deploy/stop-local-cluster.sh \
+	"
+
+# ---------------------------------------------------------------------------
+# Clean
+# ---------------------------------------------------------------------------
+.PHONY: clean
+clean:
+	$(RUN_CMD) "deploy/stop-local-cluster.sh 2>/dev/null || true; rm -rf deploy/run deploy/build build .pytest_cache"
+
+# ---------------------------------------------------------------------------
+# Legacy v1 Single-Node Targets (Preserved)
+# ---------------------------------------------------------------------------
 CC            ?= cc
 COMMON_CFLAGS := -Wall -Wextra -std=c11 -Iinclude
 CFLAGS        := $(COMMON_CFLAGS) -O2 -pthread
-LDFLAGS := -pthread
+LDFLAGS       := -pthread
 
-TSAN_CFLAGS  := $(COMMON_CFLAGS) -O1 -g -pthread -fsanitize=thread
-TSAN_LDFLAGS := $(LDFLAGS) -fsanitize=thread
+BUILD         := build
+PROTO         := src/protocol.c
+TABLE         := src/hashtable.c
+WAL           := src/wal.c
+HDRS          := include/protocol.h include/hashtable.h include/wal.h
 
-BUILD      := build
-TSAN_BUILD := $(BUILD)/tsan
+SERVER        := $(BUILD)/pulsekv
+SERVER_LT     := $(BUILD)/pulsekv_lt
 
-# Modules shared by the server and the tests that exercise them directly.
-PROTO  := src/protocol.c
-TABLE  := src/hashtable.c
-WAL    := src/wal.c
-HDRS   := include/protocol.h include/hashtable.h include/wal.h
-
-SERVER      := $(BUILD)/pulsekv
-SERVER_LT   := $(BUILD)/pulsekv_lt
-TEST_CLIENT := $(BUILD)/test_client
-TEST_MULTI  := $(BUILD)/test_multi_client
-TEST_TABLE  := $(BUILD)/test_hashtable
-TEST_STRESS := $(BUILD)/test_thread_stress
-TEST_WAL    := $(BUILD)/test_wal
-TEST_WAL_SERVER := $(BUILD)/test_wal_server
-TEST_RECOVERY := $(BUILD)/test_recovery
-BENCHMARK := $(BUILD)/benchmark
-
-TSAN_SERVER      := $(TSAN_BUILD)/pulsekv
-TSAN_TEST_MULTI  := $(TSAN_BUILD)/test_multi_client
-TSAN_TEST_TABLE  := $(TSAN_BUILD)/test_hashtable
-TSAN_TEST_STRESS := $(TSAN_BUILD)/test_thread_stress
-TSAN_TEST_WAL    := $(TSAN_BUILD)/test_wal
-TSAN_TEST_WAL_SERVER := $(TSAN_BUILD)/test_wal_server
-TSAN_TEST_RECOVERY := $(TSAN_BUILD)/test_recovery
-TSAN_BENCHMARK := $(TSAN_BUILD)/benchmark
-
-.PHONY: all clean tsan bench bench-lt
-
-all: $(SERVER) $(SERVER_LT) $(TEST_CLIENT) $(TEST_MULTI) $(TEST_TABLE) \
-	$(TEST_STRESS) $(TEST_WAL) $(TEST_WAL_SERVER) $(TEST_RECOVERY) \
-	$(BENCHMARK)
-
-tsan: $(TSAN_SERVER) $(TSAN_TEST_MULTI) $(TSAN_TEST_TABLE) \
-	$(TSAN_TEST_STRESS) $(TSAN_TEST_WAL) $(TSAN_TEST_WAL_SERVER) \
-	$(TSAN_TEST_RECOVERY) $(TSAN_BENCHMARK)
-
-bench: all
-	tests/run_benchmarks.sh $(SERVER)
-
-bench-lt: all
-	tests/run_benchmarks.sh $(SERVER_LT)
+.PHONY: v1-all v1-bench
+v1-all: $(SERVER) $(SERVER_LT)
 
 $(SERVER): src/main.c $(PROTO) $(TABLE) $(WAL) $(HDRS) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ src/main.c $(PROTO) $(TABLE) $(WAL) $(LDFLAGS)
 
-# Level-triggered build of the same source. Step 2 is a progression from LT to
-# ET, so keep both buildable and run the concurrency test against each.
 $(SERVER_LT): src/main.c $(PROTO) $(TABLE) $(WAL) $(HDRS) | $(BUILD)
 	$(CC) $(CFLAGS) -DPULSEKV_LEVEL_TRIGGERED -o $@ src/main.c $(PROTO) $(TABLE) $(WAL) $(LDFLAGS)
-
-$(TEST_CLIENT): tests/test_client.c $(PROTO) $(HDRS) | $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/test_client.c $(PROTO) $(LDFLAGS)
-
-$(TEST_MULTI): tests/test_multi_client.c $(PROTO) $(HDRS) | $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/test_multi_client.c $(PROTO) $(LDFLAGS)
-
-# Talks to the store directly, with no network in the picture.
-$(TEST_TABLE): tests/test_hashtable.c $(TABLE) $(HDRS) | $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/test_hashtable.c $(TABLE) $(LDFLAGS)
-
-$(TEST_STRESS): tests/test_thread_stress.c $(PROTO) $(HDRS) | $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/test_thread_stress.c $(PROTO) $(LDFLAGS)
-
-$(TEST_WAL): tests/test_wal.c $(WAL) $(HDRS) | $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/test_wal.c $(WAL) $(LDFLAGS)
-
-$(TEST_WAL_SERVER): tests/test_wal_server.c $(PROTO) $(WAL) $(HDRS) | $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/test_wal_server.c $(PROTO) $(WAL) $(LDFLAGS)
-
-$(TEST_RECOVERY): tests/test_recovery.c $(TABLE) $(WAL) $(HDRS) | $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/test_recovery.c $(TABLE) $(WAL) $(LDFLAGS)
-
-$(BENCHMARK): tests/benchmark.c $(PROTO) $(HDRS) | $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/benchmark.c $(PROTO) $(LDFLAGS)
-
-$(TSAN_SERVER): src/main.c $(PROTO) $(TABLE) $(WAL) $(HDRS) | $(TSAN_BUILD)
-	$(CC) $(TSAN_CFLAGS) -o $@ src/main.c $(PROTO) $(TABLE) $(WAL) $(TSAN_LDFLAGS)
-
-$(TSAN_TEST_MULTI): tests/test_multi_client.c $(PROTO) $(HDRS) | $(TSAN_BUILD)
-	$(CC) $(TSAN_CFLAGS) -o $@ tests/test_multi_client.c $(PROTO) $(TSAN_LDFLAGS)
-
-$(TSAN_TEST_TABLE): tests/test_hashtable.c $(TABLE) $(HDRS) | $(TSAN_BUILD)
-	$(CC) $(TSAN_CFLAGS) -o $@ tests/test_hashtable.c $(TABLE) $(TSAN_LDFLAGS)
-
-$(TSAN_TEST_STRESS): tests/test_thread_stress.c $(PROTO) $(HDRS) | $(TSAN_BUILD)
-	$(CC) $(TSAN_CFLAGS) -o $@ tests/test_thread_stress.c $(PROTO) $(TSAN_LDFLAGS)
-
-$(TSAN_TEST_WAL): tests/test_wal.c $(WAL) $(HDRS) | $(TSAN_BUILD)
-	$(CC) $(TSAN_CFLAGS) -o $@ tests/test_wal.c $(WAL) $(TSAN_LDFLAGS)
-
-$(TSAN_TEST_WAL_SERVER): tests/test_wal_server.c $(PROTO) $(WAL) $(HDRS) | $(TSAN_BUILD)
-	$(CC) $(TSAN_CFLAGS) -o $@ tests/test_wal_server.c $(PROTO) $(WAL) $(TSAN_LDFLAGS)
-
-$(TSAN_TEST_RECOVERY): tests/test_recovery.c $(TABLE) $(WAL) $(HDRS) | $(TSAN_BUILD)
-	$(CC) $(TSAN_CFLAGS) -o $@ tests/test_recovery.c $(TABLE) $(WAL) $(TSAN_LDFLAGS)
-
-$(TSAN_BENCHMARK): tests/benchmark.c $(PROTO) $(HDRS) | $(TSAN_BUILD)
-	$(CC) $(TSAN_CFLAGS) -o $@ tests/benchmark.c $(PROTO) $(TSAN_LDFLAGS)
 
 $(BUILD):
 	mkdir -p $@
 
-$(TSAN_BUILD):
-	mkdir -p $@
-
-clean:
-	rm -rf $(BUILD)
+v1-bench: v1-all
+	tests/run_benchmarks.sh $(SERVER)

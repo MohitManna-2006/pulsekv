@@ -1,8 +1,25 @@
 # PulseKV
 
-Concurrent, sharded, epoll-based key-value store in C — single-node, Linux-native, zero external dependencies.
+Distributed, tiered KV cache store for LLM serving engines with SGLang HiCache integration and single-node C storage core.
 
-> **Status: all 8 build steps complete** — thread-per-core epoll, sharded storage, asynchronous checksummed WAL, crash recovery, and a correctness-checking 500-client benchmark with measured optimization.
+> **PulseKV v2 Status: Phase 7 (MVP Complete)** — 3-replica Raft control plane in Go, C++ data nodes with RAM/NVMe tiering & bulk transport, and SGLang HiCache Python adapter with verified 100% cross-replica prefix cache hits.
+
+---
+
+## Quickstart (PulseKV v2 Commands)
+
+Type `make` or any of the following commands directly from your terminal (Docker container is auto-detected and wrapped automatically on macOS):
+
+| Command | Action |
+| :--- | :--- |
+| **`make test`** | Run full test suite (smoke test + engine tests + Python adapter tests) |
+| **`make test-adapter`** | Run Python client and SGLang HiCache adapter tests |
+| **`make demo`** | Run SGLang cross-replica prefix cache hit demo (10 trials @ 512 tokens) |
+| **`make start`** / **`make up`** | Boot 4-node local cluster with 3-replica Raft control plane |
+| **`make stop`** / **`make down`** | Stop all cluster processes cleanly |
+| **`make status`** | Show cluster leader and service status |
+| **`make shell`** | Open interactive bash shell inside dev container |
+| **`make help`** | Show all available commands |
 
 ---
 
