@@ -74,14 +74,13 @@ control_plane_quorum() {
 
 wait_direct_health() {
     "$PULSEKV_SMOKE_BIN" --config "$PULSEKV_CONFIG" \
-        --mode=wait --min-control-plane="$(control_plane_quorum)" \
+        --mode=wait --node="$NODE_ID" --min-control-plane="$(control_plane_quorum)" \
         --timeout="${TIMEOUT}s" 2>&1 | sed 's/^/    /'
 }
 
 wait_topology() {
-    local expected="$1"
     "$PULSEKV_SMOKE_BIN" --config "$PULSEKV_CONFIG" \
-        --mode=topology-wait --expect-live="$expected" \
+        --mode=topology-wait --expect-present="$NODE_ID" \
         --timeout="${TIMEOUT}s" 2>&1 | sed 's/^/    /'
 }
 

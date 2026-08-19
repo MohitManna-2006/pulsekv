@@ -234,6 +234,8 @@ if [ "$ENABLE_CHAOS" -eq 1 ]; then
     (
         cycle=0
         num_nodes="${#NODE_IDS[@]}"
+        # Initial grace period: allow benchmark populate and warmup phases to complete before injecting faults.
+        sleep 30
         while true; do
             sleep "$CHAOS_SLEEP_SEC"
             cycle=$((cycle + 1))

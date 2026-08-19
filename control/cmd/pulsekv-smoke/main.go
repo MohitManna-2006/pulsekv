@@ -80,8 +80,12 @@ func main() {
 			"delay between polls in --mode=wait")
 		expectLive = flag.String("expect-live", "",
 			"comma-separated exact live node IDs for --mode=topology-wait (default: all configured nodes)")
+		expectPresent = flag.String("expect-present", "",
+			"comma-separated node IDs that must be present in --mode=topology-wait (does not constrain other nodes)")
 		expectAbsent = flag.String("expect-absent", "",
 			"comma-separated node IDs that must be absent in --mode=topology-wait")
+		targetNode = flag.String("node", "",
+			"for --mode=wait: limit data-node health checks to this specific node ID (empty = all configured nodes)")
 		minGeneration = flag.Uint64("min-generation", 0,
 			"minimum topology generation for --mode=topology-wait")
 		leaderChangedFrom = flag.String("expect-leader-change-from", "",
@@ -103,7 +107,7 @@ func main() {
 
 	switch *mode {
 	case "wait":
-		os.Exit(runWait(cfg, *minControlPlane, *timeout, *rpcTimeout, *pollInterval))
+		os.Exit(runWait(cfg, *targetNode, *minControlPlane, *timeout, *rpcTimeout, *pollInterval))
 	case "smoke":
 		os.Exit(runSmoke(cfg, *rpcTimeout))
 	case "leader":
@@ -112,9 +116,17 @@ func main() {
 		os.Exit(runLeaderWait(cfg, *leaderChangedFrom, *minReplicas,
 			*timeout, *rpcTimeout, *pollInterval))
 	case "topology-wait":
-		live, err := expectedNodeIDs(cfg, *expectLive)
+		var live []string
+		if *expectLive != "" || *expectPresent == "" {
+			live, err = expectedNodeIDs(cfg, *expectLive)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "pulsekv-smoke: %v\n", err)
+				os.Exit(2)
+			}
+		}
+		present, err := parseNodeIDs(*expectPresent)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "pulsekv-smoke: %v\n", err)
+			fmt.Fprintf(os.Stderr, "pulsekv-smoke: --expect-present: %v\n", err)
 			os.Exit(2)
 		}
 		absent, err := parseNodeIDs(*expectAbsent)
@@ -122,7 +134,7 @@ func main() {
 			fmt.Fprintf(os.Stderr, "pulsekv-smoke: --expect-absent: %v\n", err)
 			os.Exit(2)
 		}
-		os.Exit(runTopologyWait(cfg, live, absent, *minGeneration,
+		os.Exit(runTopologyWait(cfg, live, present, absent, *minGeneration,
 			*timeout, *rpcTimeout, *pollInterval))
 	default:
 		fmt.Fprintf(os.Stderr,
@@ -142,13 +154,15 @@ type process struct {
 	isNode  bool
 }
 
-func processes(cfg *config.Config) []process {
+func processes(cfg *config.Config, targetNode string) []process {
 	ps := make([]process, 0, len(cfg.ControlPlanes)+len(cfg.Nodes))
 	for _, replica := range cfg.ControlPlanes {
 		ps = append(ps, process{label: "controlplane:" + replica.NodeID, address: replica.Address()})
 	}
 	for _, n := range cfg.Nodes {
-		ps = append(ps, process{label: n.NodeID, address: n.Address(), isNode: true})
+		if targetNode == "" || n.NodeID == targetNode {
+			ps = append(ps, process{label: n.NodeID, address: n.Address(), isNode: true})
+		}
 	}
 	return ps
 }
@@ -162,8 +176,8 @@ func processes(cfg *config.Config) []process {
 // legitimately runs while a replica is down, and demanding all of them would
 // make the lifecycle scripts refuse to work during exactly the failover the
 // chaos harness creates.
-func runWait(cfg *config.Config, minControlPlane int, budget, rpcTimeout, interval time.Duration) int {
-	ps := processes(cfg)
+func runWait(cfg *config.Config, targetNode string, minControlPlane int, budget, rpcTimeout, interval time.Duration) int {
+	ps := processes(cfg, targetNode)
 	replicas := len(cfg.ControlPlanes)
 	required := minControlPlane
 	if required <= 0 || required > replicas {
@@ -171,9 +185,14 @@ func runWait(cfg *config.Config, minControlPlane int, budget, rpcTimeout, interv
 	}
 	deadline := time.Now().Add(budget)
 
+	expectedDataNodes := len(cfg.Nodes)
+	if targetNode != "" {
+		expectedDataNodes = 1
+	}
+
 	if required < replicas {
 		fmt.Printf("waiting up to %s for %d data service(s) and %d of %d control-plane replica(s)...\n",
-			budget, len(cfg.Nodes), required, replicas)
+			budget, expectedDataNodes, required, replicas)
 	} else {
 		fmt.Printf("waiting up to %s for %d service(s) to report healthy...\n", budget, len(ps))
 	}
@@ -197,7 +216,7 @@ func runWait(cfg *config.Config, minControlPlane int, budget, rpcTimeout, interv
 		}
 		if dataFailures == 0 && healthyReplicas >= required {
 			fmt.Printf("all %d data service(s) and %d of %d control-plane replica(s) healthy after %d poll(s)\n",
-				len(cfg.Nodes), healthyReplicas, replicas, attempt)
+				expectedDataNodes, healthyReplicas, replicas, attempt)
 			return 0
 		}
 		if time.Now().After(deadline) {
@@ -223,17 +242,21 @@ func runWait(cfg *config.Config, minControlPlane int, budget, rpcTimeout, interv
 // topology-wait mode
 // ---------------------------------------------------------------------------
 
-func runTopologyWait(cfg *config.Config, expected, absent []string, minGeneration uint64,
+func runTopologyWait(cfg *config.Config, expected, present, absent []string, minGeneration uint64,
 	budget, rpcTimeout, interval time.Duration) int {
 
 	deadline := time.Now().Add(budget)
 	var lastErr error
 	for attempt := 1; ; attempt++ {
 		lastErr = probeTopology(cfg.ControlPlaneAddresses(), cfg.ShardCount,
-			expected, absent, minGeneration, rpcTimeout)
+			expected, present, absent, minGeneration, rpcTimeout)
 		if lastErr == nil {
-			fmt.Printf("topology converged after %d poll(s): generation >= %d, live=[%s]\n",
-				attempt, minGeneration, strings.Join(expected, ","))
+			targetSummary := strings.Join(expected, ",")
+			if len(present) > 0 {
+				targetSummary = fmt.Sprintf("present=[%s]", strings.Join(present, ","))
+			}
+			fmt.Printf("topology converged after %d poll(s): generation >= %d, live=%s\n",
+				attempt, minGeneration, targetSummary)
 			return 0
 		}
 		if time.Now().After(deadline) {
@@ -252,7 +275,7 @@ func runTopologyWait(cfg *config.Config, expected, absent []string, minGeneratio
 // heartbeat behind, so this poll simply retries until whichever replica it
 // reached has caught up -- it never sees a contradictory answer, only an
 // earlier one.
-func probeTopology(controlPlanes []string, shardCount uint32, expected, absent []string, minGeneration uint64,
+func probeTopology(controlPlanes []string, shardCount uint32, expected, present, absent []string, minGeneration uint64,
 	rpcTimeout time.Duration) error {
 
 	snapshot, _, err := fetchFromAnyReplica(controlPlanes, rpcTimeout)
@@ -264,6 +287,21 @@ func probeTopology(controlPlanes []string, shardCount uint32, expected, absent [
 	}
 	if snapshot.ShardCount != shardCount {
 		return fmt.Errorf("shard count=%d, want configured %d", snapshot.ShardCount, shardCount)
+	}
+
+	if len(present) > 0 {
+		for _, id := range present {
+			if _, ok := snapshot.Nodes[id]; !ok {
+				return fmt.Errorf("required node %q is absent in live topology (live=%v)",
+					id, sortedNodeIDs(snapshot.Nodes))
+			}
+		}
+		for _, id := range absent {
+			if _, ok := snapshot.Nodes[id]; ok {
+				return fmt.Errorf("node %q is still present (live=%v)", id, sortedNodeIDs(snapshot.Nodes))
+			}
+		}
+		return nil
 	}
 
 	want := make(map[string]bool, len(expected))
