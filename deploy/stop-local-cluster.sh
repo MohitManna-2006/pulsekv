@@ -43,9 +43,6 @@ esac
 GRACE=$((10#$GRACE))
 
 # Escape a literal string for use as a pgrep -f extended regex.
-pk_regex_escape() {
-    printf '%s' "$1" | sed 's/[][\.^$*+?(){}|\\]/\\&/g'
-}
 
 find_orphans() {
     {

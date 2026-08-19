@@ -128,6 +128,31 @@ done
 [ -f "$PULSEKV_CONFIG" ] || pk_die "config not found: $PULSEKV_CONFIG"
 mkdir -p "$(dirname -- "$REPORT")" "$(dirname -- "$METRICS_OUTPUT")" "${PULSEKV_LOG_DIR}"
 
+# One soak per run directory. Before this guard, starting a second soak while
+# one was running produced two chaos injectors crashing data nodes on
+# independent schedules against one cluster; on 2026-08-19 three of them
+# together took every data node down at once and the cluster never recovered.
+pk_singleton_acquire soak || exit 1
+
+# A previous run that was killed outright (SIGKILL, a closed terminal, a
+# torn-down container) never got to run its cleanup, so sweep before starting
+# rather than inheriting its injector.
+if command -v pgrep >/dev/null 2>&1; then
+    # Match the injector's full path, and confirm each hit is really running it
+    # rather than merely mentioning it -- a wrapper shell whose command line
+    # contains the string would otherwise look like an injector.
+    while read -r stray; do
+        [ -n "$stray" ] || continue
+        [ "$stray" = "$$" ] && continue
+        case "$(pk_process_cmdline "$stray" 2>/dev/null || true)" in
+            *"$PULSEKV_DEPLOY_DIR/soak-chaos-injector.sh"*" --parent "*) ;;
+            *) continue ;;
+        esac
+        pk_warn "found an orphaned chaos injector from an earlier run (pid $stray); stopping it"
+        pk_kill_tree "$stray" TERM
+    done < <(pgrep -f -- "$(pk_regex_escape "$PULSEKV_DEPLOY_DIR/soak-chaos-injector.sh")" 2>/dev/null || true)
+fi
+
 METRICS_PID=""
 CHAOS_PID=""
 STARTED_CLUSTER=0
@@ -138,9 +163,16 @@ cleanup() {
 
     if [ -n "$CHAOS_PID" ] && pk_pid_alive "$CHAOS_PID"; then
         pk_dim "Stopping background chaos injector (pid $CHAOS_PID)"
-        kill "$CHAOS_PID" 2>/dev/null || true
+        # The whole tree, not just the subshell: see pk_kill_tree. An injector
+        # that outlives this script keeps crashing data nodes in whatever run
+        # comes next, and the next run has no idea it is there.
+        pk_kill_tree "$CHAOS_PID" TERM
         wait "$CHAOS_PID" 2>/dev/null || true
+        if pk_pid_alive "$CHAOS_PID"; then
+            pk_kill_tree "$CHAOS_PID" KILL
+        fi
     fi
+    pk_singleton_release soak
 
     if [ -n "$METRICS_PID" ] && pk_pid_alive "$METRICS_PID"; then
         pk_dim "Stopping metrics exporter (pid $METRICS_PID)"
@@ -231,50 +263,14 @@ if [ "$ENABLE_CHAOS" -eq 1 ]; then
     fi
     [ "$CHAOS_SLEEP_SEC" -gt 0 ] || CHAOS_SLEEP_SEC=45
 
-    (
-        cycle=0
-        num_nodes="${#NODE_IDS[@]}"
-        # Initial grace period: allow benchmark populate and warmup phases to complete before injecting faults.
-        sleep 30
-        while true; do
-            sleep "$CHAOS_SLEEP_SEC"
-            cycle=$((cycle + 1))
-            target_node="${NODE_IDS[$(( (cycle - 1) % num_nodes ))]}"
-
-            printf '[%s] [chaos-cycle %d] Crashing target data node: %s\n' \
-                "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$cycle" "$target_node" >> "$CHAOS_LOG"
-
-            # 1. Crash data node.
-            "$PULSEKV_DEPLOY_DIR/local-node.sh" --config "$PULSEKV_CONFIG" --timeout 15 \
-                crash "$target_node" >> "$CHAOS_LOG" 2>&1 || true
-
-            # Hold node down for 5-8s so SWIM failure detection and shard reassignment fire.
-            sleep 6
-
-            printf '[%s] [chaos-cycle %d] Restarting target data node: %s\n' \
-                "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$cycle" "$target_node" >> "$CHAOS_LOG"
-
-            # 2. Restart data node.
-            "$PULSEKV_DEPLOY_DIR/local-node.sh" --config "$PULSEKV_CONFIG" --timeout 20 \
-                start "$target_node" >> "$CHAOS_LOG" 2>&1 || true
-
-            # 3. Every 4 cycles, step down Raft leader if 3+ control plane replicas exist.
-            if [ $((cycle % 4)) -eq 0 ]; then
-                cp_count="$(pk_controlplane_ids | grep -c . || echo 0)"
-                if [ "$cp_count" -ge 3 ]; then
-                    leader_id="$("$PULSEKV_SMOKE_BIN" --config "$PULSEKV_CONFIG" --mode=leader 2>/dev/null | grep -o 'cp-[0-9]' || true)"
-                    if [ -n "$leader_id" ]; then
-                        printf '[%s] [chaos-cycle %d] Cycling Raft leader: %s\n' \
-                            "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$cycle" "$leader_id" >> "$CHAOS_LOG"
-                        pk_stop_managed "controlplane:${leader_id}" 2 >> "$CHAOS_LOG" 2>&1 || true
-                        sleep 4
-                        pk_start_controlplane "$leader_id" >> "$CHAOS_LOG" 2>&1 || true
-                        "$PULSEKV_SMOKE_BIN" --config "$PULSEKV_CONFIG" --mode=wait --min-control-plane=3 >> "$CHAOS_LOG" 2>&1 || true
-                    fi
-                fi
-            fi
-        done
-    ) &
+    # A named script rather than an inline subshell, so an injector that
+    # outlives its parent can be found and stopped. It also watches $$ and
+    # exits on its own if this script dies without running cleanup.
+    "$PULSEKV_DEPLOY_DIR/soak-chaos-injector.sh" \
+        --config "$PULSEKV_CONFIG" \
+        --interval "$CHAOS_SLEEP_SEC" \
+        --log "$CHAOS_LOG" \
+        --parent "$$" &
     CHAOS_PID="$!"
     pk_ok "Chaos injector active (pid $CHAOS_PID, logs at $(pk_relpath "$CHAOS_LOG"))"
 else
@@ -317,3 +313,48 @@ if [ -f "$REPORT" ]; then
 else
     pk_warn "Report file not found at $(pk_relpath "$REPORT")"
 fi
+
+# ---------------------------------------------------------------------------
+# 6. Judge the run, and record how it was faulted.
+#
+# `--continue-on-error=true` means the load generator survives anything, so
+# "the benchmark finished" says nothing about whether the cluster served a
+# single request. On 2026-08-19 that gap let a run whose cluster was dead
+# report success. The verdict below closes it: a run with intervals that
+# attempted operations and verified nothing is degraded, and the script exits
+# non-zero.
+#
+# It also stamps the fault-injection configuration into the report, because the
+# old report recorded none -- which is why a claim of "crash/restart every 15s"
+# in the progress report could not be checked against the artifact it cited.
+# ---------------------------------------------------------------------------
+SOAK_VERDICT_RC=0
+if [ -f "$REPORT" ] && command -v python3 >/dev/null 2>&1; then
+    pk_step "Evaluating soak verdict"
+    VERDICT_ARGS=(--chaos-enabled "$ENABLE_CHAOS")
+    if [ "$ENABLE_CHAOS" -eq 1 ]; then
+        VERDICT_ARGS+=(--chaos-interval "$CHAOS_SLEEP_SEC" --chaos-log "$CHAOS_LOG")
+    fi
+    python3 "$PULSEKV_DEPLOY_DIR/soak-verdict.py" "$REPORT" "${VERDICT_ARGS[@]}" || SOAK_VERDICT_RC=$?
+    if [ "$SOAK_VERDICT_RC" -ne 0 ]; then
+        pk_err "Soak run is DEGRADED; see the verdict block in $(pk_relpath "$REPORT")"
+    fi
+elif [ -f "$REPORT" ]; then
+    pk_warn "python3 not available; skipping the soak verdict (report left unjudged)"
+fi
+
+# Keep a timestamped copy beside the canonical one.
+#
+# `--report` defaults to a fixed path, so every run silently replaced the last
+# one's evidence. That is why the run behind this project's own Phase 9.4
+# figures could not be found afterwards: seven soaks ran that evening and only
+# the last report survived. One `cp` makes that unrecoverable situation
+# recoverable.
+if [ -f "$REPORT" ]; then
+    REPORT_ARCHIVE="${REPORT%.json}-$(date -u +%Y%m%dT%H%M%SZ).json"
+    if cp -- "$REPORT" "$REPORT_ARCHIVE" 2>/dev/null; then
+        pk_ok "Archived copy: $(pk_relpath "$REPORT_ARCHIVE")"
+    fi
+fi
+
+exit "$SOAK_VERDICT_RC"

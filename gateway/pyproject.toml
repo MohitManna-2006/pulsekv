@@ -1,0 +1,59 @@
+[build-system]
+requires = ["setuptools>=77.0.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pulsekv-gateway"
+version = "0.0.1"
+description = "PulseKV Context Gateway — semantic context canonicalization (Phase 10)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "Mohit Manna" }]
+keywords = ["llm", "kv-cache", "prompt", "canonicalization", "gateway", "inference"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Distributed Computing",
+]
+
+# Phase 10.0 declares exactly one runtime dependency, and the hard scope
+# boundary in this phase's prompt is the reason: no embedding runtime, no
+# vector index, no web framework, no database driver. Each of those is a real
+# decision that a later phase makes against real data —
+#
+#   embedding model / vector index  -> Phase 10.3 (plan §7; design doc §10 also
+#                                      argues brute-force cosine may be enough
+#                                      at MVP scale, which is a measurement,
+#                                      not an assumption to bake in now)
+#   relational store                -> Phase 10.1 (plan §5)
+#   ASGI framework                  -> Phase 10.5 (plan §9)
+#
+# Adding any of them here would pre-empt that phase's decision with today's
+# guess.
+#
+# Pinned exactly rather than floored, matching adapters/pyproject.toml's stated
+# posture. The reason there is stronger (generated protobuf stubs assert their
+# runtime version at import), but the benefit is the same one: a resolver that
+# picks a different minor on someone else's machine should not be able to
+# change whether this contract's validators behave identically.
+dependencies = [
+    "pydantic==2.13.4",
+]
+
+[project.optional-dependencies]
+# Test framework only. Phase 10.0's tests exercise the frozen types; nothing
+# here needs a fixture library, a property-based tester, or a benchmark
+# harness yet.
+dev = [
+    "pytest==9.1.1",
+]
+
+[project.urls]
+Homepage = "https://github.com/mohitmanna/pulsekv"
+
+[tool.setuptools.packages.find]
+include = ["pulsekv_gateway*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

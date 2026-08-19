@@ -89,8 +89,100 @@ pk_cluster_pids() {
 
 # PID records are rewritten through a temporary file in the same directory and
 # renamed into place. A reader therefore sees the complete old state or the
-# complete new state, never a half-written file. The deploy lifecycle is
-# intentionally single-writer: chaos-test invokes local-node serially.
+# complete new state, never a half-written file.
+#
+# The rename is atomic; the read-modify-write around it is not. This file used
+# to say the lifecycle was "intentionally single-writer: chaos-test invokes
+# local-node serially", and for chaos-test that is still true -- but soak-test's
+# background injector is a second writer by construction (it cycles a data node
+# and, every fourth cycle, a control-plane replica), and an injector that
+# survives its parent's cleanup is a third. On 2026-08-19 that lost update cost
+# an 80-minute total outage: see docs/pulsekv-v2-soak-collapse-analysis.md.
+#
+# So the assumption is now enforced rather than asserted. Every mutation takes
+# the lock below, and deploy/test-lifecycle.sh fails without it.
+
+# pk_registry_lock -- serialise registry mutations across processes.
+#
+# mkdir is the portable atomic test-and-set: it either creates the directory or
+# fails, with no window in between, on every filesystem the dev image and a
+# developer's machine are likely to use. flock would be tidier and is not
+# portable enough (macOS ships no flock binary).
+#
+# Re-entrant within one shell, because pk_pid_remove_if legitimately calls
+# pk_pid_remove while already inside a critical section.
+pk_registry_lock() {
+    if [ "${PULSEKV_REGISTRY_LOCK_DEPTH:-0}" -gt 0 ]; then
+        PULSEKV_REGISTRY_LOCK_DEPTH=$((PULSEKV_REGISTRY_LOCK_DEPTH + 1))
+        return 0
+    fi
+
+    local lock="${PULSEKV_PID_FILE}.lock" waited=0 token seen="" token_pid
+    local limit=$(( ${PULSEKV_REGISTRY_LOCK_TIMEOUT:-10} * 50 ))
+    mkdir -p -- "$(dirname -- "$PULSEKV_PID_FILE")" 2>/dev/null || true
+
+    # The owner file carries a per-ACQUISITION token, not just a pid. Breaking a
+    # stale lock has to distinguish "the holder died still holding it" from "the
+    # holder released it and someone else took it" -- and a pid alone cannot,
+    # because the same shell re-acquiring would look identical. Taking a lock
+    # away on that mistake is worse than the wedge it is trying to fix: two
+    # writers would then believe they hold it, which is exactly the lost update
+    # this lock exists to prevent.
+    while ! mkdir -- "$lock" 2>/dev/null; do
+        token="$(cat -- "$lock/owner" 2>/dev/null || true)"
+        if [ -z "$token" ]; then
+            # Held, but the owner has not published itself yet. Never break on
+            # this: it is the normal few-microsecond gap inside acquisition.
+            seen=""
+            sleep 0.02
+            waited=$((waited + 1))
+        elif [ "$token" != "$seen" ]; then
+            # The lock changed hands. Whatever we were about to conclude about
+            # the previous holder is void; start observing again.
+            seen="$token"
+            waited=0
+            sleep 0.02
+        else
+            sleep 0.02
+            waited=$((waited + 1))
+            token_pid="${token%% *}"
+            # Same acquisition throughout, and its owner is gone: safe to break.
+            # `waited` guarantees we observed it twice, so the token cannot have
+            # been published by an acquisition that has since been released.
+            if [ "$waited" -ge 2 ] && ! pk_pid_alive "$token_pid"; then
+                pk_warn "clearing a cluster.pids lock left behind by dead pid $token_pid"
+                rm -rf -- "$lock" 2>/dev/null || true
+                seen=""
+                waited=0
+            fi
+        fi
+
+        if [ "$waited" -ge "$limit" ]; then
+            # Absolute backstop. A critical section here is an awk and a rename;
+            # anything holding for this long is not going to finish.
+            pk_warn "cluster.pids lock held by ${seen:-an unknown process} for ${PULSEKV_REGISTRY_LOCK_TIMEOUT:-10}s; breaking it"
+            rm -rf -- "$lock" 2>/dev/null || true
+            seen=""
+            waited=0
+        fi
+    done
+
+    # RANDOM alone repeats across forks seeded from the same shell; the pid and
+    # a nanosecond stamp make the token unique per acquisition.
+    printf '%s %s-%s\n' "$BASHPID" "$(date +%s%N 2>/dev/null || echo 0)" "$RANDOM" \
+        >"$lock/owner" 2>/dev/null || true
+    PULSEKV_REGISTRY_LOCK_DEPTH=1
+}
+
+pk_registry_unlock() {
+    if [ "${PULSEKV_REGISTRY_LOCK_DEPTH:-0}" -gt 1 ]; then
+        PULSEKV_REGISTRY_LOCK_DEPTH=$((PULSEKV_REGISTRY_LOCK_DEPTH - 1))
+        return 0
+    fi
+    PULSEKV_REGISTRY_LOCK_DEPTH=0
+    rm -rf -- "${PULSEKV_PID_FILE}.lock" 2>/dev/null || true
+}
+
 pk_pid_record_for() {
     local wanted="$1"
     [ -f "$PULSEKV_PID_FILE" ] || return 1
@@ -101,41 +193,65 @@ pk_pid_record_for() {
 }
 
 pk_pid_set() {
-    local label="$1" pid="$2" address="${3:-}" tmp
+    local label="$1" pid="$2" address="${3:-}" tmp rc=0
     mkdir -p "$PULSEKV_RUN_DIR"
-    tmp="$(mktemp "${PULSEKV_PID_FILE}.tmp.XXXXXX")" || return 1
+    pk_registry_lock
+    if ! tmp="$(mktemp "${PULSEKV_PID_FILE}.tmp.XXXXXX")"; then
+        pk_registry_unlock
+        return 1
+    fi
     if [ -f "$PULSEKV_PID_FILE" ]; then
         if ! awk -F '\t' -v label="$label" '$1 != label' "$PULSEKV_PID_FILE" >"$tmp"; then
             rm -f -- "$tmp"
+            pk_registry_unlock
             return 1
         fi
     fi
     if ! printf '%s\t%s\t%s\n' "$label" "$pid" "$address" >>"$tmp" ||
        ! mv -f -- "$tmp" "$PULSEKV_PID_FILE"; then
         rm -f -- "$tmp"
-        return 1
+        rc=1
     fi
+    pk_registry_unlock
+    return "$rc"
 }
 
 pk_pid_remove() {
-    local label="$1" tmp
+    local label="$1" tmp rc=0
     [ -f "$PULSEKV_PID_FILE" ] || return 0
-    tmp="$(mktemp "${PULSEKV_PID_FILE}.tmp.XXXXXX")" || return 1
+    pk_registry_lock
+    if ! tmp="$(mktemp "${PULSEKV_PID_FILE}.tmp.XXXXXX")"; then
+        pk_registry_unlock
+        return 1
+    fi
     if ! awk -F '\t' -v label="$label" '$1 != label' "$PULSEKV_PID_FILE" >"$tmp" ||
        ! mv -f -- "$tmp" "$PULSEKV_PID_FILE"; then
         rm -f -- "$tmp"
-        return 1
+        rc=1
     fi
+    pk_registry_unlock
+    return "$rc"
 }
 
 # Remove LABEL only if it still names PID. This prevents a slow stop path from
 # deleting a record installed by a concurrent/retried start.
+# Remove LABEL's record only if it still names EXPECTED_PID.
+#
+# Read and remove are one critical section. Without the lock, a concurrent
+# restart could write a new pid between the two and this would delete the new
+# record on the strength of having read the old one -- the same lost-update
+# shape the lock exists to prevent, just spread across two calls.
 pk_pid_remove_if() {
-    local label="$1" expected_pid="$2" record current_pid
-    record="$(pk_pid_record_for "$label" 2>/dev/null)" || return 0
-    IFS=$'\t' read -r _ current_pid _ <<< "$record"
-    [ "$current_pid" = "$expected_pid" ] || return 0
-    pk_pid_remove "$label"
+    local label="$1" expected_pid="$2" record current_pid rc=0
+    pk_registry_lock
+    if record="$(pk_pid_record_for "$label" 2>/dev/null)"; then
+        IFS=$'\t' read -r _ current_pid _ <<< "$record"
+        if [ "$current_pid" = "$expected_pid" ]; then
+            pk_pid_remove "$label" || rc=$?
+        fi
+    fi
+    pk_registry_unlock
+    return "$rc"
 }
 
 pk_expected_binary_for_label() {
@@ -191,6 +307,59 @@ pk_pid_matches_label() {
     return 0
 }
 
+# pk_regex_escape LITERAL -- quote a literal string for pgrep -f.
+pk_regex_escape() {
+    printf '%s' "$1" | sed 's/[][\.^$*+?(){}|\\]/\\&/g'
+}
+
+# pk_process_cmdline PID -- the process's argv, space-joined, or non-zero.
+pk_process_cmdline() {
+    local pid="$1" cmd
+    if [ -r "/proc/${pid}/cmdline" ]; then
+        # NUL-separated on Linux; the trailing separator becomes a trailing
+        # space, so strip it to match a plain "$*".
+        cmd="$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null)" || return 1
+        printf '%s\n' "${cmd% }"
+        return 0
+    fi
+    cmd="$(ps -p "$pid" -o command= 2>/dev/null)" || return 1
+    [ -n "$cmd" ] || return 1
+    printf '%s\n' "$cmd"
+}
+
+# pk_pids_for_label LABEL -- every live pid whose command line matches LABEL,
+# found by inspecting processes rather than by reading the registry.
+#
+# The registry is a cache of what this harness started. It is not, and was never
+# entitled to be, the definition of what is running. Every question of the form
+# "is X alive" needs an answer that survives the registry losing an entry --
+# stop-local-cluster.sh has always known this (its orphan sweep works exactly
+# this way); the rest of the lifecycle did not, and the 2026-08-19 outage is
+# what that cost.
+pk_pids_for_label() {
+    local label="$1" expected pid
+    expected="$(pk_expected_binary_for_label "$label" 2>/dev/null)" || return 0
+    [ -n "$expected" ] || return 0
+    command -v pgrep >/dev/null 2>&1 || return 0
+    while read -r pid; do
+        [ -n "$pid" ] || continue
+        [ "$pid" = "$$" ] && continue
+        pk_pid_alive "$pid" || continue
+        # pk_pid_matches_label re-checks argv[0] and --node-id, so a pgrep hit
+        # on an unrelated command cannot be mistaken for this label's process.
+        pk_pid_matches_label "$label" "$pid" || continue
+        printf '%s\n' "$pid"
+    done < <(pgrep -f -- "$(pk_regex_escape "$expected")" 2>/dev/null || true)
+}
+
+# pk_process_alive_for_label LABEL -- true when a matching process exists,
+# whatever the registry happens to say.
+pk_process_alive_for_label() {
+    local first
+    first="$(pk_pids_for_label "$1" | head -1)"
+    [ -n "$first" ]
+}
+
 # pk_any_controlplane_alive -- true when at least one replica is running.
 #
 # "At least one" rather than "all": the metadata group tolerates losing a
@@ -204,7 +373,20 @@ pk_any_controlplane_alive() {
         pk_recorded_alive "controlplane:${id}" && return 0
     done < <(pk_controlplane_ids)
     # Pre-Phase-5 pid files used a bare `controlplane` label.
-    pk_recorded_alive controlplane
+    pk_recorded_alive controlplane && return 0
+
+    # Registry said no. Ask the process table before believing it.
+    #
+    # local-node.sh refuses to start a data node when this returns false, so a
+    # false negative here is not a cosmetic wrong answer: it is the difference
+    # between a cluster that recovers and one that cannot. On 2026-08-19 all
+    # three replicas were serving normally while this function said none was,
+    # and no data node was startable again for the remaining 75 minutes.
+    while read -r id; do
+        [ -n "$id" ] || continue
+        pk_process_alive_for_label "controlplane:${id}" && return 0
+    done < <(pk_controlplane_ids)
+    return 1
 }
 
 pk_recorded_alive() {
@@ -348,6 +530,31 @@ pk_start_managed() {
         pk_pid_remove "$label"
     fi
 
+    # The registry may have lost this label's record while the process kept
+    # running (see pk_registry_lock). Adopt it instead of launching a rival: the
+    # rival cannot work -- it would die binding a port the survivor holds -- and
+    # every attempt overwrote the registry with the doomed process's pid, which
+    # is how the 2026-08-19 run convinced itself no control plane was running.
+    #
+    # Adoption is gated on the survivor running the EXACT command we were about
+    # to run. A process started from a different config is not the process this
+    # caller asked for, and quietly adopting it would trade a loud port-bind
+    # failure for a cluster that silently disagrees with its own config file.
+    local survivor wanted running
+    wanted="$*"
+    while read -r survivor; do
+        [ -n "$survivor" ] || continue
+        running="$(pk_process_cmdline "$survivor")" || continue
+        [ "$running" = "$wanted" ] || continue
+        pk_warn "$label is already running as pid $survivor but was missing from the registry; adopting it"
+        PK_LAST_LABEL="$label"
+        PK_LAST_PID="$survivor"
+        PK_LAST_ADDRESS="$address"
+        PK_LAST_LOG="$log"
+        pk_pid_set "$label" "$survivor" "$address"
+        return 0
+    done < <(pk_pids_for_label "$label")
+
     mkdir -p "$PULSEKV_LOG_DIR"
     printf '\n=== %s start %s ===\n' "$label" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >>"$log"
     "$@" >>"$log" 2>&1 &
@@ -486,23 +693,110 @@ pk_wait_pid_gone() {
 }
 
 # Graceful stop with a bounded hard-kill fallback. Missing/already-gone records
-# are success because cleanup and failure recovery must be idempotent.
+# are not, by themselves, success: the process table gets the last word.
+#
+# The old version returned success as soon as the registry had no live record
+# for the label. That is a lie whenever the record was lost rather than the
+# process stopped, and it is the lie that made the 2026-08-19 outage permanent.
+# The caller stopped nothing, started a replacement, and the replacement died on
+# `bind: address already in use` because the original was still holding the
+# port -- seven times over, to the end of the run.
 pk_stop_managed() {
     local label="$1" grace="${2:-10}" pid rc=0
     PK_LAST_STOP_FORCED=0
     pk_signal_managed "$label" TERM || rc=$?
     case "$rc" in
-        0) pid="$PK_LAST_PID" ;;
-        2) return 0 ;;
+        0)
+            pid="$PK_LAST_PID"
+            if ! pk_wait_pid_gone "$pid" "$grace"; then
+                pk_warn "$label (pid $pid) ignored SIGTERM after ${grace}s, sending SIGKILL"
+                PK_LAST_STOP_FORCED=1
+                kill -KILL "$pid" 2>/dev/null || true
+                pk_wait_pid_gone "$pid" 2 || return 1
+            fi
+            pk_pid_remove_if "$label" "$pid"
+            ;;
+        2) : ;;                 # no live record -- the sweep below decides
         *) return "$rc" ;;
     esac
-    if ! pk_wait_pid_gone "$pid" "$grace"; then
-        pk_warn "$label (pid $pid) ignored SIGTERM after ${grace}s, sending SIGKILL"
-        PK_LAST_STOP_FORCED=1
-        kill -KILL "$pid" 2>/dev/null || true
-        pk_wait_pid_gone "$pid" 2 || return 1
+    pk_stop_unrecorded_for_label "$label" "$grace"
+}
+
+# pk_stop_unrecorded_for_label LABEL GRACE -- stop any process matching LABEL
+# that the registry does not know about.
+#
+# Normally finds nothing and costs one pgrep. When it does find something, that
+# process is by definition one this harness started and then lost track of, and
+# leaving it running is what breaks the next start.
+pk_stop_unrecorded_for_label() {
+    local label="$1" grace="${2:-10}" pid found=0
+    while read -r pid; do
+        [ -n "$pid" ] || continue
+        found=1
+        pk_warn "$label: pid $pid is running but was missing from the registry; stopping it"
+        kill -TERM "$pid" 2>/dev/null || true
+        if ! pk_wait_pid_gone "$pid" "$grace"; then
+            PK_LAST_STOP_FORCED=1
+            kill -KILL "$pid" 2>/dev/null || true
+            pk_wait_pid_gone "$pid" 2 || {
+                pk_err "$label: pid $pid survived SIGKILL"
+                return 1
+            }
+        fi
+    done < <(pk_pids_for_label "$label")
+    [ "$found" -eq 0 ] || pk_pid_remove "$label" || true
+    return 0
+}
+
+# pk_kill_tree PID [SIGNAL] -- signal PID and every descendant, children first.
+#
+# `kill $pid` on a backgrounded subshell is not enough. The subshell spends
+# almost all its time blocked in `sleep`, and bash defers the signal until that
+# child returns; anything the subshell had already launched is not signalled at
+# all. soak-test.sh's cleanup did exactly that, which is how injectors from
+# earlier runs were still crashing data nodes hours later -- three of them at
+# once, by the 2026-08-19 run.
+pk_kill_tree() {
+    local pid="${1:-}" signal="${2:-TERM}" child
+    case "$pid" in (*[!0-9]*|'') return 0 ;; esac
+    # Depth first: a parent killed before its children just orphans them.
+    if command -v pgrep >/dev/null 2>&1; then
+        while read -r child; do
+            [ -n "$child" ] || continue
+            pk_kill_tree "$child" "$signal"
+        done < <(pgrep -P "$pid" 2>/dev/null || true)
     fi
-    pk_pid_remove_if "$label" "$pid"
+    kill -"$signal" "$pid" 2>/dev/null || true
+}
+
+# pk_singleton_acquire NAME -- refuse to run when another instance is live.
+#
+# The run directory is shared mutable state: one cluster.pids, one set of logs,
+# one cluster. Two soaks against it corrupt each other's view of what is
+# running, and the only reason that was survivable before is that nobody
+# noticed. Fails loudly instead, naming the process to stop.
+pk_singleton_acquire() {
+    # Declared separately: under `set -u`, referring to `name` in the same
+    # `local` statement that introduces it reads an unset variable.
+    local name="$1"
+    local marker="${PULSEKV_RUN_DIR}/${name}.owner"
+    local holder=""
+    mkdir -p "$PULSEKV_RUN_DIR"
+    if [ -f "$marker" ]; then
+        holder="$(cat -- "$marker" 2>/dev/null || true)"
+        if [ -n "$holder" ] && pk_pid_alive "$holder"; then
+            pk_err "another ${name} is already running (pid $holder) against $(pk_relpath "$PULSEKV_RUN_DIR")."
+            pk_err "stop it first, or run with a different run directory. Two of them share one"
+            pk_err "cluster.pids and one cluster, and will fight over both."
+            return 1
+        fi
+        pk_dim "clearing a stale ${name} marker from pid ${holder:-unknown}"
+    fi
+    printf '%s\n' "$$" >"$marker"
+}
+
+pk_singleton_release() {
+    rm -f -- "${PULSEKV_RUN_DIR}/${1}.owner" 2>/dev/null || true
 }
 
 pk_tail_process_log() {

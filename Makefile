@@ -42,6 +42,7 @@ help:
 	@printf "  $(GREEN)make test-adapter$(RESET)        Run Python Client SDK, SGLang, and vLLM adapter tests\n"
 	@printf "  $(GREEN)make test-engine$(RESET)         Run pure-C storage engine tiering & stress tests\n"
 	@printf "  $(GREEN)make test-smoke$(RESET)          Run Go control plane + gRPC contract smoke test\n"
+	@printf "  $(GREEN)make test-lifecycle$(RESET)      Run process-registry regression tests (no cluster needed)\n"
 	@printf "\n$(CYAN)Demos & Benchmarks:$(RESET)\n"
 	@printf "  $(GREEN)make demo$(RESET)                Run SGLang and vLLM cross-replica cache hit demos\n"
 	@printf "  $(GREEN)make demo-sglang$(RESET)         Run SGLang HiCache cross-replica prefix cache hit demo\n"
@@ -91,12 +92,20 @@ status:
 .PHONY: test
 test:
 	$(RUN_CMD) "\
+		deploy/test-lifecycle.sh && \
 		deploy/run-local-cluster.sh && \
 		deploy/smoke-test.sh && \
 		deploy/test-engine.sh && \
 		PYTHONPATH=adapters python3 -m unittest discover -s adapters/tests && \
 		deploy/stop-local-cluster.sh \
 	"
+
+# The lifecycle registry on its own: no cluster, no build, runs in a second.
+# Guards the defect behind the 2026-08-19 soak collapse
+# (docs/pulsekv-v2-soak-collapse-analysis.md).
+.PHONY: test-lifecycle
+test-lifecycle:
+	$(RUN_CMD) "deploy/test-lifecycle.sh"
 
 .PHONY: test-adapter
 test-adapter:
