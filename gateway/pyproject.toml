@@ -22,23 +22,42 @@ classifiers = [
 # vector index, no web framework, no database driver. Each of those is a real
 # decision that a later phase makes against real data —
 #
-#   embedding model / vector index  -> Phase 10.3 (plan §7; design doc §10 also
-#                                      argues brute-force cosine may be enough
-#                                      at MVP scale, which is a measurement,
-#                                      not an assumption to bake in now)
-#   relational store                -> Phase 10.1 (plan §5)
-#   ASGI framework                  -> Phase 10.5 (plan §9)
+#   embedding model / vector index  -> Phase 10.3 (plan §7) -- DECIDED, below
+#   relational store                -> Phase 10.1 (plan §5) -- SQLite, stdlib
+#   ASGI framework                  -> Phase 10.5 (plan §9) -- still open
 #
-# Adding any of them here would pre-empt that phase's decision with today's
-# guess.
+# Phase 10.3 is the one phase that was always going to add dependencies: Tier 2
+# needs a model to run and something to run it in. The three below are the
+# whole of it, and each is load-bearing:
+#
+#   onnxruntime  CPU inference for all-MiniLM-L6-v2. Plan §1 fixes CPU-only, so
+#                the MVP needs no GPU the rest of v2 does not have either. The
+#                package is `onnxruntime`, never `onnxruntime-gpu`.
+#   tokenizers   the model's own WordPiece tokenizer. Reusing the published
+#                tokenizer.json is what makes this encoder's vectors the same
+#                vectors the model card describes.
+#   numpy        pooling, and the single matrix-vector product that scores a
+#                whole bucket. Measured during Phase 10.3: a per-record Python
+#                loop costs ~80 ms at 5,000 records against ~4.9 ms vectorized.
+#                onnxruntime requires numpy anyway; this makes the use explicit.
+#
+# The 90 MB weights are deliberately NOT a dependency and are not vendored --
+# see gateway/README.md for the fetch command. `OnnxEncoder` raises a typed
+# error naming that command when they are absent, and every tier below 2 keeps
+# working without them (design doc §17).
 #
 # Pinned exactly rather than floored, matching adapters/pyproject.toml's stated
 # posture. The reason there is stronger (generated protobuf stubs assert their
 # runtime version at import), but the benefit is the same one: a resolver that
 # picks a different minor on someone else's machine should not be able to
-# change whether this contract's validators behave identically.
+# change whether this contract's validators behave identically -- and for the
+# encoder it is stronger still, because a different build could change a vector
+# and silently invalidate every embedding the registry has cached.
 dependencies = [
     "pydantic==2.13.4",
+    "numpy==2.5.2",
+    "onnxruntime==1.29.0",
+    "tokenizers==0.23.1",
 ]
 
 [project.optional-dependencies]
@@ -54,6 +73,12 @@ Homepage = "https://github.com/mohitmanna/pulsekv"
 
 [tool.setuptools.packages.find]
 include = ["pulsekv_gateway*"]
+
+# The registry's schema is data, not code, so setuptools would leave it out of
+# a built wheel and an installed gateway would have nothing to migrate from.
+# Phase 10.1 keeps migrations/ inside the package for exactly this reason.
+[tool.setuptools.package-data]
+pulsekv_gateway = ["migrations/*.sql"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

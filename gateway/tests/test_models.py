@@ -662,16 +662,15 @@ class TestPrivacyByShape:
 class TestStubsAreStubs:
     """Phase 10.0 produces no runtime behavior — asserted, not assumed."""
 
+    # Modules leave this list as their phase implements them: `registry` in
+    # Phase 10.1, `normalizer`/`decomposer`/`matcher`/`auditlog` in Phase 10.2,
+    # and `encoder`/`index` in Phase 10.3. The discipline moves with them
+    # rather than lapsing -- each phase's test file carries a TestPhaseBoundary
+    # asserting that what still belongs to a later phase keeps raising
+    # NotImplementedError, and that no later phase's dependency crept in early.
     STUB_MODULES = [
         "assembler",
-        "auditlog",
-        "decomposer",
-        "encoder",
         "guardrail",
-        "index",
-        "matcher",
-        "normalizer",
-        "registry",
         "server",
     ]
 
