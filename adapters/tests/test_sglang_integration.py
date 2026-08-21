@@ -45,7 +45,7 @@ class TestSGLangIntegration(unittest.TestCase):
 
     def test_backend_registration(self):
         """Test that register_sglang_backend completes without error."""
-        register_sglang_backend()
+        self.assertTrue(register_sglang_backend())
 
     def test_tensor_kv_page_round_trip(self):
         """Test storing and retrieving real or simulated multi-dimensional KV cache tensors."""
