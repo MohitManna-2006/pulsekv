@@ -1,9 +1,11 @@
 # PulseKV v3 / Phase 10 — Codebase Impact Map
 
-**Status:** derived from direct inspection of the listed files (not from
-docs alone) as of this investigation. Classification legend: **FROZEN** (no
-phase of Phase 10 touches this), **READ-ONLY / INTEGRATION-ONLY** (Phase 10
-code calls into it as a consumer, exactly as it exists today, no edits),
+**Status:** reconciled through the merged Phase 10.6 implementation. Original
+design-time classifications are retained where they explain intent; Phase
+10.6 evidence supersedes the blanket adapter freeze. Classification legend:
+**FROZEN** (semantic/core responsibility does not move here),
+**READ-ONLY / INTEGRATION-ONLY** (consumed as-is, or mechanically maintained
+only when a pinned real upstream API proves it necessary),
 **EXTEND** (a real, scoped addition), **NEW COMPONENT**.
 
 ---
@@ -77,13 +79,19 @@ gateway needs.
 
 ## `adapters/pulsekv_adapters/{key.py, sglang.py, vllm.py, vllm_key.py}`
 
-**FROZEN.** These are the exact modules the design doc's Finding 2 depends
-on staying unmodified — SGLang's and vLLM's own tokenizers, operating on
-gateway-produced canonical text, must produce the same block hashes they
-would for any other input, through this completely unchanged code path. Any
-edit here would undermine the specific claim (§6, Finding 2) that makes the
-whole architecture "zero PulseKV-side changes." Phases 10.6/10.7's hard
-scope boundaries state this explicitly as a rule, not just an expectation.
+**Semantic responsibilities and key semantics: FROZEN. Engine-specific API
+surface: INTEGRATION-ONLY.** The original map classified all four files as
+source-frozen because Finding 2 expected canonical text to flow through the
+existing adapters unchanged. Phase 10.6 disproved that stronger expectation:
+real SGLang 0.5.15 required a mechanical compatibility repair in `sglang.py`
+for its dynamic HiCache factory, batch/pool and tensor-transfer contracts.
+
+That exception did not move matching, registry access or canonicalization
+into the adapter, and `key.py` remained unchanged. `vllm.py` and
+`vllm_key.py` have not been validated by Phase 10.7; remaining unchanged is
+their desired initial compatibility hypothesis, not an unconditional fact.
+Phase 10.7 must audit a pinned real vLLM API and name any gap before proposing
+a compatibility change.
 
 ## `adapters/pulsekv_adapters/health_client.py`, `__init__.py`
 
@@ -92,27 +100,23 @@ component.
 
 ## `adapters/tests/`
 
-**FROZEN.** Existing adapter tests are the regression gate proving Phase 10
-did not disturb Phase 7/8's behavior — Phase 10.6/10.7's exit criteria
-include confirming these still pass, but no phase edits them.
+**EXTEND for compatibility evidence; existing behavior remains a regression
+gate.** Phase 10.6 added `test_sglang_0515_contract.py` and adjusted the
+existing SGLang adapter/integration tests. This is the correct home for
+pinned upstream contract and fallback/trace behavior. Phase 10.7 may likewise
+need test-only extensions after its read-only vLLM compatibility audit.
 
 ## `deploy/`
 
-**EXTEND.** Two concrete, scoped additions anticipated by the implementation
-plan, both additive:
+**EXTEND.** The original plan anticipated two additive demo scripts and
+possible Make targets. As built through Phase 10.6:
 
-- `deploy/demo-semantic-sglang.sh` / `deploy/demo-semantic-vllm.sh` (Phase
-  10.6/10.7) — new scripts, modeled on the existing
-  `demo-cross-replica-{sglang,vllm}.sh` shape, not edits to those files.
-- `Makefile` gains new targets (`make demo-semantic`, `make gateway-test` or
-  similar) the same way Phase 8 added `demo-vllm` alongside the existing
-  `demo-sglang` target without touching it. `deploy/cluster.config.yaml` is
-  not expected to need changes — the gateway is a client of the existing
-  cluster, not a new cluster member — but if Phase 10.6 finds the dev-cluster
-  scripts need a minimal extension to also boot a gateway process, that is
-  the one place a small, flagged extension to existing `deploy/` scripts
-  (not proto, not core logic) would be acceptable, per the same precedent
-  Phase 7's prompt set ("flag any such extension clearly").
+- Phase 10.6 added `deploy/demo-semantic-sglang.sh`, modeled on the existing
+  SGLang cross-replica proof but launching its own gateway/engine processes.
+- `deploy/demo-semantic-vllm.sh` remains planned for Phase 10.7; it does not
+  exist yet.
+- No Phase 10.6 Makefile target or edit to an existing deploy script was
+  merged. The demo calls the existing cluster lifecycle scripts as a client.
 
 `deploy/soak-test.sh` and `deploy/chaos-test.sh` are **READ-ONLY /
 INTEGRATION-ONLY** for Phase 10.9, which reuses their existing harness shape
@@ -120,7 +124,7 @@ for the gateway's own soak run rather than rewriting either.
 
 ## `docs/`
 
-**EXTEND.** This investigation's own five deliverables land here, plus one
+**EXTEND.** The design-time investigation's deliverables landed here, followed by
 progress-report and up to nine phase-summary docs as Phase 10 actually
 executes (mirroring v2's `pulsekv-v2-phaseN-summary.md` pattern exactly). No
 existing `docs/pulsekv-v2-*.md` file is edited by this investigation or its
@@ -130,23 +134,20 @@ in its own header) but is left in place as historical record, consistent
 with how this project has handled every other prior-report/current-source
 disagreement (precedence stated, old doc not deleted).
 
-## `gateway/` (does not exist yet)
+## `gateway/`
 
-**NEW COMPONENT.** The entire deliverable of Phase 10.0 through 10.9, per
+**NEW COMPONENT, implemented through Phase 10.6.** The deliverable of Phase 10.0 through 10.9, per
 the implementation plan's directory layout (`pulsekv_gateway/{server,
 decomposer,encoder,index,registry,models,normalizer,guardrail,assembler,
 config,auditlog}.py`, `tests/`, `tests/corpus/`, `pyproject.toml`).
 
 ## `Dockerfile` (root, v1) and `deploy/Dockerfile` (v2)
 
-**FROZEN** (root) / **EXTEND, deferred** (`deploy/Dockerfile`) — the v2 dev
-image would eventually want the gateway's Python dependencies
-(FastAPI/ASGI server, an embedding runtime) added for a fully-scripted
-`make`-driven dev loop, but this is not required until Phase 10.5 actually
-needs to run the gateway inside that image; earlier phases (10.0–10.4) can
-develop and test the gateway's pure-Python logic without any container
-change at all, since none of it depends on the C++/Go toolchain the current
-image exists to provide.
+**FROZEN** (root) / **EXTEND if a future integrated image requires it**
+(`deploy/Dockerfile`). Neither Phase 10.5 nor 10.6 changed these files. The
+Phase 10.6 demo instead requires pre-existing, separately selected SGLang and
+gateway virtual environments so its pinned engine dependency does not silently
+become the general v2 build image's contract.
 
 ---
 
@@ -160,11 +161,11 @@ image exists to provide.
 | `control/` (all) | FROZEN |
 | `proto/` | READ-ONLY / INTEGRATION-ONLY (no changes; `AdapterService` confirmed unused, not adopted) |
 | `adapters/pulsekv_adapters/client.py` | READ-ONLY / INTEGRATION-ONLY |
-| `adapters/pulsekv_adapters/{key,sglang,vllm,vllm_key}.py` | FROZEN |
+| `adapters/pulsekv_adapters/{key,sglang,vllm,vllm_key}.py` | Semantic responsibility/key semantics FROZEN; engine API compatibility INTEGRATION-ONLY (`sglang.py` repaired in 10.6; vLLM unverified for 10.7) |
 | `adapters/pulsekv_adapters/{health_client,__init__}.py` | FROZEN |
-| `adapters/tests/` | FROZEN (regression gate only) |
-| `deploy/` | EXTEND (new demo scripts, new Makefile targets; existing scripts read-only/integration-only) |
-| `docs/` | EXTEND (new docs only; existing docs untouched) |
-| `gateway/` | NEW COMPONENT |
-| `deploy/Dockerfile` | EXTEND, deferred to Phase 10.5 |
+| `adapters/tests/` | EXTEND for upstream compatibility evidence; existing tests remain regression gates |
+| `deploy/` | EXTEND (`demo-semantic-sglang.sh` added in 10.6; vLLM demo remains planned; existing scripts integration-only) |
+| `docs/` | EXTEND (phase summaries, status reconciliation and eventual progress report) |
+| `gateway/` | NEW COMPONENT, implemented through Phase 10.6 |
+| `deploy/Dockerfile` | Unchanged through 10.6; EXTEND only if a future integrated image requires it |
 | root `Dockerfile` | FROZEN |
