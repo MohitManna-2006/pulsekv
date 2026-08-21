@@ -1,0 +1,25 @@
+{
+  "id": "negation-scope-added-clause",
+  "category": "adversarial_negative",
+  "why": "Both texts contain 'Never'. Only the COUNT differs -- a second prohibition was added to one clause of two. A presence-set comparison ('is the marker in one and not the other') passes this; comparing multisets is what refuses it, and this example is why the guard compares multisets.",
+  "records": [
+    {
+      "context_id": "data-deletion-schedule",
+      "version": 1,
+      "namespace": "acme",
+      "block_type": "org_policy",
+      "canonical_text": "Never delete production data. Delete staging data weekly."
+    }
+  ],
+  "query": {
+    "namespace": "acme",
+    "block_type": "org_policy",
+    "text": "Never delete production data. Never delete staging data weekly."
+  },
+  "expect": {
+    "outcome": "rejected",
+    "rejection_reason": "negation_mismatch",
+    "context_id": "data-deletion-schedule",
+    "version": 1
+  }
+}

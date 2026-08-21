@@ -1,0 +1,25 @@
+{
+  "id": "retention-90",
+  "category": "positive_paraphrase",
+  "why": "A retention policy restated in the passive voice. The number that makes it a policy at all is unchanged, which is what the entity check has to see.",
+  "records": [
+    {
+      "context_id": "audit-log-retention",
+      "version": 1,
+      "namespace": "acme",
+      "block_type": "org_policy",
+      "canonical_text": "Retain audit logs for 90 days, then archive them to cold storage."
+    }
+  ],
+  "query": {
+    "namespace": "acme",
+    "block_type": "org_policy",
+    "text": "Audit logs must be kept for 90 days and afterwards archived to cold storage."
+  },
+  "expect": {
+    "outcome": "matched",
+    "method": "semantic",
+    "context_id": "audit-log-retention",
+    "version": 1
+  }
+}

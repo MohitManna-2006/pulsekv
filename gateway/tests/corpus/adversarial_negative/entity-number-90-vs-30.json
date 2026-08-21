@@ -1,0 +1,25 @@
+{
+  "id": "entity-number-90-vs-30",
+  "category": "adversarial_negative",
+  "why": "A retention period cut by two thirds. Same sentence, same policy shape, different obligation -- and a compliance difference.",
+  "records": [
+    {
+      "context_id": "audit-log-retention",
+      "version": 1,
+      "namespace": "acme",
+      "block_type": "org_policy",
+      "canonical_text": "Retain audit logs for 90 days, then archive them to cold storage."
+    }
+  ],
+  "query": {
+    "namespace": "acme",
+    "block_type": "org_policy",
+    "text": "Retain audit logs for 30 days, then archive them to cold storage."
+  },
+  "expect": {
+    "outcome": "rejected",
+    "rejection_reason": "entity_mismatch",
+    "context_id": "audit-log-retention",
+    "version": 1
+  }
+}

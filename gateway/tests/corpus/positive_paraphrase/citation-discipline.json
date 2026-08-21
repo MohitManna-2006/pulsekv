@@ -1,0 +1,25 @@
+{
+  "id": "citation-discipline",
+  "category": "positive_paraphrase",
+  "why": "The same two-clause instruction with the clauses swapped and one noun phrase reordered ('the retrieved documents' -> 'the documents retrieved').",
+  "records": [
+    {
+      "context_id": "answer-from-retrieved",
+      "version": 1,
+      "namespace": "acme",
+      "block_type": "agent_instruction",
+      "canonical_text": "Answer only from the retrieved documents. Cite the source of every claim."
+    }
+  ],
+  "query": {
+    "namespace": "acme",
+    "block_type": "agent_instruction",
+    "text": "Cite the source of every claim, and answer only from the documents retrieved."
+  },
+  "expect": {
+    "outcome": "matched",
+    "method": "semantic",
+    "context_id": "answer-from-retrieved",
+    "version": 1
+  }
+}

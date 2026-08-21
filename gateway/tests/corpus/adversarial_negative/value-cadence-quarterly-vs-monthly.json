@@ -1,0 +1,25 @@
+{
+  "id": "value-cadence-quarterly-vs-monthly",
+  "category": "adversarial_negative",
+  "why": "A rotation cadence is a value, not a description. Measured at 0.8911, ABOVE the lowest-scoring genuine paraphrase in positive_paraphrase/ -- so tau cannot be raised far enough to refuse this without refusing real matches, and the value lexicon has to carry it.",
+  "records": [
+    {
+      "context_id": "credential-rotation",
+      "version": 1,
+      "namespace": "acme",
+      "block_type": "org_policy",
+      "canonical_text": "Rotate service credentials quarterly."
+    }
+  ],
+  "query": {
+    "namespace": "acme",
+    "block_type": "org_policy",
+    "text": "Rotate service credentials monthly."
+  },
+  "expect": {
+    "outcome": "rejected",
+    "rejection_reason": "entity_mismatch",
+    "context_id": "credential-rotation",
+    "version": 1
+  }
+}

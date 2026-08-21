@@ -1,0 +1,25 @@
+{
+  "id": "negation-must-not-dropped",
+  "category": "adversarial_negative",
+  "why": "One word removed. The obligation inverts; the topic, the entity and the sentence shape do not.",
+  "records": [
+    {
+      "context_id": "iam-role-policy",
+      "version": 1,
+      "namespace": "acme",
+      "block_type": "org_policy",
+      "canonical_text": "The agent must not modify IAM roles."
+    }
+  ],
+  "query": {
+    "namespace": "acme",
+    "block_type": "org_policy",
+    "text": "The agent must modify IAM roles."
+  },
+  "expect": {
+    "outcome": "rejected",
+    "rejection_reason": "negation_mismatch",
+    "context_id": "iam-role-policy",
+    "version": 1
+  }
+}

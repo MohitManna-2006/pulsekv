@@ -51,6 +51,7 @@ from pulsekv_gateway.models import (
     CanonicalContextRecord,
     ContextBlock,
     GatewayComponent,
+    GuardOutcome,
     MatchMethod,
     MatchOutcome,
 )
@@ -537,14 +538,21 @@ class TestScoringAgreesWithTheReference:
 
 
 class TestRetrievalIsNotDecision:
-    """Exit criterion 4: a candidate never becomes a match in Phase 10.3."""
+    """Exit criterion 4, as it stands after Phase 10.4 gave Tier 3 a verdict.
 
-    def test_a_perfect_similarity_candidate_still_resolves_to_no_candidate(
-        self, registry, encoder
-    ):
+    Phase 10.3 proved this by showing that even a similarity-1.0 candidate
+    resolved to ``NO_CANDIDATE`` -- true then because nothing existed that
+    could accept one. That is no longer the shape of the claim: the guard now
+    decides, and a candidate it passes does become a match. What remains, and
+    is what design doc §11 actually requires, is that **Tier 2 itself** reaches
+    no verdict -- ``try_semantic`` ranks, applies no threshold, and hands over
+    a ``Candidate`` that carries no accept/reject state of its own.
+    """
+
+    def test_tier_two_alone_still_reaches_no_verdict(self, registry, encoder):
         # Same text, so similarity is exactly 1.0 -- the strongest candidate
-        # that can exist. It is still not a match, because nothing has checked
-        # equivalence: design doc §7.3 admits no partial-credit mode.
+        # that can exist. Tier 2 still says nothing about whether it may be
+        # substituted; `Candidate` has no field in which it could.
         incoming = "an incoming block worded differently"
         registry.register(
             make_record(
@@ -554,14 +562,29 @@ class TestRetrievalIsNotDecision:
             )
         )
         matcher = wired(registry, encoder)
+        candidates = matcher.try_semantic(block(incoming), NAMESPACE)
+        assert candidates and candidates[0].similarity == pytest.approx(1.0)
+        assert not hasattr(candidates[0], "matched")
+        assert set(type(candidates[0]).model_fields) == {"record", "similarity"}
+
+    def test_the_guard_is_what_turns_that_candidate_into_a_match(
+        self, registry, encoder
+    ):
+        # The same 1.0 candidate as above, now run through Tier 3: it matches
+        # only because the guard passed it, and the result says so.
+        incoming = "an incoming block worded differently"
+        registry.register(
+            make_record("the registered canonical policy", encoder,
+                        embedding_text=incoming)
+        )
+        matcher = wired(registry, encoder)
         result, candidates = matcher.resolve_with_candidates(
             block(incoming), NAMESPACE
         )
         assert candidates and candidates[0].similarity == pytest.approx(1.0)
-        assert result.outcome is MatchOutcome.NO_CANDIDATE
-        assert result.matched is False
-        assert result.substitutes is False
-        assert result.method is None
+        assert result.outcome is MatchOutcome.MATCHED
+        assert result.method is MatchMethod.SEMANTIC
+        assert result.substitutes is True
 
     def test_resolve_returns_the_same_verdict_without_the_candidates(
         self, registry, encoder
@@ -572,9 +595,9 @@ class TestRetrievalIsNotDecision:
                         embedding_text=incoming)
         )
         matcher = wired(registry, encoder)
-        assert matcher.resolve(block(incoming), NAMESPACE).outcome is (
-            MatchOutcome.NO_CANDIDATE
-        )
+        plain = matcher.resolve(block(incoming), NAMESPACE)
+        detailed, _ = matcher.resolve_with_candidates(block(incoming), NAMESPACE)
+        assert plain == detailed
 
     def test_retrieval_applies_no_threshold(self, registry, encoder):
         # τ is Phase 10.4's to earn. A candidate scoring near zero is still
@@ -712,17 +735,17 @@ class TestFailOpen:
 
 
 class TestDecisionLogUnderTier2:
-    def test_a_retrieved_candidate_logs_no_candidate_without_a_similarity(
-        self, registry, encoder
-    ):
-        """The frozen contract's limit, asserted so it is not mistaken for a bug.
+    def test_the_phase_103_observability_gap_is_closed(self, registry, encoder):
+        """Phase 10.3 §5's gap, asserted closed rather than assumed closed.
 
         ``DecisionLogRecord`` refuses ``similarity`` on a ``NO_CANDIDATE``
-        outcome, and ``NO_CANDIDATE`` is the only outcome Phase 10.3 can
-        produce for a retrieved-but-unvalidated candidate. The observability
-        gap is real and closes in Phase 10.4, when the guard turns the
-        candidate into MATCHED or REJECTED -- both of which carry similarity
-        legally. See the phase summary §5.
+        outcome, and ``NO_CANDIDATE`` was the only outcome Phase 10.3 could
+        produce for a retrieved-but-unvalidated candidate -- so a retrieved
+        candidate's score went unrecorded for exactly one phase. The summary
+        predicted the gap would close "by construction" once the guard gave
+        every candidate a verdict. This is that prediction, checked: the same
+        block that logged a bare ``no_candidate`` in 10.3 now logs a decision
+        that carries the similarity and the guard outcome legally.
         """
         incoming = "an incoming block worded differently"
         registry.register(
@@ -740,6 +763,27 @@ class TestDecisionLogUnderTier2:
             audit=audit,
         )
         record = audit.for_request("req-t2")[0]
+        assert record.decision_label == "semantic"
+        assert record.similarity == pytest.approx(1.0)
+        assert record.guard_outcome is GuardOutcome.PASSED
+
+    def test_a_retrieval_that_finds_nothing_still_logs_a_bare_no_candidate(
+        self, registry, encoder
+    ):
+        # The other half of the distinction Phase 10.0's prompt §10.0.3 asked
+        # for: nothing was retrieved, so there is nothing to score and nothing
+        # for the guard to have refused.
+        matcher = wired(registry, encoder)
+        audit = InMemoryAuditLog()
+        matcher.resolve_blocks(
+            (block("a block no namespace has ever registered"),),
+            namespace=NAMESPACE,
+            request_id="req-empty",
+            timestamp=NOW,
+            model="gpt-4o",
+            audit=audit,
+        )
+        record = audit.for_request("req-empty")[0]
         assert record.decision_label == "no_candidate"
         assert record.similarity is None
         assert record.guard_outcome is None
@@ -775,11 +819,18 @@ class TestPhaseBoundary:
         message = str(caught.value)
         assert "VectorIndex" in message and "10.3" in message
 
-    def test_the_guard_is_still_phase_104(self):
-        from pulsekv_gateway import guardrail
+    def test_the_gateway_process_is_still_phase_105(self):
+        # The boundary this test guards moved with Phase 10.4: guardrail.py is
+        # implemented, and what is still somebody else's phase is the process
+        # around it. Both remaining stubs are checked, not just one.
+        from pulsekv_gateway import assembler, config, server
 
         with pytest.raises(NotImplementedError):
-            guardrail.Guardrail().check(None, None)
+            assembler.assemble((), {})
+        with pytest.raises(NotImplementedError):
+            server.create_app(None)
+        with pytest.raises(NotImplementedError):
+            config.load("gateway.yaml")
 
     def test_nothing_in_tier_two_imports_a_gpu_runtime(self):
         import ast

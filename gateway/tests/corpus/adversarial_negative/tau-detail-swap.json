@@ -1,0 +1,25 @@
+{
+  "id": "tau-detail-swap",
+  "category": "adversarial_negative",
+  "why": "An instruction inverted in degree rather than polarity.",
+  "records": [
+    {
+      "context_id": "answer-length",
+      "version": 1,
+      "namespace": "acme",
+      "block_type": "system_prompt",
+      "canonical_text": "Answer the user concisely."
+    }
+  ],
+  "query": {
+    "namespace": "acme",
+    "block_type": "system_prompt",
+    "text": "Answer the user in exhaustive detail."
+  },
+  "expect": {
+    "outcome": "rejected",
+    "rejection_reason": "low_similarity",
+    "context_id": "answer-length",
+    "version": 1
+  }
+}

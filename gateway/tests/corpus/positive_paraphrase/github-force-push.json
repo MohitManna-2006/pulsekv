@@ -1,0 +1,25 @@
+{
+  "id": "github-force-push",
+  "category": "positive_paraphrase",
+  "why": "A tool policy whose clause order flipped. The proper noun and the negation both survive, so both checks have something real to agree on.",
+  "records": [
+    {
+      "context_id": "github-force-push-ban",
+      "version": 1,
+      "namespace": "acme",
+      "block_type": "tool_policy",
+      "canonical_text": "When using the GitHub tool, never force-push to a protected branch."
+    }
+  ],
+  "query": {
+    "namespace": "acme",
+    "block_type": "tool_policy",
+    "text": "Never force-push to a protected branch when you use the GitHub tool."
+  },
+  "expect": {
+    "outcome": "matched",
+    "method": "semantic",
+    "context_id": "github-force-push-ban",
+    "version": 1
+  }
+}

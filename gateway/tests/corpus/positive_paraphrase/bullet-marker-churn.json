@@ -1,0 +1,31 @@
+{
+  "id": "bullet-marker-churn",
+  "category": "positive_paraphrase",
+  "why": "The same two instructions rendered with '*' bullets instead of '-'. normalize_for_hash deliberately does not touch punctuation, so Tier 0 misses -- this is the 'incidental rendering churn' case that actually reaches Tier 2.",
+  "records": [
+    {
+      "context_id": "citation-rules",
+      "version": 1,
+      "namespace": "acme",
+      "block_type": "agent_instruction",
+      "canonical_text": [
+        "- Cite every source.",
+        "- Answer from the retrieved documents only."
+      ]
+    }
+  ],
+  "query": {
+    "namespace": "acme",
+    "block_type": "agent_instruction",
+    "text": [
+      "* Cite every source.",
+      "* Answer from the retrieved documents only."
+    ]
+  },
+  "expect": {
+    "outcome": "matched",
+    "method": "semantic",
+    "context_id": "citation-rules",
+    "version": 1
+  }
+}

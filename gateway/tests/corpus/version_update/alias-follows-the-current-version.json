@@ -1,0 +1,49 @@
+{
+  "id": "alias-follows-the-current-version",
+  "category": "version_update",
+  "why": "An alias names a context, not a text (design doc §10), so it resolves through the current-version pointer. Before the bump the alias resolves to v1; after it, to v2 -- and the v1 decision logged in between still names v1. This is the 'does an alias survive a version bump' question the corpus README asks, answered: it survives, and it moves.",
+  "records": [
+    {
+      "context_id": "incident-severity-guide",
+      "version": 1,
+      "namespace": "acme",
+      "block_type": "rag_document",
+      "canonical_text": "Declare a Sev-1 when checkout success drops below 90 percent.",
+      "aliases": [
+        "sev-guide"
+      ]
+    }
+  ],
+  "query": {
+    "namespace": "acme",
+    "block_type": "rag_document",
+    "text": "sev-guide"
+  },
+  "expect": {
+    "outcome": "matched",
+    "method": "alias",
+    "context_id": "incident-severity-guide",
+    "version": 1
+  },
+  "then": {
+    "publish": [
+      {
+        "context_id": "incident-severity-guide",
+        "version": 2,
+        "namespace": "acme",
+        "block_type": "rag_document",
+        "canonical_text": "Declare a Sev-1 when checkout success drops below 90 percent for five consecutive minutes.",
+        "aliases": [
+          "sev-guide"
+        ]
+      }
+    ],
+    "expect_previous_decision_unchanged": true,
+    "expect": {
+      "outcome": "matched",
+      "method": "alias",
+      "context_id": "incident-severity-guide",
+      "version": 2
+    }
+  }
+}

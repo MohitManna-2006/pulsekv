@@ -1,0 +1,25 @@
+{
+  "id": "two-teams-one-policy",
+  "category": "positive_paraphrase",
+  "why": "The README's named case: two teams writing down one internal rule. Same obligation, opposite sentence order, different connective.",
+  "records": [
+    {
+      "context_id": "pull-request-required",
+      "version": 1,
+      "namespace": "acme",
+      "block_type": "org_policy",
+      "canonical_text": "Agents must open a pull request; direct pushes to the default branch are rejected."
+    }
+  ],
+  "query": {
+    "namespace": "acme",
+    "block_type": "org_policy",
+    "text": "Direct pushes to the default branch are rejected. Agents open a pull request instead."
+  },
+  "expect": {
+    "outcome": "matched",
+    "method": "semantic",
+    "context_id": "pull-request-required",
+    "version": 1
+  }
+}

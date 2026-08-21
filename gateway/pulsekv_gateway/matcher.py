@@ -1,4 +1,4 @@
-"""Tier orchestration -- Tiers 0/1 in Phase 10.2, 2/3 in Phase 10.3/10.4.
+"""Tier orchestration -- all four tiers (Phases 10.2, 10.3, 10.4).
 
 Design doc §11 (four tiers, cheapest and most deterministic first, each a
 strict filter before the next is attempted -- not parallel races); plan §6, §7,
@@ -50,6 +50,7 @@ from typing import Iterable, Optional, Sequence, Tuple
 
 from .auditlog import AuditLog
 from .encoder import Encoder, EncoderError
+from .guardrail import SIMILARITY_THRESHOLD, Guardrail
 from .index import VectorIndex
 from .models import (
     BypassReason,
@@ -57,8 +58,11 @@ from .models import (
     ContextBlock,
     DecisionLogRecord,
     GatewayComponent,
+    GuardOutcome,
+    GuardResult,
     MatchMethod,
     MatchResult,
+    RejectionReason,
 )
 from .normalizer import (
     StructuralNormalizationError,
@@ -69,7 +73,7 @@ from .normalizer import (
 )
 from .registry import Registry, RegistryError, content_hash_for
 
-__all__ = ["DEFAULT_TOP_K", "Matcher"]
+__all__ = ["DEFAULT_GUARD_TOP_N", "DEFAULT_TOP_K", "Matcher"]
 
 # How many candidates Tier 2 offers the guard. Design doc §11 settles the MVP at
 # "just the top-1, escalate only if Phase 10.4's evaluation corpus shows a real
@@ -77,13 +81,24 @@ __all__ = ["DEFAULT_TOP_K", "Matcher"]
 # to look. This is a retrieval width, never a threshold.
 DEFAULT_TOP_K = 5
 
+# How many of them the guard actually adjudicates. Design doc §11 sets the MVP
+# at "just the top-1, escalate only if Phase 10.4's evaluation corpus shows a
+# real need for more", and 10.4's corpus is what settled it: see the phase
+# summary's escalation section for the measurement. Raising this cannot lower
+# the bar -- every extra candidate must clear the same three checks and the
+# same τ, and it is ranked below the one before it -- but it does mean a
+# rejected top-1 no longer ends the block's chances.
+DEFAULT_GUARD_TOP_N = 1
+
 
 class Matcher:
     """Resolves one block to a ``MatchResult`` through tiers 0-3.
 
-    Phase 10.2 implements tiers 0 and 1. Tier 2 is where Phase 10.3 inserts
-    ``try_semantic``; see ``resolve`` for the exact seam and what a miss means
-    until then.
+    Complete as of Phase 10.4: Tier 0/1 in 10.2 (``try_exact``,
+    ``try_structural``), Tier 2 in 10.3 (``try_semantic``), Tier 3 in 10.4
+    (``try_guard``). Every tier is separately callable so a test can prove one
+    without standing up the others, and ``resolve`` is the only thing that
+    orders them.
 
     The registry handed in **must** have been constructed with
     ``hash_text=normalizer.hash_normalized`` (Phase 10.1 left that parameter
@@ -99,11 +114,27 @@ class Matcher:
         encoder: Optional[Encoder] = None,
         index: Optional[VectorIndex] = None,
         top_k: int = DEFAULT_TOP_K,
+        guardrail: Optional[Guardrail] = None,
+        similarity_threshold: float = SIMILARITY_THRESHOLD,
+        guard_top_n: int = DEFAULT_GUARD_TOP_N,
     ) -> None:
         """``encoder`` and ``index`` are optional and additive to Phase 10.2's
         signature: ``Matcher(registry)`` still builds a working deterministic
         matcher, and Tier 2 simply does not run. Supplying one without the
         other is refused rather than half-enabling the tier.
+
+        ``guardrail``, ``similarity_threshold`` and ``guard_top_n`` are Phase
+        10.4's additions and all three default to something usable, so no
+        existing call site changes. The guard is *not* optional in the way the
+        encoder is: a matcher with Tier 2 configured and no guard would be a
+        matcher that substitutes on similarity alone, which design doc §11
+        forbids outright -- so a default ``Guardrail()`` is constructed rather
+        than leaving the attribute None.
+
+        τ lives in ``guardrail.SIMILARITY_THRESHOLD`` rather than in
+        ``config.GatewayConfig``: config.py is Phase 10.5's file, and the
+        number belongs next to the checks whose coverage determines it. Phase
+        10.5 should surface it as a config field reading this default.
         """
         if (encoder is None) != (index is None):
             raise ValueError(
@@ -111,10 +142,23 @@ class Matcher:
                 "rank without the encoder that embeds the query, and an encoder "
                 "has nothing to rank against"
             )
+        if not 0.0 <= similarity_threshold <= 1.0:
+            raise ValueError(
+                f"similarity_threshold: {similarity_threshold} is outside [0, 1]; "
+                f"Candidate.similarity is a clamped cosine"
+            )
+        if guard_top_n < 1:
+            raise ValueError(
+                f"guard_top_n: {guard_top_n} would run Tier 2 and then consult "
+                f"none of it"
+            )
         self._registry = registry
         self._encoder = encoder
         self._index = index
         self._top_k = top_k
+        self._guardrail = guardrail if guardrail is not None else Guardrail()
+        self._similarity_threshold = similarity_threshold
+        self._guard_top_n = guard_top_n
 
     @property
     def semantic_enabled(self) -> bool:
@@ -138,11 +182,17 @@ class Matcher:
     ) -> Tuple[MatchResult, Tuple[Candidate, ...]]:
         """``resolve``, plus whatever Tier 2 retrieved on the way.
 
-        Added in Phase 10.3 and additive to Phase 10.2's surface. It exists
-        because ``MatchResult`` is frozen and has no state for "a candidate was
-        found but nothing has validated it yet" -- see the Tier 2 comment in
-        the body. **This is Phase 10.4's input seam:** the guard consumes the
-        returned candidates and turns the top one into a real ``MatchResult``.
+        Added in Phase 10.3 and additive to Phase 10.2's surface. It existed
+        because ``MatchResult`` had no state for "a candidate was found but
+        nothing has validated it yet" -- which stopped being a state in Phase
+        10.4: the guard now gives every retrieved candidate a verdict, so the
+        ``MatchResult`` this returns already accounts for them.
+
+        It stays because the candidates themselves are still worth seeing from
+        the outside -- what the guard refused, and at what similarity, is how
+        the corpus harness and any later diagnostic tell a rejection apart from
+        a retrieval that found nothing (design doc §18's
+        ``pulsekv_semantic_candidates_total``).
         """
         if not block.is_mvp_eligible:
             # Design doc §13's taxonomy, checked before any work is done. A
@@ -166,7 +216,7 @@ class Matcher:
             # an ordinary miss.
             return MatchResult.errored(GatewayComponent.REGISTRY), ()
 
-        # ---- Tier 2. Phase 10.4 inserts the guard immediately below. ----
+        # ---- Tier 2: candidates, never a decision (design doc §11). ----
         try:
             candidates = self.try_semantic(block, namespace)
         except EncoderError:
@@ -177,18 +227,10 @@ class Matcher:
             # docstring names the encoder here.
             return MatchResult.errored(GatewayComponent.ENCODER), ()
 
-        # A candidate is not a match, and Phase 10.3 has nothing that could
-        # make it one: design doc §11 says Tier 2 "produces candidates, never a
-        # decision", and the guard that earns an accept is Phase 10.4's.
-        #
-        # The candidates are returned rather than logged because the frozen
-        # contract has no state for them yet. DecisionLogRecord's validator
-        # refuses `similarity` on a NO_CANDIDATE outcome -- verified, not
-        # assumed: it raises "similarity: must be unset when
-        # outcome=no_candidate". That gap is real and closes by construction in
-        # 10.4, when a retrieved candidate becomes MATCHED or REJECTED, both of
-        # which carry similarity legally. See the phase summary §5.
-        return MatchResult.no_candidate(), candidates
+        # ---- Tier 3: the equivalence guard (design doc §12). ----
+        if not candidates:
+            return MatchResult.no_candidate(), ()
+        return self.try_guard(block, namespace, candidates), candidates
 
     def resolve_blocks(
         self,
@@ -333,6 +375,106 @@ class Matcher:
             block_type=block.block_type,
             top_k=self._top_k,
         )
+
+    def try_guard(
+        self,
+        block: ContextBlock,
+        namespace: str,
+        candidates: Sequence[Candidate],
+    ) -> MatchResult:
+        """Tier 3: turn Tier 2's candidates into a decision, reject-biased.
+
+        This is the only place in the pipeline that can produce
+        ``MatchMethod.SEMANTIC``. Everything else it can produce refuses, and
+        every refusal leads to the same place as a miss: the caller forwards
+        the block's original text unchanged (design doc §7.3, §12).
+
+        **The guard runs before τ, not after it.** Design doc §12 describes τ
+        as a gate the candidate clears *before* the guard sees it, and this
+        implementation deliberately inverts that order for reject-biased
+        reasons that only became visible with a real encoder:
+
+        * Phase 10.3 measured a meaning-inverting edit at 0.9933 against a
+          genuine paraphrase at 0.7989, and 10.4's corpus reproduced the
+          inversion at scale: genuine paraphrases span 0.8462-1.0000,
+          adversarial pairs 0.1333-1.0000, and 17 of the 24 scored adversarial
+          pairs sit at or above the *lowest* genuine paraphrase. A τ gate in
+          front of the guard would therefore *not* filter adversarial pairs
+          out; it would only decide which of them the guard never gets to
+          name.
+        * The verdict is identical either way. Below-τ is a reject and a guard
+          mismatch is a reject, and neither order can produce an accept the
+          other refuses -- an accept still requires both.
+        * What differs is the *reason recorded*. Running the guard first means
+          a negation pair is logged as ``negation_mismatch`` whatever it
+          scored, instead of a ``low_similarity`` that hides the reason the
+          candidate was actually dangerous. Risk register row 1's whole
+          detection story is the reject metric's reason label, so this is the
+          difference between an audit trail that can be read and one that
+          cannot.
+
+        The contract stays intact: a ``LOW_SIMILARITY`` rejection is still
+        recorded with ``guard_outcome`` unset, which ``models.py`` requires and
+        which is still true in substance -- the candidate was refused *by the τ
+        gate*, and the guard's opinion of it changed nothing.
+
+        Candidates are ranked by descending similarity, so the first one to
+        clear both the guard and τ wins and the rest are never examined.
+        """
+        first_refusal: Optional[MatchResult] = None
+
+        for candidate in candidates[: self._guard_top_n]:
+            verdict = self._guard(block, candidate, namespace)
+
+            if verdict.outcome is not GuardOutcome.PASSED:
+                refusal = MatchResult.rejected(
+                    reason=verdict.rejection_reason,
+                    context_id=candidate.record.context_id,
+                    version=candidate.record.version,
+                    confidence=candidate.similarity,
+                )
+                first_refusal = first_refusal or refusal
+                continue
+
+            if candidate.similarity < self._similarity_threshold:
+                # Ranked descending, so nothing below this can clear τ either.
+                # Recorded against this candidate because it is the one that
+                # was considered -- the strongest thing the namespace had.
+                return first_refusal or MatchResult.rejected(
+                    reason=RejectionReason.LOW_SIMILARITY,
+                    context_id=candidate.record.context_id,
+                    version=candidate.record.version,
+                    confidence=candidate.similarity,
+                )
+
+            return MatchResult.match(
+                method=MatchMethod.SEMANTIC,
+                context_id=candidate.record.context_id,
+                version=candidate.record.version,
+                confidence=candidate.similarity,
+            )
+
+        return first_refusal or MatchResult.no_candidate()
+
+    def _guard(
+        self, block: ContextBlock, candidate: Candidate, namespace: str
+    ) -> GuardResult:
+        """``Guardrail.check``, with the reject bias enforced from the outside.
+
+        ``Guardrail.check`` already converts its own failures into an ERROR
+        verdict. This wrapper exists because a *substituted* guard -- a
+        subclass, a test double, a Phase 10.5 wrapper -- has no such guarantee,
+        and design doc §17's "guard errors or times out -> treated as reject"
+        must not depend on the implementation being the one in this repository.
+        """
+        try:
+            return self._guardrail.check(block, candidate, namespace=namespace)
+        except BaseException as exc:  # noqa: BLE001 -- §12: any doubt is a reject
+            return GuardResult(
+                outcome=GuardOutcome.ERROR,
+                rejection_reason=RejectionReason.GUARD_ERROR,
+                detail=f"{type(exc).__name__}: {exc}",
+            )
 
     # -- helpers -----------------------------------------------------------
 

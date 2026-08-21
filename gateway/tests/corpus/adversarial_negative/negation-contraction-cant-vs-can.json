@@ -1,0 +1,25 @@
+{
+  "id": "negation-contraction-cant-vs-can",
+  "category": "adversarial_negative",
+  "why": "The negation lives inside a contraction. An implementation that enumerated 'not/never/without/except/excluding/unless' as literal tokens and stopped there would pass this.",
+  "records": [
+    {
+      "context_id": "friday-deploy-freeze",
+      "version": 1,
+      "namespace": "acme",
+      "block_type": "org_policy",
+      "canonical_text": "You can't deploy on Fridays."
+    }
+  ],
+  "query": {
+    "namespace": "acme",
+    "block_type": "org_policy",
+    "text": "You can deploy on Fridays."
+  },
+  "expect": {
+    "outcome": "rejected",
+    "rejection_reason": "negation_mismatch",
+    "context_id": "friday-deploy-freeze",
+    "version": 1
+  }
+}

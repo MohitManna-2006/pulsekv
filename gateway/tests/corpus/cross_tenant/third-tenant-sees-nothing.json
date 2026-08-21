@@ -1,0 +1,41 @@
+{
+  "id": "third-tenant-sees-nothing",
+  "category": "cross_tenant",
+  "why": "A namespace that registered nothing retrieves nothing, even though two other namespaces hold a record that would score near 1.0. Design doc §15's pre-filter is a partition: the bucket initech would have to read does not exist, so no comparison is performed rather than performed and discarded.",
+  "records": [
+    {
+      "context_id": "prod-deletion-ticket",
+      "version": 1,
+      "namespace": "acme",
+      "block_type": "org_policy",
+      "canonical_text": "Agents must never delete a resource in production without an approved change ticket."
+    },
+    {
+      "context_id": "prod-deletion-ticket",
+      "version": 1,
+      "namespace": "globex",
+      "block_type": "org_policy",
+      "canonical_text": "Agents must never delete a resource in production without an approved change ticket."
+    }
+  ],
+  "query": {
+    "namespace": "initech",
+    "block_type": "org_policy",
+    "text": "Agents must never delete a production resource without an approved change ticket."
+  },
+  "expect": {
+    "outcome": "no_candidate",
+    "never_retrieves": [
+      {
+        "namespace": "acme",
+        "context_id": "prod-deletion-ticket",
+        "version": 1
+      },
+      {
+        "namespace": "globex",
+        "context_id": "prod-deletion-ticket",
+        "version": 1
+      }
+    ]
+  }
+}

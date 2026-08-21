@@ -1,0 +1,25 @@
+{
+  "id": "entity-staging-vs-production",
+  "category": "adversarial_negative",
+  "why": "Design doc §12's own example. Two deployment tiers, one word apart, in prose that is otherwise identical.",
+  "records": [
+    {
+      "context_id": "migration-target",
+      "version": 1,
+      "namespace": "acme",
+      "block_type": "rag_document",
+      "canonical_text": "Run migrations against the staging database first."
+    }
+  ],
+  "query": {
+    "namespace": "acme",
+    "block_type": "rag_document",
+    "text": "Run migrations against the production database first."
+  },
+  "expect": {
+    "outcome": "rejected",
+    "rejection_reason": "entity_mismatch",
+    "context_id": "migration-target",
+    "version": 1
+  }
+}

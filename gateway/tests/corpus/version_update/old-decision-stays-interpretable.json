@@ -1,0 +1,44 @@
+{
+  "id": "old-decision-stays-interpretable",
+  "category": "version_update",
+  "why": "The audit trail's whole basis (design doc §10, §21): a decision logged against v1 has to keep meaning the same substituted text forever. The harness resolves a paraphrase against v1, keeps the decision record, then publishes v2 -- and re-reads the ORIGINAL record afterwards. v1's row must still exist, byte-identical, and the logged decision must still name v1. Publishing must not reach backwards. The text is deliberately distinct from positive_paraphrase/retention-90's, which states the same rule: the registry refuses two live records in one namespace with the same content hash, because Tier 0's exact-hash lookup has to resolve to exactly one record. Discovered by the whole-corpus run, which is the only test that registers every example at once.",
+  "records": [
+    {
+      "context_id": "audit-retention-policy",
+      "version": 1,
+      "namespace": "acme",
+      "block_type": "org_policy",
+      "canonical_text": "Audit logs are retained for 90 days and then archived to cold storage."
+    }
+  ],
+  "query": {
+    "namespace": "acme",
+    "block_type": "org_policy",
+    "text": "Audit logs are retained for 90 days, then archived to cold storage."
+  },
+  "expect": {
+    "outcome": "matched",
+    "method": "semantic",
+    "context_id": "audit-retention-policy",
+    "version": 1
+  },
+  "then": {
+    "publish": [
+      {
+        "context_id": "audit-retention-policy",
+        "version": 2,
+        "namespace": "acme",
+        "block_type": "org_policy",
+        "canonical_text": "Audit logs are retained for 90 days and then archived to cold storage. Archived logs are held for a further two years."
+      }
+    ],
+    "expect_previous_decision_unchanged": true,
+    "expect": {
+      "outcome": "matched",
+      "method": "semantic",
+      "context_id": "audit-retention-policy",
+      "version": 2
+    },
+    "why": "After the bump the same block resolves to v2, because the current-version pointer moved and the index is built from current versions. The v1 decision already taken is untouched by any of it, which is the property this example exists to prove.\n\nMEASURED LIMITATION, recorded rather than avoided: v2 adds a sentence v1 did not have ('Archived logs are held for a further two years'), and the guard accepts the substitution anyway. That sentence carries no polarity term and no extractable value -- 'two' is spelled out and 'years' is not in the value lexicon -- so neither of the two text checks has anything to compare. The guard compares polarity and entities, NOT content volume, and a canonical version that adds a clause carrying neither is accepted. Design doc §12's own superset-or-equal rule permits it explicitly; the guard's stricter equality rule does not close it either, because there is no entity on either side of the difference. Spelling-out numerals into the value lexicon would catch this instance and was rejected: it would refuse '90 days' against 'ninety days', which is one value written two ways. The audit trail keeps it traceable (design doc §21) and a content-volume check is the named follow-up. See the Phase 10.4 summary's limitations section."
+  }
+}

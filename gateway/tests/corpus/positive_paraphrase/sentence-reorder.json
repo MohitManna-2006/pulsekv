@@ -1,0 +1,25 @@
+{
+  "id": "sentence-reorder",
+  "category": "positive_paraphrase",
+  "why": "Two independent sentences swapped. No word changed -- but the hash did, so Tier 0 misses and this is a Tier 2/3 case, not a normalization case.",
+  "records": [
+    {
+      "context_id": "rag-answer-discipline",
+      "version": 1,
+      "namespace": "acme",
+      "block_type": "system_prompt",
+      "canonical_text": "Cite your sources. Answer only from the retrieved documents."
+    }
+  ],
+  "query": {
+    "namespace": "acme",
+    "block_type": "system_prompt",
+    "text": "Answer only from the retrieved documents. Cite your sources."
+  },
+  "expect": {
+    "outcome": "matched",
+    "method": "semantic",
+    "context_id": "rag-answer-discipline",
+    "version": 1
+  }
+}

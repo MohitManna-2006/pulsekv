@@ -1,0 +1,40 @@
+{
+  "id": "deprecated-version-stops-being-a-target",
+  "category": "version_update",
+  "why": "Design doc §17: a deprecated version stops being served as a match target. v1 and v2 carry the same meaning here, so v1 would be a perfectly good candidate on similarity alone -- it is excluded because it is deprecated, not because it stopped being close.",
+  "records": [
+    {
+      "context_id": "branch-protection-policy",
+      "version": 1,
+      "namespace": "acme",
+      "block_type": "org_policy",
+      "canonical_text": "Never force-push to a protected branch.",
+      "deprecated": true
+    },
+    {
+      "context_id": "branch-protection-policy",
+      "version": 2,
+      "namespace": "acme",
+      "block_type": "org_policy",
+      "canonical_text": "Never force-push to a protected branch."
+    }
+  ],
+  "query": {
+    "namespace": "acme",
+    "block_type": "org_policy",
+    "text": "Never force-push to any protected branch."
+  },
+  "expect": {
+    "outcome": "matched",
+    "method": "semantic",
+    "context_id": "branch-protection-policy",
+    "version": 2,
+    "never_retrieves": [
+      {
+        "namespace": "acme",
+        "context_id": "branch-protection-policy",
+        "version": 1
+      }
+    ]
+  }
+}

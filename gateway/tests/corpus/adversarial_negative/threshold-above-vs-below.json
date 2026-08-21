@@ -1,0 +1,25 @@
+{
+  "id": "threshold-above-vs-below",
+  "category": "adversarial_negative",
+  "why": "Plan §8's threshold inversion. The number is preserved, so the entity check sees nothing wrong; the direction of the comparison is the whole difference.",
+  "records": [
+    {
+      "context_id": "latency-alerting",
+      "version": 1,
+      "namespace": "acme",
+      "block_type": "org_policy",
+      "canonical_text": "Alert the on-call engineer when p99 latency is above 250 ms."
+    }
+  ],
+  "query": {
+    "namespace": "acme",
+    "block_type": "org_policy",
+    "text": "Alert the on-call engineer when p99 latency is below 250 ms."
+  },
+  "expect": {
+    "outcome": "rejected",
+    "rejection_reason": "negation_mismatch",
+    "context_id": "latency-alerting",
+    "version": 1
+  }
+}

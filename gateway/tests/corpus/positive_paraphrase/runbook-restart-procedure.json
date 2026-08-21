@@ -1,0 +1,25 @@
+{
+  "id": "runbook-restart-procedure",
+  "category": "positive_paraphrase",
+  "why": "A registered runbook paragraph restated as an instruction. RAG_DOCUMENT is eligible only when the document is registered (design doc §13), which this one is.",
+  "records": [
+    {
+      "context_id": "worker-pool-restart",
+      "version": 1,
+      "namespace": "acme",
+      "block_type": "rag_document",
+      "canonical_text": "Restart the worker pool by draining connections first, then rolling each node."
+    }
+  ],
+  "query": {
+    "namespace": "acme",
+    "block_type": "rag_document",
+    "text": "To restart the worker pool, drain connections first and then roll each node."
+  },
+  "expect": {
+    "outcome": "matched",
+    "method": "semantic",
+    "context_id": "worker-pool-restart",
+    "version": 1
+  }
+}

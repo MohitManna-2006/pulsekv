@@ -1,0 +1,25 @@
+{
+  "id": "tau-service-name-swap",
+  "category": "adversarial_negative",
+  "why": "A service name swap that the entity extractor misses on purpose: adding '-' to the identifier signal would make every hyphenated English word an entity and reject paraphrases like 'read-only'/'read only'. Measured at 0.7423, so tau refuses it -- recorded here so the limitation is a measured tradeoff rather than an unnoticed hole.",
+  "records": [
+    {
+      "context_id": "rollback-procedure",
+      "version": 1,
+      "namespace": "acme",
+      "block_type": "rag_document",
+      "canonical_text": "Roll back the payments-api service before paging the database owner."
+    }
+  ],
+  "query": {
+    "namespace": "acme",
+    "block_type": "rag_document",
+    "text": "Roll back the ledger-api service before paging the database owner."
+  },
+  "expect": {
+    "outcome": "rejected",
+    "rejection_reason": "low_similarity",
+    "context_id": "rollback-procedure",
+    "version": 1
+  }
+}

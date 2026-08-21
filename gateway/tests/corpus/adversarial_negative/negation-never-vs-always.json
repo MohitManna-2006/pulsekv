@@ -1,0 +1,31 @@
+{
+  "id": "negation-never-vs-always",
+  "category": "adversarial_negative",
+  "why": "Phase 10.3's measured pair, promoted into the corpus. The meaning-inverting edit scores HIGHER than every genuine paraphrase in positive_paraphrase/ but two, which is why negation cannot be a similarity tiebreaker.",
+  "records": [
+    {
+      "context_id": "careful-agent-deletion-rule",
+      "version": 1,
+      "namespace": "acme",
+      "block_type": "system_prompt",
+      "canonical_text": [
+        "You are a careful agent.",
+        "Never delete a production resource."
+      ]
+    }
+  ],
+  "query": {
+    "namespace": "acme",
+    "block_type": "system_prompt",
+    "text": [
+      "You are a careful agent.",
+      "Always delete a production resource."
+    ]
+  },
+  "expect": {
+    "outcome": "rejected",
+    "rejection_reason": "negation_mismatch",
+    "context_id": "careful-agent-deletion-rule",
+    "version": 1
+  }
+}

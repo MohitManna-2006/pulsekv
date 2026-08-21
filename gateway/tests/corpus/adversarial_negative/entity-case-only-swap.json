@@ -1,0 +1,25 @@
+{
+  "id": "entity-case-only-swap",
+  "category": "adversarial_negative",
+  "why": "The two texts differ in exactly one character's case, inside an environment value. The encoder's tokenizer is uncased, so the two blocks embed to BYTE-IDENTICAL vectors and score 1.0000 -- tied with a genuine paraphrase in positive_paraphrase/ at exactly the same number. No value of tau can refuse it without refusing that paraphrase too. It is also the evidence behind Phase 10.4's case-folding decision: if normalize_for_hash folded case, this pair would collide at Tier 0, where no guard runs at all.",
+  "records": [
+    {
+      "context_id": "deploy-profile",
+      "version": 1,
+      "namespace": "acme",
+      "block_type": "rag_document",
+      "canonical_text": "Set AWS_PROFILE=Production before running the deploy script."
+    }
+  ],
+  "query": {
+    "namespace": "acme",
+    "block_type": "rag_document",
+    "text": "Set AWS_PROFILE=production before running the deploy script."
+  },
+  "expect": {
+    "outcome": "rejected",
+    "rejection_reason": "entity_mismatch",
+    "context_id": "deploy-profile",
+    "version": 1
+  }
+}

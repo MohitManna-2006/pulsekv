@@ -1,0 +1,25 @@
+{
+  "id": "tau-team-swap",
+  "category": "adversarial_negative",
+  "why": "The escalation target changes. Both are lowercase common nouns.",
+  "records": [
+    {
+      "context_id": "incident-escalation-target",
+      "version": 1,
+      "namespace": "acme",
+      "block_type": "org_policy",
+      "canonical_text": "Escalate the incident to the security team."
+    }
+  ],
+  "query": {
+    "namespace": "acme",
+    "block_type": "org_policy",
+    "text": "Escalate the incident to the platform team."
+  },
+  "expect": {
+    "outcome": "rejected",
+    "rejection_reason": "low_similarity",
+    "context_id": "incident-escalation-target",
+    "version": 1
+  }
+}

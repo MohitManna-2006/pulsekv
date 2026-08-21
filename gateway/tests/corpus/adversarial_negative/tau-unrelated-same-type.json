@@ -1,0 +1,25 @@
+{
+  "id": "tau-unrelated-same-type",
+  "category": "adversarial_negative",
+  "why": "Two org policies with nothing to do with each other, in the same namespace and block type. Both are deliberately free of negation, comparison, permission and obligation terms and free of numbers, flags, identifiers, proper nouns and environment names -- so all three deterministic checks pass and the ONLY thing refusing this pair is tau. In a sparse registry this is what the nearest neighbour actually looks like, and refusing it is tau's whole job.",
+  "records": [
+    {
+      "context_id": "incident-escalation-policy",
+      "version": 1,
+      "namespace": "acme",
+      "block_type": "org_policy",
+      "canonical_text": "Escalate the incident to the on-call engineer."
+    }
+  ],
+  "query": {
+    "namespace": "acme",
+    "block_type": "org_policy",
+    "text": "Retain audit logs in the archive for ninety days."
+  },
+  "expect": {
+    "outcome": "rejected",
+    "rejection_reason": "low_similarity",
+    "context_id": "incident-escalation-policy",
+    "version": 1
+  }
+}
