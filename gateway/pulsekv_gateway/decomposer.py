@@ -60,8 +60,8 @@ __all__ = [
     "decompose",
 ]
 
-# See the module docstring: an extension point Phase 10.5 may replace, not a
-# frozen part of the wire format.
+# See the module docstring: Phase 10.5 retained this explicit extension point;
+# it is removed by neither classification nor assembly.
 BLOCK_TYPE_ANNOTATION = "x_pulsekv_block_type"
 
 _ROLE_DEFAULTS = {
@@ -94,10 +94,10 @@ def decompose(request: Mapping[str, Any]) -> Tuple[ContextBlock, ...]:
     assembler recovers a block's location by running the same decomposition,
     which is deterministic for a given request.
 
-    ``token_estimate`` is left unset. Phase 10.0's summary (§5.2) records that
-    design doc §19 states the bypass threshold in tokens while §22 rejects
-    gateway-side tokenization, and assigns the resolution of that tension to
-    Phase 10.5. This phase does not pre-empt it with a guess.
+    ``token_estimate`` is left unset here because decomposition is a
+    classification operation. Phase 10.5's server adds the coarse
+    performance-only estimate at the process boundary; it never changes the
+    block text or matching identity.
     """
     if not isinstance(request, Mapping):
         raise DecompositionError(

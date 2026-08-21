@@ -1,13 +1,12 @@
 """PulseKV Context Gateway.
 
-Phase 10.0 froze this package's contract types; everything else here is a
-signature-only stub. See ``models`` for the contract and
-``docs/pulsekv-semantic-context-phase10.0-summary.md`` for what was frozen and
-why.
+Phase 10.5 completes the standalone OpenAI-compatible reverse proxy around the
+contract, registry, deterministic tiers, semantic retrieval, and guardrail.
+See ``models`` for the frozen contract and the phase summaries in ``docs/``
+for the evidence behind each implemented layer.
 
 Only ``models`` is re-exported. Importing the contract deliberately does not
-pull in the stub modules, so a later phase adding a real dependency to (say)
-``encoder`` cannot make the contract itself unimportable.
+start the proxy or open its registry.
 """
 
 from __future__ import annotations

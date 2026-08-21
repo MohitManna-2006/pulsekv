@@ -24,10 +24,9 @@ which the gateway's own bookkeeping is allowed to break the traffic it is
 observing." So ``record`` swallows every sink failure -- but it *counts* them.
 A silent swallow would trade one blind spot for another; ``dropped`` and
 ``last_error`` make a broken sink visible to the operator without making it
-visible to the request. Phase 10.5 should surface ``dropped`` as
-``pulsekv_semantic_error_total{component="registry"}``'s sibling; §18 has no
-label for an audit-sink failure today, which is noted rather than invented
-here.
+visible to the request. Phase 10.5 surfaces ``dropped`` in ``/healthz``; §18
+has no Prometheus label for an audit-sink failure today, so the gateway does
+not invent one.
 """
 
 from __future__ import annotations

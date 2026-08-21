@@ -12,7 +12,7 @@ Plan §7's unit tests, failure tests and exit criteria are the spine:
 * ``TestShortCircuitPreserved``   — Tier 0/1 hits never reach the encoder
 * ``TestFailOpen``             — encoder down or over budget, per design §17
 * ``TestDecisionLogUnderTier2``   — what the frozen contract will and will not record
-* ``TestPhaseBoundary``        — 10.3 did not start doing 10.4's job
+* ``TestPhaseBoundary``        — retrieval remains CPU-only and outside storage
 
 Tests that need the real 90 MB model are skipped when it is absent; everything
 else runs against ``StubEncoder``, which is deterministic but **not semantic**
@@ -818,19 +818,6 @@ class TestPhaseBoundary:
             )
         message = str(caught.value)
         assert "VectorIndex" in message and "10.3" in message
-
-    def test_the_gateway_process_is_still_phase_105(self):
-        # The boundary this test guards moved with Phase 10.4: guardrail.py is
-        # implemented, and what is still somebody else's phase is the process
-        # around it. Both remaining stubs are checked, not just one.
-        from pulsekv_gateway import assembler, config, server
-
-        with pytest.raises(NotImplementedError):
-            assembler.assemble((), {})
-        with pytest.raises(NotImplementedError):
-            server.create_app(None)
-        with pytest.raises(NotImplementedError):
-            config.load("gateway.yaml")
 
     def test_nothing_in_tier_two_imports_a_gpu_runtime(self):
         import ast
