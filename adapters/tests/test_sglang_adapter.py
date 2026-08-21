@@ -96,11 +96,11 @@ class TestSGLangAdapterUnit(unittest.TestCase):
             "key_b.kv": b"data_b",
             "key_c.kv": b"data_c",
         }
-        res_set = self.storage.batch_set(kvs)
-        self.assertEqual(res_set, [True, True, True])
+        res_set = self.storage.batch_set(list(kvs), list(kvs.values()))
+        self.assertTrue(res_set)
 
         exists = self.storage.batch_exists(["key_a.kv", "key_b.kv", "key_c.kv", "key_missing.kv"])
-        self.assertEqual(exists, [True, True, True, False])
+        self.assertEqual(exists, 3)
 
         vals = self.storage.batch_get(["key_a.kv", "key_b.kv", "key_c.kv", "key_missing.kv"])
         self.assertEqual(vals, [b"data_a", b"data_b", b"data_c", None])
@@ -141,7 +141,7 @@ class TestSGLangAdapterLiveCluster(unittest.TestCase):
 
         # Batch exists check
         exists = self.storage.batch_exists(keys)
-        self.assertEqual(exists, [True, True, True])
+        self.assertEqual(exists, 3)
 
         # Batch v2 prefix hit
         v2_res = self.storage.batch_exists_v2(keys)
