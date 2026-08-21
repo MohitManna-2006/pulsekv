@@ -16,13 +16,11 @@ Organised by what is being proven, not by which class is under test:
 * ``TestTierProvenance``     — a Tier 0/1 hit cannot carry Tier 2/3 evidence
 * ``TestProblemsReportedTogether`` — the control/internal/config posture
 * ``TestPrivacyByShape``     — the audit record cannot hold prompt text
-* ``TestStubsAreStubs``      — Phase 10.0 shipped no behavior by accident
+* ``TestGatewayModuleBoundary`` — later runtime still honors the frozen contract
 """
 
 from __future__ import annotations
 
-import importlib
-import inspect
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -659,92 +657,22 @@ class TestPrivacyByShape:
         assert "text" not in MatchResult.model_fields
 
 
-class TestStubsAreStubs:
-    """Phase 10.0 produces no runtime behavior — asserted, not assumed."""
+class TestGatewayModuleBoundary:
+    """Phase 10.5 turns the last stubs into process behavior."""
 
-    # Modules leave this list as their phase implements them: `registry` in
-    # Phase 10.1, `normalizer`/`decomposer`/`matcher`/`auditlog` in Phase 10.2,
-    # `encoder`/`index` in Phase 10.3, and `guardrail` in Phase 10.4. The
-    # discipline moves with them rather than lapsing -- each phase's test file
-    # carries a TestPhaseBoundary asserting that what still belongs to a later
-    # phase keeps raising NotImplementedError, and that no later phase's
-    # dependency crept in early.
-    STUB_MODULES = [
-        "assembler",
-        "server",
-    ]
-
-    @pytest.mark.parametrize("name", STUB_MODULES + ["config"])
-    def test_module_imports_without_side_effects(self, name):
-        importlib.import_module(f"pulsekv_gateway.{name}")
-
-    @staticmethod
-    def _call_with_placeholders(func) -> None:
-        """Invoke ``func`` with a placeholder per parameter, however declared.
-
-        Keyword-only parameters (``registry.find_candidates``,
-        ``index.find_candidates``) cannot be filled positionally, so each
-        parameter is bound by its own kind rather than by count. Callers pass
-        *bound* methods, whose signatures already exclude ``self``.
-        """
-        parameters = list(inspect.signature(func).parameters.values())
-        args = [
-            None
-            for parameter in parameters
-            if parameter.kind
-            in (parameter.POSITIONAL_ONLY, parameter.POSITIONAL_OR_KEYWORD)
-        ]
-        kwargs = {
-            parameter.name: None
-            for parameter in parameters
-            if parameter.kind is parameter.KEYWORD_ONLY
-        }
-        func(*args, **kwargs)
-
-    @pytest.mark.parametrize("name", STUB_MODULES)
-    def test_every_callable_raises_not_implemented(self, name):
-        module = importlib.import_module(f"pulsekv_gateway.{name}")
-        checked = 0
-        for obj in vars(module).values():
-            if inspect.isfunction(obj) and obj.__module__ == module.__name__:
-                checked += 1
-                with pytest.raises(NotImplementedError):
-                    self._call_with_placeholders(obj)
-            elif inspect.isclass(obj) and obj.__module__ == module.__name__:
-                if issubclass(obj, Exception):
-                    continue
-                instance = obj()
-                for attr, member in vars(obj).items():
-                    if attr.startswith("_"):
-                        continue
-                    checked += 1
-                    with pytest.raises(NotImplementedError):
-                        if isinstance(member, property):
-                            getattr(instance, attr)
-                        else:
-                            self._call_with_placeholders(getattr(instance, attr))
-        assert checked, f"{name}: no callables were checked"
-
-    def test_config_declares_a_shape_but_implements_no_validation(self):
-        # config.py is the one non-models module with real field declarations
-        # (Phase 10.0's prompt asks for the shape), so it is checked separately
-        # from the pure stubs: the shape exists, the behavior does not.
-        from pulsekv_gateway.config import GatewayConfig, NamespaceSource, load
+    def test_config_shape_has_real_validation(self):
+        from pulsekv_gateway.config import GatewayConfig, NamespaceSource
 
         config = GatewayConfig(
             namespace_source=NamespaceSource.HEADER,
             namespace_header="x-pulsekv-namespace",
-            registry_dsn="postgresql://localhost/pulsekv_registry",
+            registry_dsn="sqlite:///tmp/pulsekv-registry.db",
             upstream_url="http://127.0.0.1:30000",
         )
         assert config.enabled is True
         assert config.bypass_min_eligible_tokens > 0  # placeholder, see config.py
-        with pytest.raises(NotImplementedError):
-            config.validate_config()
-        with pytest.raises(NotImplementedError):
-            config.warnings()
-        with pytest.raises(NotImplementedError):
-            load("gateway.yaml")
+        assert config.validate_config() == []
+        assert config.warnings()
 
     def test_nothing_imports_the_pulsekv_client_or_grpc(self):
         # Design doc §8 has the gateway importing PulseKVClient as an ordinary

@@ -131,10 +131,9 @@ class Matcher:
         forbids outright -- so a default ``Guardrail()`` is constructed rather
         than leaving the attribute None.
 
-        τ lives in ``guardrail.SIMILARITY_THRESHOLD`` rather than in
-        ``config.GatewayConfig``: config.py is Phase 10.5's file, and the
-        number belongs next to the checks whose coverage determines it. Phase
-        10.5 should surface it as a config field reading this default.
+        τ's earned default lives in ``guardrail.SIMILARITY_THRESHOLD`` next to
+        the checks whose coverage determines it. Phase 10.5 surfaces it as a
+        config field that reads this value as its default.
         """
         if (encoder is None) != (index is None):
             raise ValueError(

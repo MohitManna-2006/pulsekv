@@ -42,9 +42,9 @@ class -- not a rewrite of how records are shaped.
 
 Concurrency and durability
 --------------------------
-Phase 10.5 runs the gateway as multiple worker processes, so this module is
-built for concurrent readers and writers now, before any process exists to
-exercise it:
+Gateway deployments may run multiple process instances, so this module is
+built for concurrent readers and writers even though the Phase 10.5 console
+entry point deliberately starts one Uvicorn worker per process:
 
 * **WAL mode** (``PRAGMA journal_mode=WAL``, set once and persistent in the
   file). Readers do not block the writer and the writer does not block

@@ -17,18 +17,14 @@ classifiers = [
     "Topic :: System :: Distributed Computing",
 ]
 
-# Phase 10.0 declares exactly one runtime dependency, and the hard scope
-# boundary in this phase's prompt is the reason: no embedding runtime, no
-# vector index, no web framework, no database driver. Each of those is a real
-# decision that a later phase makes against real data —
+# Phase 10.0 began with one runtime dependency and deferred every substantial
+# runtime choice to the phase that could test it. Those choices are now:
 #
 #   embedding model / vector index  -> Phase 10.3 (plan §7) -- DECIDED, below
 #   relational store                -> Phase 10.1 (plan §5) -- SQLite, stdlib
-#   ASGI framework                  -> Phase 10.5 (plan §9) -- still open
+#   ASGI framework                  -> Phase 10.5 (plan §9) -- Starlette
 #
-# Phase 10.3 is the one phase that was always going to add dependencies: Tier 2
-# needs a model to run and something to run it in. The three below are the
-# whole of it, and each is load-bearing:
+# Phase 10.3 added the three load-bearing embedding dependencies:
 #
 #   onnxruntime  CPU inference for all-MiniLM-L6-v2. Plan §1 fixes CPU-only, so
 #                the MVP needs no GPU the rest of v2 does not have either. The
@@ -40,6 +36,13 @@ classifiers = [
 #                whole bucket. Measured during Phase 10.3: a per-record Python
 #                loop costs ~80 ms at 5,000 records against ~4.9 ms vectorized.
 #                onnxruntime requires numpy anyway; this makes the use explicit.
+#
+# Phase 10.5 adds the smallest complete process stack:
+#
+#   starlette    the ASGI request/streaming-response surface.
+#   httpx        bounded-timeout upstream forwarding and response streaming.
+#   uvicorn      the production ASGI process runner and console entry point.
+#   PyYAML       strict operator configuration loading (JSON remains valid YAML).
 #
 # The 90 MB weights are deliberately NOT a dependency and are not vendored --
 # see gateway/README.md for the fetch command. `OnnxEncoder` raises a typed
@@ -58,12 +61,18 @@ dependencies = [
     "numpy==2.5.2",
     "onnxruntime==1.29.0",
     "tokenizers==0.23.1",
+    "starlette==0.48.0",
+    "httpx==0.28.1",
+    "uvicorn==0.35.0",
+    "PyYAML==6.0.3",
 ]
 
+[project.scripts]
+pulsekv-gateway = "pulsekv_gateway.server:main"
+
 [project.optional-dependencies]
-# Test framework only. Phase 10.0's tests exercise the frozen types; nothing
-# here needs a fixture library, a property-based tester, or a benchmark
-# harness yet.
+# Test framework only. HTTP integration tests use Starlette/HTTPX's built-in
+# transports, so no extra fixture server or network test dependency is needed.
 dev = [
     "pytest==9.1.1",
 ]

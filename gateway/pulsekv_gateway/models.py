@@ -1,10 +1,9 @@
 """Frozen contract types for the PulseKV Context Gateway (Phase 10.0).
 
-This module is the whole of Phase 10.0's runtime output. Every other module in
-``pulsekv_gateway`` is a signature-only stub whose bodies raise
-``NotImplementedError``; the types here are what those stubs are typed against,
-and what Phases 10.1-10.9 build to. It plays the role v2's Phase 0 played for
-the gRPC contract: freeze the shape first so later phases do not diverge.
+This module was the whole of Phase 10.0's runtime output. The implemented
+registry, matcher, guard, and Phase 10.5 proxy still type themselves against
+this frozen contract. It plays the role v2's Phase 0 played for the gRPC
+contract: freeze the shape first so later phases do not diverge.
 
 Design references, cited per type below:
 
@@ -45,7 +44,8 @@ extend that to the cross-field rules.
 
 **What this module deliberately does not do:** compute a hash, encode an
 embedding, talk to a registry, or import anything from ``pulsekv_adapters``.
-Phase 10.0 produces no runtime behavior.
+That boundary remains true for this contract module even though the surrounding
+package now has runtime behavior.
 """
 
 from __future__ import annotations

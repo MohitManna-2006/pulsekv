@@ -4,6 +4,12 @@ Distributed, tiered KV cache store for LLM serving engines with SGLang HiCache a
 
 > **PulseKV v2 Status: Phase 9 (Complete — Final Milestone)** — Production-ready distributed KV-cache for LLM inference serving. Features a 3-replica Raft consensus control plane in Go, C data nodes with RAM/NVMe tiering & zero-copy bulk transport, SGLang HiCache and vLLM KVConnector v1 adapters (100% verified cross-replica hits), Prometheus exporter (179 metrics), Zipf load generator, and long-duration chaos soak harness.
 
+> **Semantic Context Gateway: Phase 10.5 complete** — A standalone,
+> OpenAI-compatible fail-open reverse proxy now performs safe canonical-context
+> substitution before inference tokenization. See
+> [`gateway/README.md`](gateway/README.md) and the
+> [Phase 10.5 evidence](docs/pulsekv-semantic-context-phase10.5-summary.md).
+
 ---
 
 ## Quickstart (PulseKV v2 Commands)

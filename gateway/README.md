@@ -13,15 +13,14 @@ they produce, so identical text in means identical cache keys out, through
 completely unmodified adapter code
 (`docs/pulsekv-semantic-context-design.md` §6, Finding 2).
 
-## Status: Phase 10.4 — all four tiers, no gateway process
+## Status: Phase 10.5 — working fail-open ingress gateway
 
-`Matcher.resolve(block, namespace) -> MatchResult` is complete. A block that
-misses the deterministic tiers is embedded, ranked within its namespace, and
-then put to the equivalence guard, which either accepts it as a
-`MATCHED(method=semantic)` substitution or refuses it — and a refusal forwards
-the original text unchanged, the same fallback every other tier has. There is
-still no process around it: `assembler.py`, `server.py` and `config.py`'s
-validation are signature-only stubs whose bodies raise `NotImplementedError`.
+The package is now an OpenAI-compatible reverse proxy. It accepts
+`POST /v1/chat/completions`, decomposes eligible blocks, runs the complete
+four-tier matcher, substitutes accepted canonical text in the original
+position, and streams the downstream response. A miss, rejection, timeout,
+unsafe assembly, or registry/encoder/guard failure forwards the original
+request body byte-for-byte.
 
 | Module | Phase | What it becomes |
 |---|---|---|
@@ -30,7 +29,42 @@ validation are signature-only stubs whose bodies raise `NotImplementedError`.
 | `normalizer.py`, `decomposer.py`, `matcher.py`, `auditlog.py` | **10.2 (done)** | Tier 0/1 and the decision log |
 | `encoder.py`, `index.py` | **10.3 (done)** | Tier 2 candidate retrieval (MiniLM-L6-v2, ONNX CPU) |
 | `guardrail.py` | **10.4 (done)** | Tier 3 equivalence guard, τ = 0.90, and the corpus that earned it |
-| `server.py`, `assembler.py`, `config.py` | 10.5 | The actual proxy process |
+| `server.py`, `assembler.py`, `config.py` | **10.5 (done)** | Strict config, order-preserving assembly, and the proxy process |
+
+### Running the gateway
+
+Install it and copy the documented configuration:
+
+```bash
+python -m venv .venv
+.venv/bin/pip install -e './gateway[dev]'
+cp gateway/gateway.example.yaml /tmp/pulsekv-gateway.yaml
+.venv/bin/pulsekv-gateway --config /tmp/pulsekv-gateway.yaml
+```
+
+The example uses a trusted `x-pulsekv-namespace` header. Static,
+API-key-to-namespace, and exact-route-to-namespace modes are also validated
+config shapes. Namespace input comes only from deployment/authentication
+state, never from prompt text. The trusted namespace header is removed before
+forwarding; inference authorization and unrelated headers are retained.
+
+```bash
+curl http://127.0.0.1:8088/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -H 'x-pulsekv-namespace: acme' \
+  -d '{"model":"local-model","messages":[{"role":"system","content":"registered alias or paraphrase"},{"role":"user","content":"hello"}]}'
+```
+
+`GET /healthz` reports process and semantic-tier state without configuration
+secrets. `GET /readyz` verifies that the registry remains readable. The
+gateway chooses design option E (inline reverse proxy); applications or the
+load balancer must retain `upstream_url` as a direct fallback route. That
+route is intentionally independent of this process, because no in-process
+fail-open handler can help when the process itself is unreachable.
+
+The default eligible-token bypass uses a coarse character-count estimate only
+to avoid work; it never participates in identity or acceptance. The 512-token
+default and timeout budgets remain explicitly provisional until Phase 10.8.
 
 ### The two deterministic tiers
 
@@ -88,10 +122,10 @@ done
 export PULSEKV_GATEWAY_MODEL_DIR="$DIR"
 ```
 
-Without them, `OnnxEncoder` raises a typed error naming this command, Tier 2
-does not run, and Tiers 0/1 keep working — which is design doc §17's fail-open
-behavior, not a degraded mode. The Tier 2 tests skip themselves when the
-weights are absent.
+Set the fetched directory as `model_dir` in the gateway YAML. Without it,
+Tier 2 does not run and Tiers 0/1 keep working. If a configured encoder cannot
+load or times out, the same fail-open behavior applies. The Tier 2 tests use
+`PULSEKV_GATEWAY_MODEL_DIR` and skip themselves when the weights are absent.
 
 ## The invariant everything else serves
 
@@ -104,7 +138,8 @@ tier, guard, timeout and error path in this package is biased toward the first
 
 ```
 gateway/
-├── pyproject.toml          # pydantic + pytest, nothing else yet
+├── pyproject.toml          # pinned runtime and test dependencies
+├── gateway.example.yaml    # complete operator-facing example
 ├── pulsekv_gateway/        # the package
 │   └── migrations/         # the registry's schema, applied on open
 └── tests/
@@ -113,6 +148,7 @@ gateway/
     ├── test_deterministic_tiers.py  # tier 0/1 and the decision log
     ├── test_semantic_retrieval.py   # tier 2: encoder, index, retrieval seam
     ├── test_guardrail.py            # tier 3: the guard, and the corpus run
+    ├── test_gateway.py              # config, assembly, proxy, failure paths
     ├── corpus_loader.py             # turns a corpus file into a live matcher
     └── corpus/             # 44 evaluation examples, four categories
 ```
@@ -143,3 +179,4 @@ python -m venv .venv && .venv/bin/pip install -e './gateway[dev]'
 - `docs/pulsekv-semantic-context-phase10.2-summary.md` — the deterministic tiers
 - `docs/pulsekv-semantic-context-phase10.3-summary.md` — Tier 2, and its real latency
 - `docs/pulsekv-semantic-context-phase10.4-summary.md` — Tier 3, τ, and the corpus
+- `docs/pulsekv-semantic-context-phase10.5-summary.md` — proxy, failure evidence, and `T_gateway`

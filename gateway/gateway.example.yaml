@@ -1,0 +1,30 @@
+# PulseKV semantic context gateway — Phase 10.5 example.
+# Applications send OpenAI-compatible requests to listen_host:listen_port.
+# Keep upstream_url separately routable so an LB/client can bypass this process
+# if it is down; fail-open inside a process cannot repair process unavailability.
+enabled: true
+listen_host: 127.0.0.1
+listen_port: 8088
+
+upstream_url: http://127.0.0.1:30000
+registry_dsn: sqlite:///var/lib/pulsekv-gateway/registry.db
+model_dir: /var/lib/pulsekv-gateway/models/all-MiniLM-L6-v2
+audit_log_path: /var/log/pulsekv-gateway/decisions.jsonl
+
+# This header must be set by a trusted authentication/routing layer. The
+# gateway removes it before forwarding to the inference server.
+namespace_source: header
+namespace_header: x-pulsekv-namespace
+
+# The 512-token bypass default and budgets are placeholders until Phase 10.8
+# measures production traffic. They are explicit here so operators see them.
+bypass_min_eligible_tokens: 512
+registry_timeout_ms: 50
+encoder_timeout_ms: 100
+guard_timeout_ms: 50
+request_timeout_ms: 120000
+max_request_bytes: 16777216
+
+similarity_threshold: 0.90
+top_k: 5
+guard_top_n: 1
