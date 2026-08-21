@@ -1,19 +1,32 @@
 # PulseKV Context Gateway
 
-A new, standalone component: the ingress point where a request's reusable
-context blocks are replaced with agreed canonical text **before** the text
-reaches an inference engine's tokenizer, so two differently-worded blocks that
-mean the same thing produce byte-identical tokens and hit PulseKV's existing
-exact-match cache.
+A new, standalone component: the ingress point where eligible, registered
+context blocks whose match is accepted may be replaced with the same canonical
+text **before** that text reaches an inference engine's tokenizer. Identical
+canonical text then lets the downstream engine's normal tokenization and
+hashing produce the same exact-cache identity. That identity makes reuse
+possible when a corresponding cache entry exists; canonicalization alone does
+not guarantee that an entry has already been stored.
 
-Nothing in `node/`, `control/`, `proto/`, or `adapters/` changes for this to
-work. That is the design's central claim, and it rests on one verified fact:
+Nothing in `node/`, `control/`, or `proto/` changes for this to work. The
+semantic responsibility also stays out of `adapters/`: it rests on one
+verified fact:
 SGLang's and vLLM's own tokenizers already derive block hashes from the tokens
 they produce, so identical text in means identical cache keys out, through
-completely unmodified adapter code
+unchanged key semantics. Real SGLang 0.5.15 integration did require mechanical
+adapter API compatibility maintenance, but introduced no semantic awareness
+into that adapter
 (`docs/pulsekv-semantic-context-design.md` §6, Finding 2).
 
-## Status: Phase 10.5 — working fail-open ingress gateway
+## Status: Phase 10.6 — real SGLang integration complete
+
+Phase 10.6 connected the Phase 10.5 gateway to two real SGLang 0.5.15 serving
+processes and correlated canonical outbound text with concrete PulseKV writes
+and successful reads from an independent replica. The SGLang adapter needed a
+narrow compatibility repair for the real upstream HiCache contract; the
+gateway placement, fail-open behavior and PulseKV key/storage semantics did
+not change. See the
+[post-hoc Phase 10.6 reconstruction](../docs/pulsekv-semantic-context-phase10.6-summary.md).
 
 The package is now an OpenAI-compatible reverse proxy. It accepts
 `POST /v1/chat/completions`, decomposes eligible blocks, runs the complete
@@ -180,3 +193,5 @@ python -m venv .venv && .venv/bin/pip install -e './gateway[dev]'
 - `docs/pulsekv-semantic-context-phase10.3-summary.md` — Tier 2, and its real latency
 - `docs/pulsekv-semantic-context-phase10.4-summary.md` — Tier 3, τ, and the corpus
 - `docs/pulsekv-semantic-context-phase10.5-summary.md` — proxy, failure evidence, and `T_gateway`
+- `docs/pulsekv-semantic-context-phase10.6-summary.md` — post-hoc reconstruction of real SGLang compatibility and cross-replica evidence
+- `docs/pulsekv-semantic-context-progress.md` — current phase status and next dependency

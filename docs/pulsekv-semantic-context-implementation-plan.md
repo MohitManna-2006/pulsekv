@@ -1,6 +1,9 @@
 # PulseKV v3 / Phase 10 — Semantic Context Canonicalization: Implementation Plan
 
-**Status:** implementation plan, not yet started. Companion to
+**Status:** historical implementation plan. Phases 10.0–10.6 are implemented
+and merged; Phase 10.7 is next and not started. Original scope statements are
+retained below and annotated where as-built evidence superseded a hypothesis.
+Companion to
 `pulsekv-semantic-context-design.md` (what/why) — this document is how it
 gets built, phase by phase, at the granularity needed to actually execute it,
 in the same spirit as `pulsekv-v2-implementation-plan.md`. Does not modify
@@ -506,6 +509,17 @@ instead of a stub.
 
 ## 10. Phase 10.6 — SGLang real-model integration
 
+> **As-built outcome (added after Phase 10.6):** Phase 10.6 completed in
+> `f8da035` and merged through PR #3 (`c61118f`). Real SGLang 0.5.15
+> compatibility disproved the strict unchanged-adapter hypothesis below. A
+> narrowly scoped repair to `pulsekv_adapters.sglang` was required for the
+> upstream dynamic HiCache factory, v1/v2 batch/pool and tensor-transfer
+> contracts. Semantic canonicalization remained entirely upstream in the
+> gateway; `node/`, `control/`, `proto/`, adapter key semantics and the vLLM
+> adapter were unchanged. The original boundary is preserved below as the
+> plan that was tested, not presented as the as-built result. See the
+> post-hoc `pulsekv-semantic-context-phase10.6-summary.md` reconstruction.
+
 **Objective:** prove the gateway's canonical text produces the claimed
 exact-cache behavior against a real SGLang server and the real,
 **unmodified** `pulsekv_adapters.sglang`/`key.py` — this is where design
@@ -522,7 +536,8 @@ a `deploy/demo-semantic-sglang.sh` mirroring the shape of
 `deploy/demo-cross-replica-sglang.sh` but with two *differently-worded*
 requests instead of the identical prefix Phase 7's demo used.
 
-**Hard scope boundary, explicit:** no changes to `node/engine/`,
+**Original hard scope boundary, explicit (superseded for the SGLang adapter
+compatibility surface by the as-built note above):** no changes to `node/engine/`,
 `node/grpc_shim/`, `control/`, `proto/`, or any file under
 `adapters/pulsekv_adapters/` — the entire point of this phase is that none
 of those need to change. If SGLang integration seems to require a change to
@@ -553,8 +568,15 @@ scheduler/worker interface, per-layer.
 **Dependencies:** Phase 10.6 (de-risks the gateway-to-real-engine pattern
 first, same sequencing logic v2's own Phase 7→8 used).
 
-**Hard scope boundary:** identical to 10.6's, plus explicitly: no changes to
-`pulsekv_adapters.vllm`/`vllm_key.py`.
+**Desired initial compatibility hypothesis:** semantic responsibility remains
+outside the adapter, and `pulsekv_adapters.vllm`/`vllm_key.py` should remain
+unchanged if they already satisfy the selected real upstream contract. Phase
+10.7 must first perform a read-only compatibility audit against an explicitly
+selected and pinned real vLLM version; this plan does not choose that version.
+If the API does not match, the phase must name and review the compatibility
+gap before making any adapter change. No compatibility repair may move
+canonicalization into the adapter or change PulseKV key semantics. Core
+`node/`, `control/` and `proto/` boundaries remain protected.
 
 **Exit criteria/documentation:** same shape as 10.6, against vLLM.
 

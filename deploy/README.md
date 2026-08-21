@@ -51,6 +51,36 @@ deploy/chaos-test.sh --target node-2 --cycles 3 --seed 7
 deploy/stop-local-cluster.sh
 ```
 
+## Phase 10.6 real semantic SGLang proof
+
+`deploy/demo-semantic-sglang.sh` is the checked-in Phase 10.6 end-to-end proof.
+It is designed for the project's GPU evidence environment, not the ordinary
+CPU-only quickstart. The script validates SGLang 0.5.15 and a visible CUDA GPU,
+pins `Qwen/Qwen2.5-1.5B-Instruct` to Hugging Face revision
+`989aa7980e4cf806f80c7fef2b1adb7bc71aa306`, starts the PulseKV dev cluster,
+two independent SGLang processes and two gateway processes, and sends two
+surface-different registered-equivalent system prompts.
+
+The proof captures both outbound gateway bodies and records adapter operations
+per replica. It requires canonical text/token equality, successful reads from
+Replica B, and a non-empty exact intersection between Replica A's written keys
+and Replica B's successful read keys before reporting success. It does **not**
+infer a cache hit from latency.
+
+This is stronger than the older Phase 7 cross-replica demo for the semantic
+claim: Phase 7 established the adapter/storage path using an identical prefix,
+whereas Phase 10.6 adds two real gateway paths and proves that different raw
+variants converge before the independent engine processes reuse exact keys.
+The script sets the dynamic backend's `prefetch_threshold` to `1` and uses
+`wait_complete` so the external read path is exercised; these are proof
+settings, not Phase 10.8-tuned production defaults.
+
+See the
+[post-hoc Phase 10.6 reconstruction](../docs/pulsekv-semantic-context-phase10.6-summary.md)
+for the evidence chain, scope and remaining unknowns. The required SGLang and
+gateway virtual environments, model cache, GPU and ordinary cluster build
+prerequisites must already exist; this script does not install them.
+
 One-shot, CI shape:
 
 ```sh

@@ -1,15 +1,23 @@
 # PulseKV v3 / Phase 10 — Semantic Context Canonicalization: System Design
 
-**Status:** architectural investigation, not yet implemented. Companion to
+**Status:** architectural design, implemented through Phase 10.6. The
+gateway-before-tokenization architecture remains current; annotations below
+distinguish its durable semantic boundary from the SGLang API compatibility
+maintenance discovered during Phase 10.6. Companion to
 `pulsekv-v2-distributed-design.md` (what v2 is) and this document's sibling,
-`pulsekv-semantic-context-implementation-plan.md` (how it gets built). Does not
-modify v1 or v2. v2's data plane, control plane, adapters, and proto contract
-remain exactly as documented in Phases 0–9.
+`pulsekv-semantic-context-implementation-plan.md` (how it gets built). v1
+remains untouched. In v2, storage/data-plane semantics, control-plane behavior,
+protobuf contracts and exact key semantics remain unchanged, and semantic
+responsibilities remain outside the adapters. Engine adapter API surfaces may
+receive narrowly scoped mechanical compatibility maintenance when a pinned
+real upstream contract proves it necessary, as SGLang 0.5.15 did in Phase
+10.6; this does not make those adapters semantic-aware.
 
 **Supersedes, with corrections:** `docs/pulsekv-v2-semantic-canonicalization-report.md`
 (Aug 18, 2026). That report reached the same top-level architectural
 conclusion this document reaches — an ingress gateway producing canonical
-*text*, not tokens, feeding unmodified SGLang/vLLM — and that conclusion is
+*text*, not tokens, feeding semantically unaware SGLang/vLLM adapters — and
+that conclusion is
 reaffirmed here against the current source, not just against the design docs
 it was written from. But it also states a number of specific latencies,
 thresholds, and a break-even table (§7, §11 of that report) as measured fact
@@ -73,10 +81,11 @@ that produces false positives (§8 below).
 
 - Increase exact PulseKV cache-hit rate for long, structurally reusable
   prompt blocks, without weakening the exact-match invariant v2 is built on.
-- Keep `node/engine/`, `node/grpc_shim/`, `control/`, `proto/`, and the
-  existing `adapters/pulsekv_adapters/{client,key,sglang,vllm,vllm_key}.py`
-  modules **unmodified**. See the companion codebase impact map for the
-  directory-by-directory classification this claim rests on.
+- Keep `node/engine/`, `node/grpc_shim/`, `control/`, `proto/`, adapter key
+  semantics and all semantic responsibilities unmodified. Engine-specific
+  adapter surfaces may receive mechanical compatibility maintenance when a
+  pinned real upstream API proves it necessary; Phase 10.6's SGLang 0.5.15
+  repair is the first such exception. See the companion codebase impact map.
 - Make the feature optional and fail-open: SGLang, vLLM, and PulseKV must
   each work exactly as they do today with the gateway absent, disabled, or
   down.
@@ -137,13 +146,21 @@ produces, chained SHA-256 over 4-byte big-endian token bytes. Neither module
 is reachable from outside the adapter call path; neither takes canonicalization
 metadata as input today. If a gateway hands SGLang or vLLM byte-identical
 canonical text for two originally-different requests, the engines' own
-existing tokenization and hashing — completely unmodified — produces
+existing tokenization and hashing — with unchanged identity semantics — produces
 byte-identical block hashes, and `PulseKVHiCacheStorage`/`PulseKVKVConnector`
 resolve to the same PulseKV key with **zero new PulseKV-side logic**. This
 directly answers investigation question 4 (§38.4 of the master prompt): yes,
 canonical text automatically produces the exact existing cache identity,
 verified against the real key-derivation code, not asserted from the design
 doc.
+
+> **Phase 10.6 as-built annotation:** the key-identity conclusion above held,
+> but the stronger source-file-freeze assumption did not. Real SGLang 0.5.15
+> required a mechanical `pulsekv_adapters.sglang` compatibility repair for its
+> HiCache storage API. No canonicalization, registry or semantic decision
+> moved into the adapter, and `key.py` remained unchanged. For future engines,
+> “no adapter change” is a compatibility hypothesis; “no semantic awareness or
+> key-semantic change in the adapter” is the architectural invariant.
 
 **Finding 3 — the control plane's readiness-gate pattern is the right
 precedent for a registry, but the registry does not belong inside it.**
@@ -208,12 +225,11 @@ Application / API client
 +-----------------------------------------------------------+
         |
         v
-SGLang / vLLM  (UNCHANGED -- no code, no config beyond a normal
-                 reverse-proxy front-end, points at the gateway
-                 instead of directly at the app)
+SGLang / vLLM  (SEMANTICALLY UNAWARE; engine adapters may need
+                 mechanical upstream-API compatibility maintenance)
         |
         v  (block-hash keyed get/exist/set, via
-        |   pulsekv_adapters.sglang / .vllm -- UNCHANGED)
+        |   pulsekv_adapters.sglang / .vllm -- exact key semantics)
         v
 PulseKV v2 cluster (UNCHANGED -- node/engine, node/grpc_shim,
                      control/, proto/ all exactly as built)
@@ -226,8 +242,8 @@ dispatches through) — not a patch to SGLang, vLLM, or anything in
 gateway's own registry-lookup path only for the exact-hash tier (§10's Tier
 0), not for anything resembling the inference request itself; the gateway
 never calls `NodeService` for KV tensor data and never constructs a block
-hash — that stays exclusively the job of the unmodified SGLang/vLLM
-adapters, downstream of the gateway, per Finding 2.
+hash — that stays exclusively the job of the SGLang/vLLM adapters,
+downstream of the gateway, with unchanged identity semantics per Finding 2.
 
 ## 9. Component boundary evaluation
 
@@ -240,7 +256,7 @@ report:
 | **B. `control/` (Go)** | Reject | `control/internal/metadata/service.go` and the v2 design doc are explicit: Raft is reserved for low-volume cluster metadata, off the data write path. A registry read on every gateway request is not that. Gossip/Raft libraries have no vector-search primitive and adding one couples cluster liveness to an unrelated subsystem. |
 | **C. `adapters/pulsekv_adapters/` (existing modules)** | Reject | Confirmed by reading `sglang.py`/`vllm.py`: SGLang's `RadixCache`/HiCache and vLLM's `BlockManager` construct block hashes from *already-tokenized* prompts before calling into the adapter. Canonicalizing inside the adapter would need to un-tokenize, rewrite, and re-tokenize after the engine has already committed to a token sequence and block layout — strictly harder and strictly later than doing it before the engine ever sees the text. |
 | **D. Client SDK (a new SDK layer)** | Reject | Forces every calling application to embed an embedding model and vector index locally, and is incompatible with the common case of an application built against a standard OpenAI-compatible client that has no PulseKV awareness at all. |
-| **E. Ingress gateway (new component)** | **Accept** | Sits exactly at the one point in the request path where the full, structured, pre-tokenization prompt is visible and mutable, and where SGLang/vLLM/PulseKV are all still standard, unmodified deployments on the other side. This is also where the prior report landed (§3 of that report) — reaffirmed here against source, not merely against design docs. |
+| **E. Ingress gateway (new component)** | **Accept** | Sits exactly at the one point in the request path where the full, structured, pre-tokenization prompt is visible and mutable, while SGLang/vLLM/PulseKV remain semantically unaware exact-cache consumers on the other side. Engine adapters may still need mechanical compatibility maintenance for pinned upstream APIs. This is also where the prior report landed (§3 of that report) — reaffirmed here against source, not merely against design docs. |
 | **F. Separate always-on service called by applications directly (not inline proxy)** | Partially folded into E | A viable deployment shape for the same logic (§8's gateway as a sidecar/library call rather than a network hop) — not a different architectural answer, a different packaging of E. Left as a Phase 10.5 deployment decision, not a boundary decision. |
 | **G. Hybrid gateway + registry** | **Accept, refines E** | The registry (§17) is intentionally a separate component from the gateway process's request-handling code, for the durability reason given there — but it is not a different *boundary*, it is a dependency the gateway calls, same relationship the gateway has to PulseKV itself. |
 

@@ -1,82 +1,108 @@
-# `adapters/` — Python LLM serving adapters
+# `adapters/` — Python LLM serving integrations
 
-Layer 2 of PulseKV v2: the thing that lets a real inference engine attach to
-the cluster and get prefix-cache hits across replicas instead of recomputing
-attention state per request.
+Layer 2 of PulseKV v2 connects real inference-engine external-cache APIs to
+the distributed PulseKV client. The adapters store and retrieve opaque KV
+payloads; they do not decide semantic equivalence. Phase 10's canonicalization
+happens in the separate gateway before the engine tokenizes a request.
 
-Python is not a preference here — vLLM and SGLang expose their external-cache
-interfaces as Python classes, so an adapter has to be one.
+## Current components
 
-## Phase 0 status
-
-A package skeleton and a health-check gRPC client. **No cache logic.** That is
-the entire scope, on purpose: Phases 1–6 have to exist before an adapter has
-anything to adapt to.
-
-```
-adapters/
-├── pyproject.toml
-└── pulsekv_adapters/
-    ├── __init__.py
-    ├── health_client.py      # the only working code in Phase 0
-    └── gen/                  # generated stubs, checked in
-```
-
-## Install and run
-
-```sh
-pip install ./adapters
-pulsekv-health --address 127.0.0.1:7000
-```
-
-or, without installing:
-
-```sh
-PYTHONPATH=adapters python -m pulsekv_adapters.health_client --address 127.0.0.1:7000
-```
-
-`deploy/smoke-test.sh` runs this against the live dev cluster as its Python leg.
-
-## The `AdapterService` substitution
-
-Phase 0's exit criteria ask for a client that calls
-`AdapterService.HealthCheck`. Nothing implements `AdapterService` yet — it is
-the surface Phase 7's adapter will call *into*, and its server side is Phase 7
-work. So:
-
-- `check_adapter_service()` exists, is correct, and uses the generated
-  `AdapterService` stubs. Against a Phase 0 cluster it returns `ok=False` with
-  `UNIMPLEMENTED`, which is the honest result.
-- `check_cluster_metadata()` — calling `ClusterMetadataService.HealthCheck` on
-  the Go control plane — is what actually proves Python↔Go gRPC works, and is
-  what the smoke test asserts on.
-
-`check_node()` is thrown in as well, because proving Python↔C++ costs three
-extra lines and covers the other language boundary.
-
-## What lands later
-
-| Module | Interface | Phase |
+| Module | Current role | Evidence boundary |
 |---|---|---|
-| `pulsekv_adapters.sglang` | SGLang HiCache external backend: `get` / `exist` / `set` | 7 |
-| `pulsekv_adapters.vllm` | vLLM KVConnector v1: `get_num_new_matched_tokens`, `save_kv_layer`, `request_finished` | 8 |
+| `pulsekv_adapters.client` | Generic topology-aware Python client for control-plane discovery and unary/chunked/bulk data-node operations | Shared by engine adapters; not LLM-semantic |
+| `pulsekv_adapters.key` | SGLang token/block key helpers | Exact identity only |
+| `pulsekv_adapters.sglang` | SGLang HiCache external-storage backend | Phase 7 integration, mechanically updated in Phase 10.6 for the real SGLang 0.5.15 contract |
+| `pulsekv_adapters.vllm` | vLLM KVConnector v1 scheduler/worker integration | Implemented in Phase 8; no Phase 10.7 real-version proof yet |
+| `pulsekv_adapters.vllm_key` | Model/layer-aware vLLM key derivation | Exact identity only; Phase 10.7 compatibility remains unverified |
+| `pulsekv_adapters.health_client` | Minimal generated-client health wrapper | Compatibility utility |
 
-SGLang comes first because its interface is three methods; vLLM's splits across
-scheduler-side and worker-side hooks invoked per transformer layer and needs the
-Phase 6 bulk transport rather than the gRPC control path.
+Python is required here because SGLang and vLLM expose their external-cache
+interfaces as Python contracts. PulseKV's C storage engine and Go control plane
+remain independent of those engine-specific APIs.
 
-Both stay thin. `adapter.proto` was shaped to match HiCache's own backend
-interface precisely so the Phase 7 adapter is a pass-through and not an
-impedance-matching layer — routing belongs to the Go control plane and storage
-belongs to the C data plane.
+## Generic PulseKV client
 
-## Regenerating the stubs
+`PulseKVClient` discovers the shard map through one or more control-plane
+addresses, routes a key to its primary/replicas, and selects unary, chunked or
+bulk transport by payload size. Its public values are `str`/`bytes`; it has no
+prompt, tokenizer, model or semantic-matching responsibility.
 
-`pulsekv_adapters/gen/` is checked in so `pip install ./adapters` works without
-`protoc` on the machine. Regenerate inside the v2 dev image, never by hand:
+The checked-in protobuf stubs under `pulsekv_adapters/gen/` bind this client to
+the existing control/data-plane RPC contracts. Do not hand-edit them.
 
-```sh
-docker run --rm -v "$PWD:/src" -w /src pulsekv-v2-dev deploy/gen-proto.sh
+## SGLang HiCache
+
+`PulseKVHiCacheStorage` implements the external storage operations used by
+SGLang HiCache. Phase 10.6 tested the real dynamic backend contract against
+SGLang **0.5.15**, including:
+
+- dynamic-factory construction and real base-class inheritance;
+- v1 and v2 batch existence/get/set paths;
+- pool transfers and hit policies;
+- opaque-key and legacy method compatibility;
+- CPU/CUDA target tensor copies with size validation;
+- optional JSONL tracing that cannot break storage when its sink fails;
+- fallback operation when SGLang is not installed.
+
+This was a mechanical upstream-API compatibility repair. Semantic matching
+still happens in `gateway/`; the adapter receives engine-generated keys and
+opaque KV data.
+
+The real Phase 10.6 proof is reconstructed in
+[`docs/pulsekv-semantic-context-phase10.6-summary.md`](../docs/pulsekv-semantic-context-phase10.6-summary.md).
+
+## vLLM KVConnector
+
+`PulseKVKVConnector` carries the Phase 8 scheduler/worker split: scheduler-side
+prefix matching, per-layer worker save/load, request lifecycle handling and
+model/layer namespacing through `vllm_key.py`.
+
+Those unit and integration surfaces are present, but **Phase 10.7 has not
+started**. The repository does not yet contain a real, pinned current-vLLM
+semantic gateway proof. Phase 10.7 must begin with a read-only compatibility
+audit before treating `vllm.py`/`vllm_key.py` as compatible or proposing a
+mechanical repair.
+
+## Test surfaces
+
+`adapters/tests/` currently covers:
+
+- `test_client.py`: key-to-shard hashing, topology fingerprinting and optional
+  live-cluster unary, miss, chunked-blob and prefix-match operations;
+- `test_key_alignment.py`: token-byte encoding, reference and chained hashes,
+  shared-prefix key equality and formatted SGLang cache keys;
+- `test_sglang_adapter.py`: basic get/exist/set behavior, batch operations,
+  longest-prefix existence and optional live storage operations;
+- `test_sglang_integration.py`: backend registration, tensor page round trips
+  and a simulated hierarchical radix-cache lifecycle;
+- `test_sglang_0515_contract.py`: pinned SGLang 0.5.15 factory, v1/v2,
+  pool-policy, tensor, generated-protobuf import, no-SGLang fallback and
+  trace/trace-failure behavior;
+- `test_vllm_adapter.py`: scheduler prefix matching, request lifecycle,
+  worker layer save/load, model namespace isolation and optional live storage;
+- `test_vllm_integration.py`: connector registration, multi-layer tensor
+  round trips and simulated scheduler/worker coordination;
+- `test_vllm_key.py`: token bytes, reference/chained block hashes, key
+  formatting/parsing and per-layer key derivation.
+
+Some tests are synthetic or use fakes and prove local contract behavior.
+Tests gated on a live PulseKV cluster prove the RPC/storage path when that
+cluster is supplied. The Phase 10.6 demo goes further for SGLang by launching
+real serving processes and correlating cross-process write/read keys. No
+equivalent Phase 10.7 vLLM result exists yet.
+
+Run the adapter suite from the repository root with the existing Make target:
+
+```bash
+make test-adapter
 ```
 
-See `proto/README.md` for why the generated imports get rewritten afterwards.
+Live-cluster tests use `PULSEKV_CONTROL_PLANE_ADDRESS` when available and skip
+otherwise.
+
+## Regenerating protobuf stubs
+
+The generated Python protobuf code is checked in so the package imports from a
+fresh clone. Regenerate it through the repository's existing deployment/codegen
+workflow after an intentional `proto/` change; do not edit generated files by
+hand.
