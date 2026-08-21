@@ -1,0 +1,36 @@
+{
+  "id": "type-mismatch-schema-vs-policy",
+  "category": "adversarial_negative",
+  "why": "A block classified TOOL_SCHEMA against a candidate registered ORG_POLICY. Tier 2 partitions by (namespace, block_type), so retrieval cannot produce this pair at all -- which is exactly why the check exists as defense in depth, and why this example is handed to Guardrail.check directly. The harness asserts BOTH halves: that retrieval never surfaces it, and that the guard would refuse it if retrieval ever did.",
+  "records": [
+    {
+      "context_id": "deletion-policy-prose",
+      "version": 1,
+      "namespace": "acme",
+      "block_type": "org_policy",
+      "canonical_text": "Deleting a resource requires approval."
+    }
+  ],
+  "query": {
+    "namespace": "acme",
+    "block_type": "tool_schema",
+    "text": "{\"name\":\"delete_resource\",\"parameters\":{\"approval\":\"required\"}}"
+  },
+  "expect": {
+    "outcome": "no_candidate",
+    "never_retrieves": [
+      {
+        "namespace": "acme",
+        "context_id": "deletion-policy-prose",
+        "version": 1
+      }
+    ]
+  },
+  "guard_direct": {
+    "namespace": "acme",
+    "context_id": "deletion-policy-prose",
+    "version": 1,
+    "similarity": 1.0,
+    "expect_rejection_reason": "type_mismatch"
+  }
+}

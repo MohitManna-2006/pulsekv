@@ -1,0 +1,25 @@
+{
+  "id": "tau-role-swap-approver",
+  "category": "adversarial_negative",
+  "why": "The approver in a policy changes from one lowercase job title to another. No negation, no number, no flag, no proper noun, no environment name -- nothing any deterministic extractor in this guard recognises. At 0.8187 it is the highest-scoring pair the checks cannot refuse, and it is therefore the pair that sets tau.",
+  "records": [
+    {
+      "context_id": "deploy-approver",
+      "version": 1,
+      "namespace": "acme",
+      "block_type": "org_policy",
+      "canonical_text": "Only the release manager may approve a deploy."
+    }
+  ],
+  "query": {
+    "namespace": "acme",
+    "block_type": "org_policy",
+    "text": "Only the on-call engineer may approve a deploy."
+  },
+  "expect": {
+    "outcome": "rejected",
+    "rejection_reason": "low_similarity",
+    "context_id": "deploy-approver",
+    "version": 1
+  }
+}

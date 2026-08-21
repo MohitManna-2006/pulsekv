@@ -1,0 +1,25 @@
+{
+  "id": "entity-added-production",
+  "category": "adversarial_negative",
+  "why": "The registered text covers two environments and the incoming block covers one. Design doc §12 states the rule as superset-or-equal -- the candidate's entities must contain the block's -- and this pair satisfies that rule while being a false positive: substituting the registered text would extend a deletion instruction to production. The guard compares for EQUALITY instead, and this example is the reason.",
+  "records": [
+    {
+      "context_id": "unused-resource-cleanup",
+      "version": 1,
+      "namespace": "acme",
+      "block_type": "agent_instruction",
+      "canonical_text": "Delete unused resources in staging and production."
+    }
+  ],
+  "query": {
+    "namespace": "acme",
+    "block_type": "agent_instruction",
+    "text": "Delete unused resources in staging."
+  },
+  "expect": {
+    "outcome": "rejected",
+    "rejection_reason": "entity_mismatch",
+    "context_id": "unused-resource-cleanup",
+    "version": 1
+  }
+}

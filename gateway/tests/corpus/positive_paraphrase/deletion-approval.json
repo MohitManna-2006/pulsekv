@@ -1,0 +1,27 @@
+{
+  "id": "deletion-approval",
+  "category": "positive_paraphrase",
+  "why": "A maintainer reworded one org policy between deploys: the obligation verb moved from 'require' to 'obtain'. Same rule, same entity, different sentence shape. MEASURED OUTCOME: refused, and the corpus records it rather than hiding it. 'require' is in the guard's REQUIRE polarity family and 'obtain' is in none, so the multisets differ. The same family is what refuses adversarial_negative/polarity-required-vs-optional at 0.9574 -- a pair the entity check cannot see, since both sides say 'production'. Dropping REQUIRE would buy this match and cost that refusal, and design doc §4's tiebreaker settles which way that trade goes.",
+  "records": [
+    {
+      "context_id": "prod-deletion-approval",
+      "version": 1,
+      "namespace": "acme",
+      "block_type": "org_policy",
+      "canonical_text": "All deletions of production resources require written approval from the on-call engineer before they are executed."
+    }
+  ],
+  "query": {
+    "namespace": "acme",
+    "block_type": "org_policy",
+    "text": "Before deleting any production resource, obtain written approval from the on-call engineer."
+  },
+  "expect": {
+    "outcome": "matched",
+    "method": "semantic",
+    "context_id": "prod-deletion-approval",
+    "version": 1
+  },
+  "guard_verdict": "rejected",
+  "guard_rejection_reason": "negation_mismatch"
+}

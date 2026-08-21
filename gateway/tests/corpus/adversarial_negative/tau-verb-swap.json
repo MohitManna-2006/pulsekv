@@ -1,0 +1,25 @@
+{
+  "id": "tau-verb-swap",
+  "category": "adversarial_negative",
+  "why": "Same object, different operation. The guard has nothing to compare; the distance between 'summarize' and 'translate' is the whole signal.",
+  "records": [
+    {
+      "context_id": "document-handling",
+      "version": 1,
+      "namespace": "acme",
+      "block_type": "agent_instruction",
+      "canonical_text": "Summarize the retrieved documents for the user."
+    }
+  ],
+  "query": {
+    "namespace": "acme",
+    "block_type": "agent_instruction",
+    "text": "Translate the retrieved documents for the user."
+  },
+  "expect": {
+    "outcome": "rejected",
+    "rejection_reason": "low_similarity",
+    "context_id": "document-handling",
+    "version": 1
+  }
+}

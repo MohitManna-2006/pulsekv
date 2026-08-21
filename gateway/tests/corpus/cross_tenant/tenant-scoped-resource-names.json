@@ -1,0 +1,47 @@
+{
+  "id": "tenant-scoped-resource-names",
+  "category": "cross_tenant",
+  "why": "The near-identical case rather than the identical one: each tenant's policy names its own environment. If namespace were a post-hoc filter, globex's record would be a live candidate for acme's request -- and the entity check would then be the only thing between it and a substitution. The harness asserts both: that globex's record is never retrieved, AND that the guard refuses it when handed it directly. Two independent layers, tested separately, because design doc §15 says the first one is structural and risk register row 3 says a future edit is what would undo it.",
+  "records": [
+    {
+      "context_id": "env-deletion-rule",
+      "version": 1,
+      "namespace": "acme",
+      "block_type": "org_policy",
+      "canonical_text": "Never delete a resource in acme-prod without an approved change ticket."
+    },
+    {
+      "context_id": "env-deletion-rule",
+      "version": 1,
+      "namespace": "globex",
+      "block_type": "org_policy",
+      "canonical_text": "Never delete a resource in globex-prod without an approved change ticket."
+    }
+  ],
+  "query": {
+    "namespace": "acme",
+    "block_type": "org_policy",
+    "text": "Without an approved change ticket, never delete a resource in acme-prod."
+  },
+  "expect": {
+    "outcome": "matched",
+    "method": "semantic",
+    "context_id": "env-deletion-rule",
+    "version": 1,
+    "namespace": "acme",
+    "never_retrieves": [
+      {
+        "namespace": "globex",
+        "context_id": "env-deletion-rule",
+        "version": 1
+      }
+    ]
+  },
+  "guard_direct": {
+    "namespace": "globex",
+    "context_id": "env-deletion-rule",
+    "version": 1,
+    "similarity": 1.0,
+    "expect_rejection_reason": "guard_error"
+  }
+}

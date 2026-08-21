@@ -1,0 +1,25 @@
+{
+  "id": "exception-unless-added",
+  "category": "adversarial_negative",
+  "why": "An exception clause appears in the incoming block and not in the registered text. Substituting here would silently delete the carve-out.",
+  "records": [
+    {
+      "context_id": "stale-branch-cleanup",
+      "version": 1,
+      "namespace": "acme",
+      "block_type": "agent_instruction",
+      "canonical_text": "Delete stale branches."
+    }
+  ],
+  "query": {
+    "namespace": "acme",
+    "block_type": "agent_instruction",
+    "text": "Delete stale branches unless they are protected."
+  },
+  "expect": {
+    "outcome": "rejected",
+    "rejection_reason": "negation_mismatch",
+    "context_id": "stale-branch-cleanup",
+    "version": 1
+  }
+}

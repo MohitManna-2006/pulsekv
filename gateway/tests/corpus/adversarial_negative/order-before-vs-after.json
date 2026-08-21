@@ -1,0 +1,25 @@
+{
+  "id": "order-before-vs-after",
+  "category": "adversarial_negative",
+  "why": "Plan §8's named 'before/after' failure mode. Every token but one is shared, and the one that differs reverses the procedure.",
+  "records": [
+    {
+      "context_id": "migration-ordering",
+      "version": 1,
+      "namespace": "acme",
+      "block_type": "rag_document",
+      "canonical_text": "Run database migrations before restarting the API servers."
+    }
+  ],
+  "query": {
+    "namespace": "acme",
+    "block_type": "rag_document",
+    "text": "Run database migrations after restarting the API servers."
+  },
+  "expect": {
+    "outcome": "rejected",
+    "rejection_reason": "negation_mismatch",
+    "context_id": "migration-ordering",
+    "version": 1
+  }
+}

@@ -13,15 +13,15 @@ they produce, so identical text in means identical cache keys out, through
 completely unmodified adapter code
 (`docs/pulsekv-semantic-context-design.md` §6, Finding 2).
 
-## Status: Phase 10.3 — deterministic matching, plus semantic retrieval
+## Status: Phase 10.4 — all four tiers, no gateway process
 
-Blocks that are byte-identical after incidental-rendering cleanup, or that are
-the same tool schema serialized differently, resolve to a registered canonical
-context with no embedding involved. On a miss, Tier 2 now embeds the block and
-retrieves the nearest registered contexts within its namespace — as
-**candidates only**. Nothing turns a candidate into a substitution yet; that is
-Phase 10.4's guard. `guardrail.py`, `assembler.py` and `server.py` are still
-signature-only stubs whose bodies raise `NotImplementedError`.
+`Matcher.resolve(block, namespace) -> MatchResult` is complete. A block that
+misses the deterministic tiers is embedded, ranked within its namespace, and
+then put to the equivalence guard, which either accepts it as a
+`MATCHED(method=semantic)` substitution or refuses it — and a refusal forwards
+the original text unchanged, the same fallback every other tier has. There is
+still no process around it: `assembler.py`, `server.py` and `config.py`'s
+validation are signature-only stubs whose bodies raise `NotImplementedError`.
 
 | Module | Phase | What it becomes |
 |---|---|---|
@@ -29,7 +29,7 @@ signature-only stubs whose bodies raise `NotImplementedError`.
 | `registry.py` | **10.1 (done)** | Durable, versioned, namespace-scoped storage (SQLite, WAL) |
 | `normalizer.py`, `decomposer.py`, `matcher.py`, `auditlog.py` | **10.2 (done)** | Tier 0/1 and the decision log |
 | `encoder.py`, `index.py` | **10.3 (done)** | Tier 2 candidate retrieval (MiniLM-L6-v2, ONNX CPU) |
-| `guardrail.py` | 10.4 | Tier 3 equivalence guard, and the τ threshold it earns |
+| `guardrail.py` | **10.4 (done)** | Tier 3 equivalence guard, τ = 0.90, and the corpus that earned it |
 | `server.py`, `assembler.py`, `config.py` | 10.5 | The actual proxy process |
 
 ### The two deterministic tiers
@@ -53,6 +53,26 @@ Tier 2 embeds that same normalized text and ranks registered contexts by cosine
 similarity, partitioned by `(namespace, block_type)` so a cross-tenant
 comparison is never performed rather than filtered away. It applies no
 threshold and reaches no verdict.
+
+### Tier 3, and what similarity is actually for
+
+The guard runs three deterministic checks over the **full text** of the block
+and of the candidate — never the embedded prefix, because the encoder stops
+reading at 512 tokens and the blocks this feature targets are longer than that
+by construction. Block type first, then polarity (negation, exception, order,
+comparison, permission and obligation terms, compared as a multiset of
+families), then entities (numbers, flags, identifiers, environment names,
+proper nouns, compared as a case-sensitive set). Any mismatch, any error, any
+timeout is a reject; there is no reduced-confidence accept.
+
+Only a candidate the guard has passed is compared against τ = 0.90. That order
+is deliberate. Measured across the 38 pairs in `tests/corpus/`, genuine
+paraphrases span 0.8462–1.0000 and adversarial pairs 0.1333–1.0000 — and 17 of
+the 24 scored adversarial pairs sit at or above the *lowest* genuine
+paraphrase. Three pairs score exactly 1.0000 with byte-identical vectors: two
+adversarial and one a real paraphrase. **No value of τ separates meaning from
+its opposite.** The deterministic checks do that; τ only refuses a candidate
+that is the nearest neighbour of nothing in particular.
 
 ### Running Tier 2
 
@@ -92,7 +112,9 @@ gateway/
     ├── test_registry.py             # storage tests
     ├── test_deterministic_tiers.py  # tier 0/1 and the decision log
     ├── test_semantic_retrieval.py   # tier 2: encoder, index, retrieval seam
-    └── corpus/             # evaluation corpus, populated in Phase 10.4
+    ├── test_guardrail.py            # tier 3: the guard, and the corpus run
+    ├── corpus_loader.py             # turns a corpus file into a live matcher
+    └── corpus/             # 44 evaluation examples, four categories
 ```
 
 The registry keeps its records in an ordinary SQLite file — no service to run
@@ -120,3 +142,4 @@ python -m venv .venv && .venv/bin/pip install -e './gateway[dev]'
 - `docs/pulsekv-semantic-context-phase10.1-summary.md` — the registry, as built
 - `docs/pulsekv-semantic-context-phase10.2-summary.md` — the deterministic tiers
 - `docs/pulsekv-semantic-context-phase10.3-summary.md` — Tier 2, and its real latency
+- `docs/pulsekv-semantic-context-phase10.4-summary.md` — Tier 3, τ, and the corpus

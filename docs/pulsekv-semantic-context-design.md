@@ -367,39 +367,57 @@ comparison table (§7):**
 The hardest correctness problem in this design, and the one the master
 prompt is most insistent about (§11, §24, §26).
 
+**Status: implemented and measured (Phase 10.4, `gateway/pulsekv_gateway/
+guardrail.py`).** The three checks below and the τ value are no longer
+hypothetical — see `docs/pulsekv-semantic-context-phase10.4-summary.md` for
+full methodology. Two departures from the original text of this section are
+kept, both driven by corpus evidence rather than by preference, and both
+recorded where they happened:
+
 **What the guard checks**, run only against a Tier 2 candidate that already
-cleared a similarity threshold (τ — see below for why this document does not
-assert a number):
+cleared τ = 0.90 (derivation below) — as built, type is checked first
+(cheapest, most decisive), then polarity, then entities, the latter two
+sharing one tokenization pass:
 
-1. **Negation/polarity.** Deterministic token-level check for negation and
-   exception markers (`not`, `never`, `without`, `except`, `excluding`,
-   `unless`, and their common contractions) present in one text and absent in
-   the other, or vice versa. A mismatch here is an automatic reject,
-   independent of similarity score — this check runs *before* similarity is
-   even consulted for the accept/reject decision, not as a tiebreaker.
-2. **Entity/value preservation.** Extracted numbers, identifiers, and
-   proper-noun-like tokens (namespaces, environment names, resource names,
-   command flags) in the candidate's `canonical_text` must be a superset-or-
-   equal set of what's semantically load-bearing in the incoming block. A
-   `staging`/`production` or `--force`/`--dry-run` mismatch is exactly the
-   deterministic-string-comparison problem the master prompt's failure-mode
-   list (§8.1 / §11) describes, and it does not need a neural check — it
-   needs a set-difference on extracted literals.
-3. **Structural-type consistency.** A block classified as `TOOL_SCHEMA` never
-   matches a candidate registered as `ORG_POLICY`, independent of embedding
-   similarity — block type is part of the retrieval key (§11 Tier 2), not
-   just a tag checked after the fact.
+1. **Negation/polarity.** Deterministic check for negation and exception
+   markers (`not`, `never`, `without`, `except`, `excluding`, `unless`, and
+   contractions — matched by the `n't`/`n't` suffix rule, not a fixed list,
+   so it also covers terms not yet written into any list) plus families
+   extending §12's original six to reach failure modes named elsewhere in
+   the master prompt (before/after, above/below threshold, allow/deny,
+   required/optional). **As built, this compares family *counts*
+   (multiset), not presence/absence as this section originally specified.**
+   The corpus contains a pair where both texts contain "Never" and only the
+   count differs — a second prohibition added to one clause — which a
+   presence-only comparison passes and a multiset comparison correctly
+   refuses. This check runs before similarity is consulted at all, so a
+   negation mismatch is logged as `negation_mismatch`, never as a
+   `low_similarity` rejection that would hide why the pair was dangerous.
+2. **Entity/value preservation.** **As built, this requires set equality,
+   not the superset-or-equal rule this section originally specified.** The
+   corpus contains the case that makes the difference concrete: "Delete
+   unused resources in staging" against a registered "…in staging and
+   production" satisfies superset-or-equal (the candidate's entities are a
+   superset of the incoming block's) and would silently extend a
+   staging-scoped deletion to production. Equality closes that; it costs
+   nothing the corpus has found a legitimate use for yet.
+3. **Structural-type consistency.** As specified — confirmed redundant with
+   Tier 2's own namespace/type-scoped retrieval, and kept anyway as a direct
+   guard-level guarantee rather than relying on Tier 2 alone.
 
-**On the similarity threshold τ:** the prior report asserted τ ≥ 0.96 as
-fact. No evaluation corpus exists yet to justify any specific number, and
-asserting one here would repeat exactly the mistake this document exists to
-correct (master prompt §40). What can be stated: the threshold must be
-*tuned against Phase 10.4's adversarial-negative corpus specifically*, not
-picked from general embedding-similarity folklore, because the corpus in
-§13's testing strategy is deliberately built from *high-similarity, opposite-
-meaning* pairs (negation, entity-swap) — exactly the pairs a naive cosine
-cutoff is worst at separating. τ is a Phase 10.4 deliverable, not a Phase
-10.0 assumption.
+**τ = 0.90, derived from the adversarial suite, not asserted.** The
+corpus's 25 adversarial-negative examples: 19 are refused by the polarity or
+entity check with no similarity score even consulted; the remaining six are
+the "guard-blind" class the checks above don't catch by construction, topping
+out at 0.8187 similarity. τ = 0.83 would also produce zero false positives on
+this corpus and matches one more positive example (12/13 vs. 9/13) — deliberately
+not chosen, because fitting a threshold 0.011 above the highest member of a
+six-example class fits that class's examples, not the class it's drawn from.
+τ cannot do the safety work alone regardless of where it's set: positive
+similarity spans 0.8462–1.0000, adversarial spans 0.1333–1.0000, and 17 of 24
+adversarial pairs outrank the lowest genuine paraphrase — this is the
+concrete evidence, not a general embedding-similarity caveat, for why §11
+treats Tier 2 as candidate retrieval only and never as a decision.
 
 **Failure bias.** Every check in this section is a reject-biased gate: any
 signal of doubt (negation mismatch, entity mismatch, type mismatch, guard

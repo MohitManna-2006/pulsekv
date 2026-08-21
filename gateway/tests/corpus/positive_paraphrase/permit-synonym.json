@@ -1,0 +1,25 @@
+{
+  "id": "permit-synonym",
+  "category": "positive_paraphrase",
+  "why": "'allowed' against 'permitted'. The polarity check compares families, not surface forms, so a synonym inside one family costs nothing -- while 'allowed' against 'denied' crosses a boundary and is refused. That pair is in adversarial_negative/polarity-allow-vs-deny.",
+  "records": [
+    {
+      "context_id": "readonly-query-policy",
+      "version": 1,
+      "namespace": "acme",
+      "block_type": "tool_policy",
+      "canonical_text": "Read-only queries are allowed without prior approval."
+    }
+  ],
+  "query": {
+    "namespace": "acme",
+    "block_type": "tool_policy",
+    "text": "Read-only queries are permitted without prior approval."
+  },
+  "expect": {
+    "outcome": "matched",
+    "method": "semantic",
+    "context_id": "readonly-query-policy",
+    "version": 1
+  }
+}

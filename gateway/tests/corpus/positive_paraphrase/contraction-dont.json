@@ -1,0 +1,25 @@
+{
+  "id": "contraction-dont",
+  "category": "positive_paraphrase",
+  "why": "'Do not' against 'Don't'. Design doc §12 asks the negation check to handle 'common contractions'; this is the pair that proves it does not reject one.",
+  "records": [
+    {
+      "context_id": "no-direct-push",
+      "version": 1,
+      "namespace": "acme",
+      "block_type": "agent_instruction",
+      "canonical_text": "Do not push directly to main; open a pull request instead."
+    }
+  ],
+  "query": {
+    "namespace": "acme",
+    "block_type": "agent_instruction",
+    "text": "Don't push directly to main; open a pull request instead."
+  },
+  "expect": {
+    "outcome": "matched",
+    "method": "semantic",
+    "context_id": "no-direct-push",
+    "version": 1
+  }
+}

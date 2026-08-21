@@ -1,0 +1,25 @@
+{
+  "id": "entity-flag-dryrun-vs-force",
+  "category": "adversarial_negative",
+  "why": "Design doc §12's other example. '--dry-run' and '--force' are the difference between a rehearsal and an irreversible action.",
+  "records": [
+    {
+      "context_id": "sync-tool-policy",
+      "version": 1,
+      "namespace": "acme",
+      "block_type": "tool_policy",
+      "canonical_text": "Always run the sync tool with --dry-run."
+    }
+  ],
+  "query": {
+    "namespace": "acme",
+    "block_type": "tool_policy",
+    "text": "Always run the sync tool with --force."
+  },
+  "expect": {
+    "outcome": "rejected",
+    "rejection_reason": "entity_mismatch",
+    "context_id": "sync-tool-policy",
+    "version": 1
+  }
+}

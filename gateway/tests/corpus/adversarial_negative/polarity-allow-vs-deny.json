@@ -1,0 +1,25 @@
+{
+  "id": "polarity-allow-vs-deny",
+  "category": "adversarial_negative",
+  "why": "An antonym swap with no negation marker anywhere. The words are in the same grammatical slot and the sentence is otherwise identical, so nothing but the PERMIT/FORBID family boundary distinguishes them.",
+  "records": [
+    {
+      "context_id": "internal-network-acl",
+      "version": 1,
+      "namespace": "acme",
+      "block_type": "tool_policy",
+      "canonical_text": "Requests from the internal network are allowed."
+    }
+  ],
+  "query": {
+    "namespace": "acme",
+    "block_type": "tool_policy",
+    "text": "Requests from the internal network are denied."
+  },
+  "expect": {
+    "outcome": "rejected",
+    "rejection_reason": "negation_mismatch",
+    "context_id": "internal-network-acl",
+    "version": 1
+  }
+}

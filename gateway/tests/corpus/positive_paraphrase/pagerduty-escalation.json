@@ -1,0 +1,25 @@
+{
+  "id": "pagerduty-escalation",
+  "category": "positive_paraphrase",
+  "why": "An escalation policy with the time-box moved to the front. The proper noun (PagerDuty) and the number (five) are unchanged.",
+  "records": [
+    {
+      "context_id": "oncall-escalation",
+      "version": 1,
+      "namespace": "acme",
+      "block_type": "org_policy",
+      "canonical_text": "Escalate to the on-call engineer through PagerDuty within five minutes."
+    }
+  ],
+  "query": {
+    "namespace": "acme",
+    "block_type": "org_policy",
+    "text": "Within five minutes, escalate through PagerDuty to the on-call engineer."
+  },
+  "expect": {
+    "outcome": "matched",
+    "method": "semantic",
+    "context_id": "oncall-escalation",
+    "version": 1
+  }
+}

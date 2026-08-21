@@ -1,0 +1,25 @@
+{
+  "id": "exception-without-removed",
+  "category": "adversarial_negative",
+  "why": "'without' dropped: the registered text describes a lock-free migration, the incoming one takes the lock. Design doc §12 names 'without' explicitly.",
+  "records": [
+    {
+      "context_id": "orders-migration-procedure",
+      "version": 1,
+      "namespace": "acme",
+      "block_type": "rag_document",
+      "canonical_text": "Run the migration without locking the orders table."
+    }
+  ],
+  "query": {
+    "namespace": "acme",
+    "block_type": "rag_document",
+    "text": "Run the migration and lock the orders table."
+  },
+  "expect": {
+    "outcome": "rejected",
+    "rejection_reason": "negation_mismatch",
+    "context_id": "orders-migration-procedure",
+    "version": 1
+  }
+}

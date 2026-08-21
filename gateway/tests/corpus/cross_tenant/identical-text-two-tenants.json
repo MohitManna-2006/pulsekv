@@ -1,0 +1,40 @@
+{
+  "id": "identical-text-two-tenants",
+  "category": "cross_tenant",
+  "why": "Both tenants registered the SAME policy text, byte for byte, so their embeddings are identical and either record would score 1.0 against the other's query. The incoming block is a paraphrase rather than a copy, so Tier 0 misses and the request genuinely reaches Tier 2/3 -- a byte-identical query would prove only that the hash lookup is namespace-scoped, which Phase 10.1 already proved one layer lower.",
+  "records": [
+    {
+      "context_id": "prod-deletion-ticket",
+      "version": 1,
+      "namespace": "acme",
+      "block_type": "org_policy",
+      "canonical_text": "Agents must never delete a resource in production without an approved change ticket."
+    },
+    {
+      "context_id": "prod-deletion-ticket",
+      "version": 1,
+      "namespace": "globex",
+      "block_type": "org_policy",
+      "canonical_text": "Agents must never delete a resource in production without an approved change ticket."
+    }
+  ],
+  "query": {
+    "namespace": "acme",
+    "block_type": "org_policy",
+    "text": "Agents must never delete a production resource without an approved change ticket."
+  },
+  "expect": {
+    "outcome": "matched",
+    "method": "semantic",
+    "context_id": "prod-deletion-ticket",
+    "version": 1,
+    "namespace": "acme",
+    "never_retrieves": [
+      {
+        "namespace": "globex",
+        "context_id": "prod-deletion-ticket",
+        "version": 1
+      }
+    ]
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "id": "polarity-required-vs-optional",
+  "category": "adversarial_negative",
+  "why": "The same inversion in obligation rather than permission: an approval step that stops being mandatory.",
+  "records": [
+    {
+      "context_id": "deletion-approval-requirement",
+      "version": 1,
+      "namespace": "acme",
+      "block_type": "org_policy",
+      "canonical_text": "Written approval is required for every production deletion."
+    }
+  ],
+  "query": {
+    "namespace": "acme",
+    "block_type": "org_policy",
+    "text": "Written approval is optional for every production deletion."
+  },
+  "expect": {
+    "outcome": "rejected",
+    "rejection_reason": "negation_mismatch",
+    "context_id": "deletion-approval-requirement",
+    "version": 1
+  }
+}

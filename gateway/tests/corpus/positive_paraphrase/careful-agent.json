@@ -1,0 +1,31 @@
+{
+  "id": "careful-agent",
+  "category": "positive_paraphrase",
+  "why": "Two wordings of the same system prompt: 'careful'/'cautious', and the confirmation clause moved to the front.",
+  "records": [
+    {
+      "context_id": "careful-agent-preamble",
+      "version": 1,
+      "namespace": "acme",
+      "block_type": "system_prompt",
+      "canonical_text": [
+        "You are a careful engineering assistant.",
+        "Ask for confirmation before running any command that modifies infrastructure."
+      ]
+    }
+  ],
+  "query": {
+    "namespace": "acme",
+    "block_type": "system_prompt",
+    "text": [
+      "You are a cautious engineering assistant.",
+      "Before you run a command that changes infrastructure, ask the user to confirm."
+    ]
+  },
+  "expect": {
+    "outcome": "matched",
+    "method": "semantic",
+    "context_id": "careful-agent-preamble",
+    "version": 1
+  }
+}
